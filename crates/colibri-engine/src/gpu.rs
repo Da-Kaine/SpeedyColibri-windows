@@ -761,6 +761,17 @@ pub fn try_expert_ffn_relu2(
 /// `COLI_EXPERT_GROUP=1` batches a layer's routed experts through the grouped async
 /// kernel (one H2D/D2H per ≤64-expert chunk) instead of a synchronous call per expert
 /// — attacks the per-expert round-trip that dominates moe-compute.
+/// Is the gateless ReLU² grouped expert path on? **Default ON**, unlike the fp8
+/// `expert_group_enabled()` opt-in: this path declines outside decode (`rows==1`), so it
+/// cannot hit the prefill devcopy gap that kept the fp8 one opt-in. MEASURED on Nemotron-H,
+/// interleaved with a discarded warmup: decode 8.11 -> 8.31 tok/s (+2.5%, non-overlapping
+/// ranges), prefill 38.5 -> 38.6 s (unchanged), tokens byte-identical. `COLI_EXPERT_GROUP=0`
+/// turns it off.
+pub fn expert_group_relu2_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() != Some("0"))
+}
+
 pub fn expert_group_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() == Some("1"))
@@ -858,6 +869,125 @@ pub fn try_expert_group(
         ci = c1;
     }
     // Scatter weighted results into the destination tokens.
+    for gg in 0..total {
+        let (t, wgt) = (token_of[gg], weight_of[gg]);
+        let ys = &y_all[gg * d..(gg + 1) * d];
+        let os = &mut out[t * d..(t + 1) * d];
+        for dd in 0..d {
+            os[dd] += wgt * ys[dd];
+        }
+    }
+    true
+}
+
+/// Batched gateless ReLU² routed-expert FFN (Nemotron-H) — the [`try_expert_group`] shape
+/// for the two-tensor NVFP4 expert. Same gather/scatter, but each expert is `down(relu(up·x)²)`
+/// with no gate tensor (`ex.gate` is empty and never touched).
+///
+/// Why this exists: the decode profile puts routed experts at 47.5 ms/token (43.4%), and the
+/// cause is call count, not kernel speed — 22 experts × 40 layers = 880 separate
+/// `expert_mlp_nvfp4_relu2` calls per token, each with its own H2D/D2H round-trip (~54 µs
+/// per call, only ~10 µs of it real work). One grouped call per layer pays the round-trip
+/// 40 times instead of 880. The per-expert kernels and their accumulation order are
+/// unchanged, so results match the per-expert path exactly.
+///
+/// The weighted scatter stays on the CPU: it is 1.9% of decode, and moving it would mean
+/// shipping row→token maps to the device for no measurable gain.
+///
+/// Returns false — leaving `out` untouched — if unavailable/ineligible, so the caller falls
+/// back to the per-expert loop.
+pub fn try_expert_group_relu2(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    // NVFP4 (fmt==5) is zero-copy only — the block-scale/global plumbing has no
+    // device-copy path (same guard as `try_expert_ffn_relu2`).
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if active.is_empty() {
+        return true; // nothing routed — `out` unchanged
+    }
+    // DECODE ONLY. Grouping saves the per-expert H2D/D2H round-trip, which is a decode
+    // win (+5% end-to-end, MEASURED interleaved) — but at prefill the per-expert path can
+    // stage weights to the device (`COLI_FFN_DEVCOPY`, S>=16) and this one cannot: those
+    // ctx buffers are single, so a group would need one per expert. Reading zero-copy
+    // where the per-expert path would devcopy made prefill 38.5 -> 40.3 s (4.7% SLOWER).
+    // Restricting to single-row (decode) keeps the win and drops the regression.
+    if active.iter().any(|(_, rows, _)| rows.len() != 1) {
+        return false;
+    }
+    // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);
+    // the kernel derives D from up.I, so decline rather than mis-stride if they disagree.
+    if !active.iter().all(|(ex, _, _)| {
+        ex.up.gpu_eligible
+            && ex.down.gpu_eligible
+            && ex.up.fmt_code == 5
+            && ex.down.fmt_code == 5
+            && ex.up.i as usize == d
+            && ex.down.o as usize == d
+    }) {
+        return false;
+    }
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    // Gather activations, rows grouped by expert; remember each global row's dest token+weight.
+    let mut x_all = vec![0f32; total * d];
+    let mut token_of = vec![0usize; total];
+    let mut weight_of = vec![0f32; total];
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let mut y_all = vec![0f32; total * d];
+    // Chunked at 64 experts to share the shape of the fp8 grouped path (Nemotron routes 22
+    // per layer, so this is one chunk in practice).
+    let mut row_off = 0usize;
+    let mut ci = 0usize;
+    while ci < active.len() {
+        let c1 = (ci + 64).min(active.len());
+        let (mut us, mut ds, mut rows_i) = (Vec::new(), Vec::new(), Vec::new());
+        let mut keep = Vec::new(); // hold descriptors alive across the synchronous call
+        let mut chunk_rows = 0usize;
+        for (ex, rows, _) in &active[ci..c1] {
+            // Fresh, owned descriptors held only for this call — see `wrap_fresh`. Safe
+            // under cache eviction (no stale pointer-keyed descriptors).
+            let (Some(ut), Some(dt)) = (wrap_fresh(&ex.up), wrap_fresh(&ex.down)) else {
+                return false;
+            };
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            keep.push(ut);
+            keep.push(dt);
+            rows_i.push(rows.len() as i32);
+            chunk_rows += rows.len();
+        }
+        let off = row_off * d;
+        // SAFETY: us/ds stay resident until `keep` drops (after the synchronous group call,
+        // which includes the D2H); the x/y sub-slices hold chunk_rows*d floats each.
+        let ok = unsafe {
+            cuda::expert_group_nvfp4_relu2_raw(
+                &us,
+                &ds,
+                &rows_i,
+                y_all[off..off + chunk_rows * d].as_mut_ptr(),
+                x_all[off..off + chunk_rows * d].as_ptr(),
+            )
+        };
+        drop(keep);
+        if !ok {
+            return false;
+        }
+        row_off += chunk_rows;
+        ci = c1;
+    }
+    // Scatter weighted results into the destination tokens (CPU — 1.9% of decode).
     for gg in 0..total {
         let (t, wgt) = (token_of[gg], weight_of[gg]);
         let ys = &y_all[gg * d..(gg + 1) * d];
