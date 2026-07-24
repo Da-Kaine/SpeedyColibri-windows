@@ -80,6 +80,13 @@ COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate, ColiCudaT
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_i8a16(ColiCudaTensor *gate, ColiCudaTensor *up,
                          ColiCudaTensor *down, float *y, const float *x, int S);
 
+/* Gateless ReLU² NVFP4 expert FFN (Nemotron-H): y = down(relu(up·x)²). Two-tensor
+ * expert (no gate); reuses the NVFP4 decode of coli_cuda_expert_mlp_nvfp4 with a relu²
+ * activation between the up and down projections. Requires up/down at fmt==5, with
+ * down the transpose of up. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
+                         ColiCudaTensor *down, float *y, const float *x, int S);
+
 /* Packed group of same-shaped experts. Inputs and outputs contain sum(rows)
  * consecutive [D] rows in call order. */
 COLI_CUDA_DLLEXPORT int coli_cuda_expert_group(ColiCudaTensor *const *gates,
@@ -104,6 +111,16 @@ COLI_CUDA_DLLEXPORT int coli_cuda_attention_absorb_batch(ColiCudaTensor *kv_b,fl
  * mode 0 = scalar gqa_attn_kernel; mode 1 = WMMA flash tc_gqa_attn (D%16==0). */
 COLI_CUDA_DLLEXPORT int coli_cuda_gqa_attn(int device,float *ctx,const float *q,const float *k,
                                      const float *v,int S,int H,int Hkv,int D,int T,float scale,int mode);
+
+/* Nemotron-H Mamba2 selective-scan for one decode token (S==1). Per (head, head_dim),
+ * loops d_state updating ssm[h,p,n] = ssm*dA_h + dt_h*B[g,n]*x and y[h,p] = sum_n ssm*C[g,n]
+ * + x*D[h], where g = h/(n_heads/n_groups). state[nh*hd*ds] is in/out; y[nh*hd] out;
+ * hidden[nh*hd], b/c[ng*ds], dt_h/da_h/d[nh] in. dt_h/da_h are host-precomputed so the
+ * softplus/exp match the CPU reference; the kernel uses fma-free f32 for bit-identity. */
+COLI_CUDA_DLLEXPORT int coli_cuda_mamba2_scan(int device,float *state,float *y,const float *hidden,
+                                     const float *b,const float *c,const float *dt_h,
+                                     const float *da_h,const float *d,
+                                     int n_heads,int head_dim,int d_state,int n_groups);
 
 /* DSA sparse prefill attention: like the batch variant but each query attends only
  * to its indexer selection. sel_idx is [S, maxsel] int (row s holds the chosen

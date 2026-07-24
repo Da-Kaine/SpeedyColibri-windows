@@ -111,6 +111,13 @@ extern "C" {
         x: *const f32,
         s: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_nvfp4_relu2(
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
     fn coli_cuda_expert_group(
         gates: *const *mut ColiCudaTensor,
         ups: *const *mut ColiCudaTensor,
@@ -149,6 +156,23 @@ extern "C" {
         t: c_int,
         scale: f32,
         mode: c_int,
+    ) -> c_int;
+    // Nemotron-H Mamba2 selective-scan for one decode token (S==1).
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_mamba2_scan(
+        device: c_int,
+        state: *mut f32,
+        y: *mut f32,
+        hidden: *const f32,
+        b: *const f32,
+        c: *const f32,
+        dt_h: *const f32,
+        da_h: *const f32,
+        d: *const f32,
+        n_heads: c_int,
+        head_dim: c_int,
+        d_state: c_int,
+        n_groups: c_int,
     ) -> c_int;
     // DSA lightning-indexer scores (the indexer's CPU hot loop, moved to the GPU).
     fn coli_cuda_dsa_indexer_scores(
@@ -517,6 +541,23 @@ pub unsafe fn expert_mlp_nvfp4_raw(
     coli_cuda_expert_mlp_nvfp4(gate, up, down, y, x, s) != 0
 }
 
+/// Gateless ReLU² NVFP4 expert FFN (Nemotron-H): `y = down(relu(up·x)²)`. Two-tensor
+/// expert (no gate projection); reuses the same NVFP4 decode as
+/// [`expert_mlp_nvfp4_raw`] with a relu² activation between the projections. Requires
+/// `up`/`down` at fmt==5, `down` the transpose of `up`.
+///
+/// # Safety
+/// The two handles must be resident on the same device; `y`/`x` hold `s*up.I` floats.
+pub unsafe fn expert_mlp_nvfp4_relu2_raw(
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_nvfp4_relu2(up, down, y, x, s) != 0
+}
+
 /// Tiled int8 (W8A16) fused expert/MLP FFN — tensor-core replacement for the naive
 /// `quant_matmul` on resident int8 weights (the shared expert). Requires fmt==1.
 ///
@@ -611,6 +652,34 @@ pub unsafe fn gqa_attn_raw(
     mode: i32,
 ) -> bool {
     coli_cuda_gqa_attn(0, ctx, q, k, v, s, h, hkv, d, t, scale, mode) != 0
+}
+
+/// Nemotron-H Mamba2 selective-scan for one decode token (`seq == 1`) on the GPU.
+/// Uploads `state` (`[nh*hd*ds]`), runs the per-token recurrent update in place, and
+/// downloads the updated `state` plus the scan output `y` (`[nh*hd]`). `dt_h`/`da_h`
+/// (`[nh]`) are the host-precomputed per-head step and decay. Twin of the CPU
+/// `selective_scan` at `seq == 1`.
+///
+/// # Safety
+/// `state`/`y` and the read-only inputs must be sized per `(nh, hd, ds, ng)`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn mamba2_scan_raw(
+    state: *mut f32,
+    y: *mut f32,
+    hidden: *const f32,
+    b: *const f32,
+    c: *const f32,
+    dt_h: *const f32,
+    da_h: *const f32,
+    d: *const f32,
+    n_heads: i32,
+    head_dim: i32,
+    d_state: i32,
+    n_groups: i32,
+) -> bool {
+    coli_cuda_mamba2_scan(
+        0, state, y, hidden, b, c, dt_h, da_h, d, n_heads, head_dim, d_state, n_groups,
+    ) != 0
 }
 
 /// DSA sparse MLA attention: like [`attention_absorb_batch_raw`] but each query

@@ -7,7 +7,8 @@
 //! filled in against a known shape. Buffers that are hot-path detail (profiling
 //! counters, GPU shadow caches) are elided until their subsystem is ported.
 
-use colibri_core::{Config, QTensor};
+use crate::mamba2::SsmState;
+use colibri_core::{Arch, Config, LayerKind, QTensor};
 use colibri_safetensors::Shards;
 
 /// A transformer layer: MLA attention (dense, quantized) plus either a dense MLP
@@ -68,6 +69,24 @@ pub struct Layer {
     pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
     pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
     pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
+
+    // ---- Nemotron-H Mamba2 mixer (present on `LayerKind::Mamba` layers) ----
+    // `in_ln` above is the single block-input RMSNorm; Nemotron has no `post_ln`.
+    pub mamba_in_proj: Option<QTensor>, // hidden -> d_inner + conv_dim + n_heads (18560)
+    pub mamba_out_proj: Option<QTensor>, // d_inner -> hidden
+    pub mamba_conv_w: Vec<f32>,     // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
+    pub mamba_conv_b: Vec<f32>,     // conv bias [conv_dim]
+    pub mamba_a_log: Vec<f32>,      // [n_heads]; A = -exp(a_log)
+    pub mamba_d: Vec<f32>,          // skip connection [n_heads]
+    pub mamba_dt_bias: Vec<f32>,    // step bias [n_heads]
+    pub mamba_norm: Vec<f32>,       // gated RMSNorm weight [d_inner]
+
+    // ---- Nemotron-H latent-MoE projections (present on `LayerKind::Moe` layers) ----
+    // Routed experts (`sh_*` unused here; routed via the expert provider) run in the
+    // `moe_latent` space between these two projections; `router`/`router_bias` above
+    // are reused for the gate. `up_proj`/`down_proj` reused for the shared expert.
+    pub fc1_latent: Option<QTensor>, // hidden -> moe_latent
+    pub fc2_latent: Option<QTensor>, // moe_latent -> hidden
 }
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /
@@ -122,6 +141,22 @@ pub struct KvCache {
     k_full: Vec<Vec<f32>>,
     /// per-layer full value buffer, each `[max_t * kv_dim]` — GQA only (else empty).
     v_full: Vec<Vec<f32>>,
+
+    // ---- Nemotron-H Mamba2 recurrent state (per Mamba layer; empty otherwise) ----
+    // Unlike the KV buffers above these are **fixed-size**, not `max_t`-scaled: a
+    // selective-scan carries a bounded recurrent state, so its memory is O(1) in
+    // context length. Populated by [`KvCache::enable_mamba2`]; other layer rows (and
+    // every non-Nemotron cache) leave both empty.
+    /// per-Mamba-layer causal-conv history, each `[d_conv * conv_dim]`, time-major:
+    /// the last `d_conv` input columns of `hidden_B_C`, row `d_conv-1` = most recent.
+    mamba_conv: Vec<Vec<f32>>,
+    /// per-Mamba-layer selective-scan state `[n_heads, head_dim, d_state]`.
+    mamba_ssm: Vec<SsmState>,
+    /// conv-kernel width `d_conv` (rows per `mamba_conv` entry); 0 if unused.
+    mamba_d_conv: usize,
+    /// conv channel count `conv_dim` (cols per `mamba_conv` entry); 0 if unused.
+    mamba_conv_dim: usize,
+
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
     /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
@@ -170,6 +205,10 @@ impl KvCache {
             kv_dim: 0,
             k_full: vec![Vec::new(); n_rows],
             v_full: vec![Vec::new(); n_rows],
+            mamba_conv: vec![Vec::new(); n_rows],
+            mamba_ssm: (0..n_rows).map(|_| SsmState::zeros(0, 0, 0)).collect(),
+            mamba_d_conv: 0,
+            mamba_conv_dim: 0,
             kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
@@ -184,6 +223,33 @@ impl KvCache {
         let rows = self.k_full.len();
         self.k_full = lazy_zeros(rows, self.max_t * kv_dim);
         self.v_full = lazy_zeros(rows, self.max_t * kv_dim);
+    }
+
+    /// Enable the Nemotron-H Mamba2 recurrent state: for each `LayerKind::Mamba`
+    /// layer, allocate a fixed-size conv history (`[d_conv, conv_dim]`, time-major)
+    /// and selective-scan state (`[n_heads, head_dim, d_state]`), both zeroed. Non-Mamba
+    /// rows (attention/MoE) keep empty buffers. These are O(1) in context length, unlike
+    /// the `max_t`-scaled KV rows, so they are allocated eagerly (small + always resident).
+    pub(crate) fn enable_mamba2(&mut self, cfg: &Config) {
+        let conv_dim = cfg.mamba_inter as usize
+            + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
+        let k = cfg.mamba_d_conv as usize;
+        let (nh, hd, ds) = (
+            cfg.mamba_n_heads as usize,
+            cfg.mamba_head_dim as usize,
+            cfg.mamba_d_state as usize,
+        );
+        self.mamba_d_conv = k;
+        self.mamba_conv_dim = conv_dim;
+        let rows = self.mamba_conv.len();
+        for li in 0..rows {
+            // Only the actual Mamba layers carry state; index by layer so the mixer can
+            // address `mamba_*(li)` directly. The MTP row (if any) is never Mamba.
+            if cfg.layer_kind.get(li).copied() == Some(LayerKind::Mamba) {
+                self.mamba_conv[li] = vec![0.0f32; k * conv_dim];
+                self.mamba_ssm[li] = SsmState::zeros(nh, hd, ds);
+            }
+        }
     }
 
     /// Allocate a cache sized for `model`, holding up to `max_t` tokens.
@@ -208,6 +274,14 @@ impl KvCache {
         }
         if model.cfg.arch.is_gqa() {
             kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
+        }
+        // Nemotron-H is hybrid: its 8 attention layers need the GQA full-KV cache AND its
+        // 40 Mamba layers need recurrent conv+ssm state. `enable_gqa` allocates KV rows for
+        // every layer (only attention rows are ever written — the rest stay lazily
+        // uncommitted), and `enable_mamba2` allocates state on just the Mamba rows.
+        if model.cfg.arch == Arch::NemotronH {
+            kv.enable_gqa(model.cfg.n_kv_heads as usize * model.cfg.qk_head as usize);
+            kv.enable_mamba2(&model.cfg);
         }
         kv
     }
@@ -293,6 +367,28 @@ impl KvCache {
     /// Contiguous full-value rows `[start, end)` for a layer.
     pub fn v_full_rows(&self, layer: usize, start: usize, end: usize) -> &[f32] {
         &self.v_full[layer][start * self.kv_dim..end * self.kv_dim]
+    }
+
+    // ---- Nemotron-H Mamba2 state accessors ----
+    /// Conv-kernel width `d_conv` (rows in a `mamba_conv` entry); 0 if unused.
+    pub fn mamba_d_conv(&self) -> usize {
+        self.mamba_d_conv
+    }
+    /// Conv channel count `conv_dim` (cols in a `mamba_conv` entry); 0 if unused.
+    pub fn mamba_conv_dim(&self) -> usize {
+        self.mamba_conv_dim
+    }
+    /// The layer's `[d_conv, conv_dim]` time-major conv history (read).
+    pub fn mamba_conv_row(&self, layer: usize) -> &[f32] {
+        &self.mamba_conv[layer]
+    }
+    /// The layer's `[d_conv, conv_dim]` time-major conv history (write).
+    pub fn mamba_conv_row_mut(&mut self, layer: usize) -> &mut [f32] {
+        &mut self.mamba_conv[layer]
+    }
+    /// The layer's selective-scan state, carried and updated across steps.
+    pub fn mamba_ssm_mut(&mut self, layer: usize) -> &mut SsmState {
+        &mut self.mamba_ssm[layer]
     }
 }
 
