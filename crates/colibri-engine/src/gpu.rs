@@ -838,6 +838,47 @@ pub fn try_expert_ffn_relu2(
 /// interleaved with a discarded warmup: decode 8.11 -> 8.31 tok/s (+2.5%, non-overlapping
 /// ranges), prefill 38.5 -> 38.6 s (unchanged), tokens byte-identical. `COLI_EXPERT_GROUP=0`
 /// turns it off.
+/// `COLI_EXPERT_GROUP_PREFILL=1` lets the grouped gateless-ReLU² path take multi-row
+/// (prefill) groups too. **Off by default** — see the recorded 4.7% prefill regression at
+/// the gate in [`try_expert_group_relu2`]. Exists so that number can be re-measured on a
+/// current binary instead of inherited.
+/// `COLI_EXPERT_SEG=1` routes multi-row (prefill) expert groups through the SEGMENTED
+/// kernel — one grid for the whole layer instead of three launches per expert.
+///
+/// ⚠️ **MEASURED NEUTRAL — leave off.** Built to test an occupancy hypothesis that turned
+/// out to be wrong. Token-identical [17054], and ~1% slower:
+///     off  prefill 31084 ms, moe 26194      on  prefill 31354 ms, moe 26378
+///
+/// The hypothesis: the per-expert path launches dim3((I+63)/64,(S+15)/16) = 86 blocks at
+/// ~25 rows/expert, 453 launches back-to-back on one stream (which cannot overlap), so it
+/// looked starved. The segmented form issues ~39,000 blocks in ONE grid. **86 blocks and
+/// 39,000 blocks perform the same**, so occupancy was never the constraint.
+///
+/// What actually drives the cost — solving the 512- vs 2048-token scaling (8.916 s vs
+/// 12.966 s, experts 1.13x, rows 4x) for its two components:
+///     weight-read  7.91 s  (89%)   47.2 GB at 5.97 GB/s
+///     row-compute  1.01 s  (11%)
+/// So gpu-ffn is ~90% weight streaming. The 2.75x that the 2048-token prompt showed was
+/// WEIGHT AMORTIZATION per row (118 -> 33 KB/row as rows/expert go 25 -> 88), not better
+/// occupancy — and a segmented GEMM changes launch structure, not that ratio.
+///
+/// The real lever is therefore the weight path: 47 GB moving at ~6 GB/s. Making a layer's
+/// experts device-resident before the GEMMs (1.3 GB/layer to VRAM, then ~TB/s reads) is
+/// the untried option; note the existing per-expert `COLI_FFN_DEVCOPY` is NOT that — it
+/// stages one expert at a time from PAGEABLE memory and measured slightly negative.
+///
+/// Kept because it is correct, it is the definitive disproof of the occupancy theory, and
+/// it is the scaffolding a device-resident version would reuse.
+fn expert_seg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_SEG").ok().as_deref() == Some("1"))
+}
+
+fn group_prefill_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP_PREFILL").ok().as_deref() == Some("1"))
+}
+
 pub fn expert_group_relu2_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP").ok().as_deref() != Some("0"))
@@ -951,6 +992,49 @@ pub fn try_expert_group(
     true
 }
 
+/// Reusable per-thread gather/scatter scratch for [`try_expert_group_relu2`].
+///
+/// The grouped path packs every routed row of a layer into one contiguous buffer before
+/// the call and scatters the results back after. At Nemotron's 557-token prefill that is
+/// ~12.3k rows x 1024 floats = ~50 MB for `x_all` and another ~50 MB for `y_all`, freshly
+/// allocated and zeroed on every one of 40 layers — ~4 GB of allocate-and-zero per
+/// prefill. The identical pattern cost 8.5% of a warm prefill in the Mamba mixer (see
+/// `MambaScratch` in forward.rs), which is why it is the first suspect for why grouping
+/// measures ~1.05x SLOWER than the per-expert path at prefill.
+///
+/// Same contract as `MambaScratch`: single-threaded forward pass, buffers only grow, and
+/// callers slice to the current length because a stale tail is always live.
+#[derive(Default)]
+struct GroupScratch {
+    x_all: Vec<f32>,
+    y_all: Vec<f32>,
+    token_of: Vec<usize>,
+    weight_of: Vec<f32>,
+}
+
+thread_local! {
+    static GROUP_SCRATCH: std::cell::Cell<GroupScratch> = const {
+        std::cell::Cell::new(GroupScratch {
+            x_all: Vec::new(), y_all: Vec::new(),
+            token_of: Vec::new(), weight_of: Vec::new(),
+        })
+    };
+}
+
+fn fit_f32(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
+    if v.len() < n {
+        v.resize(n, 0.0);
+    }
+    &mut v[..n]
+}
+
+fn fit_usize(v: &mut Vec<usize>, n: usize) -> &mut [usize] {
+    if v.len() < n {
+        v.resize(n, 0);
+    }
+    &mut v[..n]
+}
+
 /// Batched gateless ReLU² routed-expert FFN (Nemotron-H) — the [`try_expert_group`] shape
 /// for the two-tensor NVFP4 expert. Same gather/scatter, but each expert is `down(relu(up·x)²)`
 /// with no gate tensor (`ex.gate` is empty and never touched).
@@ -981,13 +1065,43 @@ pub fn try_expert_group_relu2(
     if active.is_empty() {
         return true; // nothing routed — `out` unchanged
     }
-    // DECODE ONLY. Grouping saves the per-expert H2D/D2H round-trip, which is a decode
-    // win (+5% end-to-end, MEASURED interleaved) — but at prefill the per-expert path can
-    // stage weights to the device (`COLI_FFN_DEVCOPY`, S>=16) and this one cannot: those
-    // ctx buffers are single, so a group would need one per expert. Reading zero-copy
-    // where the per-expert path would devcopy made prefill 38.5 -> 40.3 s (4.7% SLOWER).
-    // Restricting to single-row (decode) keeps the win and drops the regression.
-    if active.iter().any(|(_, rows, _)| rows.len() != 1) {
+    // Decode-only BY DEFAULT — the prefill regression is REAL, but the reason recorded here
+    // originally was WRONG, so read this before trying to "just group them".
+    //
+    // Grouping saves the per-expert H2D/D2H round-trip: a decode win (+5% end-to-end,
+    // measured interleaved). At prefill it LOSES, re-measured 2026-07-26 on a current
+    // binary via `COLI_EXPERT_GROUP_PREFILL=1`, 2 reps, token-identical [17054]:
+    //     off  31404 / 31098 ms      on  32273 / 32895 ms      ~1.05x SLOWER
+    //
+    // The old explanation — that grouping forfeits the `COLI_FFN_DEVCOPY` weight staging
+    // the per-expert path gets at S>=16 — does not survive measurement: devcopy is not
+    // helping. A/B'd on the per-expert path, turning it OFF was FASTER (gpu-ffn 8911 ->
+    // 8375 ms). So the loss is not about where the weights live.
+    //
+    // ⚠️ AND GROUPING CANNOT WIN HERE — the ceiling is ~3%. CUDA-event timing of the
+    // per-expert path splits its 9060 ms as: H2D activations 72 ms, D2H+sync 184 ms, host
+    // memcpy 18 ms, and 7575 ms (84%) inside the kernel window. The per-expert round-trip
+    // that grouping eliminates is therefore ~256 ms, under 3% of the cost. Grouping
+    // optimizes the wrong 3%.
+    //
+    // Two rounds of evidence. The path's own gather buffers (~50 MB x_all + ~50 MB y_all
+    // per layer at 557 tokens) were freshly allocated per layer; hoisting them into
+    // `GroupScratch` moved grouping from ~1.05x slower to ~1.013x slower — so most of the
+    // original regression was allocation churn, the same thing that cost 8.5% in the Mamba
+    // mixer. But it is STILL a loss, 5 reps each, token-identical [17054]:
+    //     off  31394/31129/31195/30917/31263   median 31195 ms
+    //     on   32023/31224/31772/31602/31440   median 31602 ms
+    // because grouping still launches 3 kernels PER EXPERT (nvfp4_matmul / relu2 /
+    // nvfp4_matmul in a `for c<count` loop): it removes transfers, not launches.
+    //
+    // So do not revisit grouping for prefill. The 84% lives in the kernel window — ~47 GB
+    // of expert weight traffic per prefill (453 experts x 40 layers x ~2.95 MB) moving at
+    // ~6 GB/s against a ~51 GB/s zero-copy ceiling, at an average of only ~25 rows per
+    // call. The fix is a fused SEGMENTED GEMM: one launch per layer with per-expert tile
+    // ranges, so the weight stream gets real memory-level parallelism.
+    //
+    // `COLI_EXPERT_GROUP_PREFILL=1` lifts the restriction so this stays re-measurable.
+    if !group_prefill_enabled() && !expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() != 1) {
         return false;
     }
     // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);
@@ -1004,9 +1118,12 @@ pub fn try_expert_group_relu2(
     }
     let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
     // Gather activations, rows grouped by expert; remember each global row's dest token+weight.
-    let mut x_all = vec![0f32; total * d];
-    let mut token_of = vec![0usize; total];
-    let mut weight_of = vec![0f32; total];
+    // Reused across layers — see `GroupScratch`. Moved out and back rather than held
+    // borrowed, so the body below is unchanged apart from the slice types.
+    let mut gsc = GROUP_SCRATCH.with(|c| c.take());
+    let x_all = fit_f32(&mut gsc.x_all, total * d);
+    let token_of = fit_usize(&mut gsc.token_of, total);
+    let weight_of = fit_f32(&mut gsc.weight_of, total);
     let mut g = 0usize;
     for (_, rows, rw) in active {
         for (r, &t) in rows.iter().enumerate() {
@@ -1016,7 +1133,58 @@ pub fn try_expert_group_relu2(
             g += 1;
         }
     }
-    let mut y_all = vec![0f32; total * d];
+    let y_all = fit_f32(&mut gsc.y_all, total * d);
+
+    // SEGMENTED fast path: one grid for the whole layer. Only worth it when experts carry
+    // real row counts (prefill); at decode every expert has a single row and the grouped
+    // chunk path already amortizes the round-trip.
+    if expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() > 1) {
+        let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
+        let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
+        let mut rws: Vec<i32> = Vec::with_capacity(active.len());
+        let mut keep = Vec::with_capacity(active.len() * 2);
+        let mut all_wrapped = true;
+        for (ex, rows, _) in active {
+            let (Some(ut), Some(dt)) = (wrap_fresh(&ex.up), wrap_fresh(&ex.down)) else {
+                all_wrapped = false;
+                break;
+            };
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            rws.push(rows.len() as i32);
+            keep.push(ut);
+            keep.push(dt);
+        }
+        if all_wrapped {
+            // SAFETY: us/ds stay resident until `keep` drops (after the synchronous call,
+            // which includes the D2H); x_all/y_all hold `total * d` floats each.
+            let ok = unsafe {
+                cuda::expert_seg_nvfp4_relu2_raw(
+                    &us,
+                    &ds,
+                    &rws,
+                    y_all.as_mut_ptr(),
+                    x_all.as_ptr(),
+                )
+            };
+            drop(keep);
+            if ok {
+                for gg in 0..total {
+                    let (t, wgt) = (token_of[gg], weight_of[gg]);
+                    let ys = &y_all[gg * d..(gg + 1) * d];
+                    let os = &mut out[t * d..(t + 1) * d];
+                    for dd in 0..d {
+                        os[dd] += wgt * ys[dd];
+                    }
+                }
+                GROUP_SCRATCH.with(|c| c.set(gsc));
+                return true;
+            }
+        } else {
+            drop(keep);
+        }
+        // fall through to the chunked grouped path on any decline
+    }
     // Chunked at 64 experts to share the shape of the fp8 grouped path (Nemotron routes 22
     // per layer, so this is one chunk in practice).
     let mut row_off = 0usize;
@@ -1030,6 +1198,8 @@ pub fn try_expert_group_relu2(
             // Fresh, owned descriptors held only for this call — see `wrap_fresh`. Safe
             // under cache eviction (no stale pointer-keyed descriptors).
             let (Some(ut), Some(dt)) = (wrap_fresh(&ex.up), wrap_fresh(&ex.down)) else {
+                // Put the scratch back before declining, or the next call reallocates.
+                GROUP_SCRATCH.with(|c| c.set(gsc));
                 return false;
             };
             us.push(ut.as_raw());
@@ -1053,6 +1223,7 @@ pub fn try_expert_group_relu2(
         };
         drop(keep);
         if !ok {
+            GROUP_SCRATCH.with(|c| c.set(gsc));
             return false;
         }
         row_off += chunk_rows;
@@ -1067,6 +1238,7 @@ pub fn try_expert_group_relu2(
             os[dd] += wgt * ys[dd];
         }
     }
+    GROUP_SCRATCH.with(|c| c.set(gsc));
     true
 }
 
