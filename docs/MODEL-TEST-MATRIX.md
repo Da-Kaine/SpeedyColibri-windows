@@ -24,7 +24,7 @@ Box: gx10-42b2 (DGX Spark, 121.7 GiB). Unless stated, prompt = each model's regi
 | lever | glm-5.2 | minimax-m3 | minimax-m2.7 | nemotron-3-super |
 |---|---|---|---|---|
 | end-to-end token validation | PASS | PASS | PASS | PASS |
-| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **35.4 warm** tok/s (15.7 s at the default budget after #98's shared-scratch pool; was 20.1 s pre-fix, 23.3 s pre-#91) — the residency memory-pressure tax is gone, so the default budget now gives fast prefill *and* fast decode |
+| prefill bench | PASS | PASS 17.4 tok/s | PASS 18.9 tok/s | PASS 13.3 cold / **43.5 warm** tok/s (12.8 s at the default budget: #98 shared-scratch pool → 15.7 s, then #90 weight-stationary NVFP4 expert GEMM → 12.8 s; was 20.1 s pre-#98, 23.3 s pre-#91). `gpu-ffn` is still the largest phase but no longer catastrophic |
 | decode bench | PASS | PASS 2.07 | PASS | PASS **9.27 tok/s** — 2.77× behind vLLM |
 | serve bench | PASS | PASS 1.38 | PASS | PASS 3.60 tok/s (12/12) |
 | batch / genbatch | PASS 1.34× @B64 | **NEG** monotonic loss | TODO | **N/A** hybrid — guarded, PR #9 |
@@ -560,6 +560,13 @@ finally established the real constraint.
 | **weight-read** | **7.91 s (89%)** | 47.2 GB at 5.97 GB/s |
 | row-compute | 1.01 s (11%) | |
 
+> **Refined by #90 (see “#90 RESOLVED” above).** That 5.97 GB/s is not memory bandwidth —
+> the routed weights are device-staged and read at TB/s. It is the **dequant throughput**:
+> the WMMA path re-dequantizes each weight once per 16-row m-tile at ~26 rows/expert. The
+> weight-stationary kernel reads + dequantizes each weight once and amortizes it across all
+> rows, cutting the kernel 1.48× (1.24× warm prefill). "Device-resident experts" was the
+> wrong lever — the bottleneck was dequant, not the read.
+
 CUDA-event timing agrees from the other direction: H2D 72 ms | D2H+sync 184 | host memcpy
 18 | **kernel window 7 575 (84%)**.
 
@@ -621,6 +628,78 @@ was not `COLI_EXPERT_SEG`'s buffers (the leading suspect here) but the shared ex
 scratch faulting under expert-cache pressure; pooling it took the default budget to **15.7 s**.
 So the untried device-resident-experts idea below must be re-measured against the *new* 15.7 s
 baseline, not the old 20 s one, before it can claim anything.
+
+## #90 RESOLVED: weight-stationary NVFP4 expert GEMM — 1.24× warm prefill (2026-07-27)
+
+After #98, `gpu-ffn` is the largest warm-prefill phase — **9646 ms of 15.56 s (62%)**, of
+which RELU2_EVT attributes 8.16 s/req to the kernel and only 0.82 s to the H2D stage. The
+routed experts are device-staged (`COLI_FFN_DEVCOPY`), so this is **not** streaming
+bandwidth: doing the arithmetic, ~52 GB of weight reads and ~5.3 TFLOP/req in 8.16 s is
+**~0.26 % of the GB10's tensor peak**. The WMMA path (`nvfp4_matmul`) is the wrong shape for
+a routed expert: at ~26 rows/expert it runs its 16×16 MMA at ~1/8 utilization **and**
+re-dequantizes the whole weight once per 16-row m-tile.
+
+**Fix (`nvfp4_wsmm`, `COLI_NVFP4_WSMM`, default on for S≤32):** a weight-stationary kernel —
+one warp per output column, 32 lanes split K, each lane holds `MT` per-row accumulators
+(templated bucket ∈ {8,16,32} so they stay in registers) — so each weight element is read
+and dequantized **exactly once** and reused across all rows. x is staged to shared per
+K-tile (L2-resident, ~104 KB/expert). S>32 falls back to WMMA.
+
+One binary, `COLI_NVFP4_WSMM` switches the arm, ABBA ×2, default budget, token-identical:
+
+| | warm prefill | relu² kernel (cumulative, 6 req) |
+|---|---|---|
+| WSMM **on** | **12.71 / 12.85 s (≈43.5 tok/s)** | 33.7 / 34.1 s |
+| WSMM off (WMMA) | 15.80 / 15.90 s | 50.2 / 50.4 s |
+
+**1.24× prefill, 1.48× on the kernel.** Cross-arm token-identical (48-token greedy gen
+byte-for-byte). Decode (S==1) is untouched — it uses `nvfp4_gemv`.
+
+Stacked context: warm prefill is now **12.8 s** vs 15.6 s (pre-#90), 20.1 s (pre-#98),
+23.3 s (pre-#91). The kernel still holds ~5.6 s/req — remaining headroom is the per-block
+x-restage and byte-load granularity (one nibble per byte-load); a future pass can chase it,
+but re-measure against **12.8 s**.
+
+### #92: MTP is still blocked on CORRECTNESS; the perf calculus can't be re-measured yet (2026-07-27)
+
+The open question after #90: does the WSMM kernel make the S=2 MTP verify cheap enough to
+flip nemotron speculation from its recorded ~1.18× *slowdown* to a win? **Answer: not
+cleanly measurable yet, and the hard blocker is unchanged.** Two facts:
+
+- **The Mamba-rollback correctness bug is untouched by #90, and it poisons the very
+  measurement.** The verify forward advances the Mamba conv/SSM state by all 1+g tokens and
+  never rolls it back to the accepted prefix, so the output diverges. Measured through
+  `coli serve`, `DRAFT=1`: acceptance **collapsed to 17 %** (from the head's real 77 %) and
+  generation ran off after ~6 tokens — because the "true" tokens each draft is checked
+  against are themselves corrupted. You cannot observe MTP's true speed at 77 % acceptance
+  while the output is wrong, so any tok/s from this arm is not a verdict on the compute
+  calculus — it is the divergence bug.
+
+- **What #90 does and does not do to the S=2 penalty.** The recorded penalty was *compute*,
+  not bytes — [[nemotron-mtp-blocked]] measured aggregate expert-load **unchanged** between
+  DRAFT arms (8077 vs 8060 ms; same tokens ⇒ same expert bytes), the slowdown being that
+  S=2 falls off three S==1 fast paths (tile bypass, i8a16 gemv, grouped relu²). #90's
+  weight-stationary kernel is a genuine fast path for **one** of those — the routed-expert
+  GEMM at S≤32 — but the Mamba scan and the dense/shared i8a16 GEMV at S=2 still take their
+  slow paths. So #90 *reduces* the S=2 compute penalty without eliminating it.
+
+**Conclusion:** MTP remains gated on the Mamba-state rollback fix (snapshot conv+SSM ~166
+MiB, restore, replay the scan for the accepted prefix — see [[nemotron-mtp-blocked]]), which
+#90 does not provide. Whether the reduced S=2 penalty now nets positive at 77 % acceptance
+is **only measurable after correctness lands** — do that A/B then, not before. Correcting an
+earlier draft of this section that called it a clean "bytes-bound loss": that contradicted
+the measured compute-bound decomposition and read a confounded (17 %-acceptance) number as a
+verdict. Not chased further this session.
+
+**Correction (a false alarm of mine):** an earlier draft here claimed the *nemotron* prompt
+in `scripts/models.toml` had out-of-vocab tokens and crashed `bench.sh nemotron decode`. It
+does **not** — every model's prompt is valid for its own model (nemotron L89 max 104209 <
+vocab 131072; verified `coli gen` runs decode at 8.49 tok/s). The `embed_row` index panic I
+hit came from a throwaway MTP-measurement script of mine reading the *first* prompt in the
+file — minimax-m3's (max 151521) — and feeding it to the nemotron container (vocab 131072).
+The `coli serve` MTP numbers above are unaffected (serve tokenizes text correctly). Real
+takeaway kept: `embed_row` now asserts `tok < vocab` with a named error instead of an opaque
+slice panic, so this class of mistake self-diagnoses (separate branch).
 
 > **#98 is RESOLVED — jump to the “#98 RESOLVED” section just below this one.** The step
 > function was a real characterisation, but the root cause was found afterward (per-call
