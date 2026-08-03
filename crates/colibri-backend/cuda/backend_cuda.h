@@ -34,6 +34,10 @@ COLI_CUDA_DLLEXPORT int coli_cuda_device_at(int index);
 COLI_CUDA_DLLEXPORT int coli_cuda_mem_info(int device, size_t *free_bytes, size_t *total_bytes);
 /* device < 0 returns aggregate statistics for all configured devices. */
 COLI_CUDA_DLLEXPORT void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes);
+/* Live DeviceContext scratch (device + pinned host), EXCLUDING the weight cache that
+ * coli_cuda_stats reports. On GB10 both draw on the same LPDDR5X pool, and none of it is
+ * visible to the Rust RAM ledger today. */
+COLI_CUDA_DLLEXPORT size_t coli_cuda_scratch_bytes(int device);
 COLI_CUDA_DLLEXPORT void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                            double *h2d_ms, double *kernel_ms, double *d2h_ms);
 
@@ -45,12 +49,30 @@ COLI_CUDA_DLLEXPORT int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
 /* Zero-copy wrap: point at host (RAM) buffers directly instead of copying to
  * device memory. Only valid on unified-memory devices with pageable host access
  * (the GB10). Weights stay in their on-disk layout. No device allocation. */
+/* Resident-weight residency: 0 = upload a device copy (fast reads, costs a second
+ * copy of every weight), 1 = wrap the host buffer and read it in place (free, slower
+ * reads). See the definition for why Kimi-K3 forces the choice. */
+COLI_CUDA_DLLEXPORT void coli_cuda_set_weight_zerocopy(int on);
+
+COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap_mxfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale, int I, int O, int device);
+
+/* Kimi-K3 MXFP4 expert FFN with the situ activation. fmt must be 6 on all three. */
+COLI_CUDA_DLLEXPORT int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,
+        ColiCudaTensor *up, ColiCudaTensor *down, float *y, const float *x, int S,
+        float beta, float linear_beta);
+
 COLI_CUDA_DLLEXPORT int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
                             const void *weights, const float *scales,
                             int fmt, int I, int O, int device);
 
 /* 1 if the device can read pageable host memory directly (zero-copy wrap works). */
 COLI_CUDA_DLLEXPORT int coli_cuda_pageable_access(int device);
+/* Page-lock host memory the engine already owns, so the GPU can DMA out of it without
+ * the driver bouncing the copy through its own staging buffer. Returns 0 on failure
+ * (and clears the error) — the caller is expected to fall back, not to fail. */
+COLI_CUDA_DLLEXPORT int coli_cuda_host_register(void *p, size_t bytes);
+COLI_CUDA_DLLEXPORT void coli_cuda_host_unregister(void *p);
 
 /*
  * y[S,O] = x[S,I] @ W[O,I]^T.

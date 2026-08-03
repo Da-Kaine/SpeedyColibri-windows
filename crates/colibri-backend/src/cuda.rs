@@ -67,6 +67,28 @@ extern "C" {
         device: c_int,
     ) -> c_int;
     fn coli_cuda_pageable_access(device: c_int) -> c_int;
+    fn coli_cuda_host_register(p: *mut c_void, bytes: usize) -> c_int;
+    fn coli_cuda_host_unregister(p: *mut c_void);
+    fn coli_cuda_set_weight_zerocopy(on: c_int);
+    fn coli_cuda_tensor_wrap_mxfp4(
+        tensor: *mut *mut ColiCudaTensor,
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: c_int,
+        o: c_int,
+        device: c_int,
+    ) -> c_int;
+    fn coli_cuda_expert_mlp_mxfp4_situ(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+        beta: f32,
+        linear_beta: f32,
+    ) -> c_int;
     fn coli_cuda_matmul(
         tensor: *mut *mut ColiCudaTensor,
         y: *mut f32,
@@ -150,6 +172,16 @@ extern "C" {
         x: *const f32,
     ) -> c_int;
     fn coli_cuda_expert_group_nvfp4_relu2(
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn coli_cuda_expert_group_nvfp4(
+        gates: *const *mut ColiCudaTensor,
         ups: *const *mut ColiCudaTensor,
         downs: *const *mut ColiCudaTensor,
         rows: *const c_int,
@@ -280,6 +312,7 @@ extern "C" {
     fn coli_cuda_pipe_upload(device: c_int, dst: *mut c_void, src: *const c_void, bytes: usize) -> c_int;
     fn coli_cuda_tensor_free(tensor: *mut ColiCudaTensor);
     fn coli_cuda_tensor_bytes(tensor: *const ColiCudaTensor) -> usize;
+    fn coli_cuda_scratch_bytes(device: c_int) -> usize;
     fn coli_cuda_tensor_device(tensor: *const ColiCudaTensor) -> c_int;
 }
 
@@ -290,9 +323,44 @@ pub fn device_count() -> i32 {
     unsafe { coli_cuda_device_count() }
 }
 
+/// Live CUDA scratch across every device: activation/GEMM buffers, expert staging, the
+/// Mamba2 scan arenas, attention scratch, and the pinned host staging — but NOT the device
+/// weight cache.
+///
+/// This exists because on GB10 that memory is invisible to the RAM ledger and yet entirely
+/// real: "VRAM" is the same LPDDR5X the ledger is trying to budget. `Class::Scratch` is
+/// charged in one place, as a prediction, on the grouped NVFP4 path only — so an MXFP4
+/// model charges ~nothing while allocating all of it.
+///
+/// Reports capacities, which is what is actually held: the C `reserve` helper keeps a
+/// buffer whenever its capacity already covers the request.
+pub fn scratch_bytes() -> u64 {
+    unsafe { coli_cuda_scratch_bytes(-1) as u64 }
+}
+
 /// Initialize the given CUDA device ordinals. Returns whether init succeeded.
+///
+/// Installs the host-pinning hooks on success. They are what lets the expert staging path
+/// DMA straight out of a pooled buffer instead of copying it first; without a device there
+/// is nothing to pin *for*, so they stay uninstalled and the pool allocates as it always did.
 pub fn init(devices: &[i32]) -> bool {
-    unsafe { coli_cuda_init(devices.as_ptr(), devices.len() as c_int) != 0 }
+    let ok = unsafe { coli_cuda_init(devices.as_ptr(), devices.len() as c_int) != 0 };
+    if ok {
+        colibri_core::quant::set_host_pin_hooks(host_register, host_unregister);
+    }
+    ok
+}
+
+/// Page-lock `bytes` at `p`. `false` means the memory stays pageable — a fallback, not an
+/// error: every caller keeps a working path for unpinned memory.
+pub fn host_register(p: *mut u8, bytes: usize) -> bool {
+    unsafe { coli_cuda_host_register(p as *mut c_void, bytes) != 0 }
+}
+
+/// Release a registration taken by [`host_register`]. Must be called before the allocation
+/// is freed — a registration outliving its memory is a dangling page-lock in the driver.
+pub fn host_unregister(p: *mut u8) {
+    unsafe { coli_cuda_host_unregister(p as *mut c_void) }
 }
 
 /// Release all CUDA resources.
@@ -310,6 +378,12 @@ pub fn set_activation(oai: bool, alpha: f32, limit: f32) {
 /// Whether `device` can read pageable host memory directly (coherent unified
 /// memory like the GB10). When true, the zero-copy [`ResidentTensor::wrap_raw`]
 /// path avoids copying weights into device memory entirely.
+/// Whether `tensor_upload` wraps host buffers instead of copying to the device. Set once
+/// at load, before any matmul: an already-cached tensor keeps whichever form it got.
+pub fn set_weight_zerocopy(on: bool) {
+    unsafe { coli_cuda_set_weight_zerocopy(on as c_int) }
+}
+
 pub fn pageable_access(device: i32) -> bool {
     unsafe { coli_cuda_pageable_access(device) != 0 }
 }
@@ -425,6 +499,29 @@ impl ResidentTensor {
     ) -> Option<ResidentTensor> {
         let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
         if coli_cuda_tensor_wrap_nvfp4(&mut ptr, weights, bscale, gscale, i, o, device) != 0
+            && !ptr.is_null()
+        {
+            Some(ResidentTensor { ptr })
+        } else {
+            None
+        }
+    }
+
+    /// Zero-copy wrap of an MXFP4 expert weight `[O, I]` (fmt=6): packed e2m1 nibbles
+    /// plus E8M0 per-32 block scales, both read from host RAM in place.
+    ///
+    /// # Safety
+    /// `weights`/`bscale` must outlive every kernel that uses this tensor.
+    pub unsafe fn wrap_raw_mxfp4(
+        weights: *const c_void,
+        bscale: *const c_void,
+        gscale: f32,
+        i: i32,
+        o: i32,
+        device: i32,
+    ) -> Option<ResidentTensor> {
+        let mut ptr: *mut ColiCudaTensor = std::ptr::null_mut();
+        if coli_cuda_tensor_wrap_mxfp4(&mut ptr, weights, bscale, gscale, i, o, device) != 0
             && !ptr.is_null()
         {
             Some(ResidentTensor { ptr })
@@ -634,6 +731,24 @@ pub unsafe fn expert_mlp_nvfp4_raw(
 ///
 /// # Safety
 /// The two handles must be resident on the same device; `y`/`x` hold `s*up.I` floats.
+/// Kimi-K3 MXFP4 expert FFN with the situ activation. All three must be fmt==6.
+///
+/// # Safety
+/// The three handles must be resident on the same device; `y`/`x` hold `s*O`/`s*I` floats.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn expert_mlp_mxfp4_situ_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+    beta: f32,
+    linear_beta: f32,
+) -> bool {
+    coli_cuda_expert_mlp_mxfp4_situ(gate, up, down, y, x, s, beta, linear_beta) != 0
+}
+
 pub unsafe fn expert_mlp_nvfp4_relu2_raw(
     up: *mut ColiCudaTensor,
     down: *mut ColiCudaTensor,
@@ -722,6 +837,32 @@ pub unsafe fn expert_seg_nvfp4_relu2_raw(
         downs.as_ptr(),
         rows.as_ptr(),
         ups.len() as c_int,
+        y,
+        x,
+    ) != 0
+}
+
+/// Grouped NVFP4 **SwiGLU** experts (M2.7 / M3 / GLM-5.2): the three-tensor twin of
+/// [`expert_group_nvfp4_relu2_raw`]. These models previously had no grouped path at all and
+/// fell through to one `expert_mlp_nvfp4` call per expert — ~15872 round trips per prefill.
+pub unsafe fn expert_group_nvfp4_raw(
+    gates: &[*mut ColiCudaTensor],
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = gates.len();
+    if count == 0 || ups.len() != count || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group_nvfp4(
+        gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
         y,
         x,
     ) != 0

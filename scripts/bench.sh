@@ -18,6 +18,9 @@ source "$(dirname "$0")/lib.sh"
 MODEL="$1"; SUITE="${2:-all}"
 load_model "$MODEL"; need_coli; need_container
 cd "$REPO_ROOT"
+# Claim the box for the duration. Anything that would contend for the NVMe or the network
+# — notably a Hugging Face container upload — tests this and refuses to start.
+bench_lock_acquire
 
 REPS="${BENCH_REPS:-3}"
 NTOK_PROMPT="$(wc -w <<<"$PROMPT_TOKENS")"
@@ -37,6 +40,7 @@ field() { grep -oP "$2" <<<"$1" | head -1 || true; }
 suite_prefill() {
   echo; echo "── prefill (NGEN=1, profile; $REPS reps + warmup) ──"
   local prefills=() eloads=() toks=()
+  mem_reset
   COLI_NGEN=1 COLI_PROFILE=1 COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS >/dev/null 2>&1 || true
   local i out pf el ff pj at mo tok
   for i in $(seq 1 "$REPS"); do
@@ -56,6 +60,7 @@ suite_prefill() {
     "$(median "${prefills[@]}")" "$(median "${eloads[@]}")" \
     "$(awk -v n="$NTOK_PROMPT" -v ms="$(median "${prefills[@]}")" 'BEGIN{printf (ms>0)? n/(ms/1000) : 0}')"
   gate_tokens "${toks[@]}"
+  mem_reset
 }
 
 # ---- decode: warm steady-state tok/s + decode phase breakdown ------------------
@@ -66,6 +71,7 @@ suite_decode() {
   # Steady-state = MEDIAN of the per-token rates (robust to the cold first tokens and
   # the ±40% expert-load cache spikes); `best` = the compute-floor token.
   local meds=() toks=()
+  mem_reset
   COLI_NGEN="$ngen" COLI_TIMING=1 "$COLI_BIN" gen "$CONTAINER" $PROMPT_TOKENS >/dev/null 2>&1 || true
   local i out med best tok
   for i in $(seq 1 "$REPS"); do
@@ -80,6 +86,7 @@ suite_decode() {
   done
   printf "  MEDIAN across reps: %s tok/s\n" "$(median "${meds[@]}")"
   gate_tokens "${toks[@]}"
+  mem_reset
 }
 
 # ---- batch: aggregate tok/s vs batch size + a token-identity verify -------------
@@ -87,8 +94,16 @@ suite_batch() {
   local sizes="${BATCH_SIZES:-1 4 8 16 32}" ngen="${BATCH_NGEN:-10}"
   echo; echo "── batch (genbatch aggregate tok/s vs B; ngen=$ngen) ──"
   echo "  verify (B=8, token-identity vs single-sequence):"
-  local vraw vout
-  vraw=$(COLI_BATCH_VERIFY=1 "$COLI_BIN" genbatch "$CONTAINER" 8 8 $PROMPT_TOKENS 2>&1)
+  local vraw vout vrc=0
+  # `|| vrc=$?` is load-bearing. This script runs under `set -euo pipefail`, and a failing
+  # command substitution in an assignment ABORTS right here — which made the "SKIPPED"
+  # branch below unreachable dead code for the entire time it has existed.
+  #
+  # Measured 2026-08-02: Nemotron-H (hybrid — 40 Mamba2 + 40 latent-MoE + 8 GQA) has no
+  # batched decode, so `genbatch` exits non-zero, the `all` suite died on this line, and it
+  # took the SERVE results down with it. The symptom is a bare `rc=1` with nothing printed
+  # after the verify header, which reads like a crash rather than an unsupported config.
+  vraw=$(COLI_BATCH_VERIFY=1 "$COLI_BIN" genbatch "$CONTAINER" 8 8 $PROMPT_TOKENS 2>&1) || vrc=$?
   # Models whose architecture has no batched path say so; report that and skip the
   # sweep rather than printing a column of blanks for every B (which reads as a
   # measurement rather than an unsupported configuration).
@@ -97,11 +112,24 @@ suite_batch() {
     grep -oiP "batched decode is not implemented[^\"]*" <<<"$vraw" | head -1 | sed 's/^/      /'
     return 0
   fi
+  # Any OTHER non-zero exit is a real failure, not an unsupported configuration. Say so
+  # loudly and skip only this suite — swallowing it would turn a broken batched path into a
+  # silently missing row, and losing the rest of the run to it is worse still.
+  if [[ "$vrc" != 0 ]]; then
+    echo "    genbatch FAILED (rc=$vrc) — batch suite skipped, rest of the run continues:"
+    printf '%s\n' "$vraw" | tail -3 | sed 's/^/      /'
+    return 0
+  fi
   vout=$(grep -i "VERIFY" <<<"$vraw" || true)
   echo "    ${vout:-<no VERIFY line — check genbatch output>}"
-  local b out rate step
+  local b out rate step brc
   for b in $sizes; do
-    out=$("$COLI_BIN" genbatch "$CONTAINER" "$b" "$ngen" $PROMPT_TOKENS 2>&1)
+    brc=0
+    out=$("$COLI_BIN" genbatch "$CONTAINER" "$b" "$ngen" $PROMPT_TOKENS 2>&1) || brc=$?
+    if [[ "$brc" != 0 ]]; then
+      printf "  B=%-3s  FAILED rc=%s (%s)\n" "$b" "$brc" "$(printf '%s' "$out" | tail -1)"
+      continue
+    fi
     rate=$(field "$out" 'aggregate \K[0-9.]+')
     step=$(field "$out" 'steady-state \K[0-9.]+')
     printf "  B=%-3s  %8s ms/step   aggregate %s tok/s\n" "$b" "$step" "$rate"
@@ -112,6 +140,7 @@ suite_batch() {
 suite_serve() {
   local port="${SERVE_PORT:-8080}" ntok="${SERVE_NTOK:-32}"
   echo; echo "── serve (bench_serve.py, diverse NL prompts, HTTP :$port) ──"
+  mem_reset
   local log="/tmp/coli_serve_${MODEL}_$$.log"
   COLI_SERVE_MODEL="$MODEL" COLI_PORT="$port" "$COLI_BIN" serve "$CONTAINER" "$port" >"$log" 2>&1 &
   local pid=$!

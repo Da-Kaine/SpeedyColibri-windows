@@ -37,8 +37,8 @@ pub struct Layer {
     /// built at load time so `attention_gqa` runs ONE fused matmul per layer instead of
     /// three (q/k/v share the same input). When set, `q_proj`/`k_proj`/`v_proj` are dropped.
     pub qkv_proj: Option<QTensor>,
-    pub q_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
-    pub k_norm: Vec<f32>,        // per-head RMSNorm weight [head_dim] (gemma-folded)
+    pub q_norm: Vec<f32>, // per-head RMSNorm weight [head_dim] (gemma-folded)
+    pub k_norm: Vec<f32>, // per-head RMSNorm weight [head_dim] (gemma-folded)
 
     // MiniMax-M3 block-sparse Lightning Indexer (present only on sparse attention
     // layers; see `Config::idx_type` for M3). Empty/None on GLM and on M3 dense layers.
@@ -64,22 +64,22 @@ pub struct Layer {
     // DSA lightning indexer (present only on FULL indexer layers, i.e. when the
     // checkpoint was converted with the indexer weights). `None`/empty → no DSA on
     // this layer, so attention runs the dense path. See `crate::dsa`.
-    pub ix_wk: Option<QTensor>,     // key proj: hidden -> index_hd
-    pub ix_wq: Option<QTensor>,     // query proj: q_lora -> index_nh*index_hd
-    pub ix_wp: Option<QTensor>,     // per-head weight proj: hidden -> index_nh
-    pub ix_knorm_w: Vec<f32>,       // key LayerNorm weight (eps 1e-6)
-    pub ix_knorm_b: Vec<f32>,       // key LayerNorm bias
+    pub ix_wk: Option<QTensor>, // key proj: hidden -> index_hd
+    pub ix_wq: Option<QTensor>, // query proj: q_lora -> index_nh*index_hd
+    pub ix_wp: Option<QTensor>, // per-head weight proj: hidden -> index_nh
+    pub ix_knorm_w: Vec<f32>,   // key LayerNorm weight (eps 1e-6)
+    pub ix_knorm_b: Vec<f32>,   // key LayerNorm bias
 
     // ---- Nemotron-H Mamba2 mixer (present on `LayerKind::Mamba` layers) ----
     // `in_ln` above is the single block-input RMSNorm; Nemotron has no `post_ln`.
     pub mamba_in_proj: Option<QTensor>, // hidden -> d_inner + conv_dim + n_heads (18560)
     pub mamba_out_proj: Option<QTensor>, // d_inner -> hidden
-    pub mamba_conv_w: Vec<f32>,     // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
-    pub mamba_conv_b: Vec<f32>,     // conv bias [conv_dim]
-    pub mamba_a_log: Vec<f32>,      // [n_heads]; A = -exp(a_log)
-    pub mamba_d: Vec<f32>,          // skip connection [n_heads]
-    pub mamba_dt_bias: Vec<f32>,    // step bias [n_heads]
-    pub mamba_norm: Vec<f32>,       // gated RMSNorm weight [d_inner]
+    pub mamba_conv_w: Vec<f32>,         // depthwise conv [conv_dim, k] (from [conv_dim,1,k])
+    pub mamba_conv_b: Vec<f32>,         // conv bias [conv_dim]
+    pub mamba_a_log: Vec<f32>,          // [n_heads]; A = -exp(a_log)
+    pub mamba_d: Vec<f32>,              // skip connection [n_heads]
+    pub mamba_dt_bias: Vec<f32>,        // step bias [n_heads]
+    pub mamba_norm: Vec<f32>,           // gated RMSNorm weight [d_inner]
 
     // ---- Nemotron-H latent-MoE projections (present on `LayerKind::Moe` layers) ----
     // Routed experts (`sh_*` unused here; routed via the expert provider) run in the
@@ -87,6 +87,55 @@ pub struct Layer {
     // are reused for the gate. `up_proj`/`down_proj` reused for the shared expert.
     pub fc1_latent: Option<QTensor>, // hidden -> moe_latent
     pub fc2_latent: Option<QTensor>, // moe_latent -> hidden
+
+    // ---- Kimi-K3: the output gate, on BOTH mixers ----
+    // `g_proj` is present on all 93 layers (confirmed by sweeping the checkpoint
+    // headers), gating the mixer output before `o`. KDA and gated MLA share it.
+    pub attn_gate: Option<QTensor>, // hidden -> n_heads * head_dim
+
+    // ---- Kimi-K3 KDA mixer (present on `LayerKind::Kda` layers) ----
+    // q/k/v reuse `q_proj`/`k_proj`/`v_proj` above; `o` is the shared output proj.
+    /// per-head decay coefficient projection, `hidden -> n_heads`
+    pub kda_b_proj: Option<QTensor>,
+    /// low-rank forget gate, factored: `hidden -> r` then `r -> n_heads * head_dim`
+    pub kda_f_a: Option<QTensor>,
+    pub kda_f_b: Option<QTensor>,
+    /// short causal depthwise conv over q/k/v, each `[n_heads*head_dim, d_conv]`
+    /// (stored `[C, 1, k]` on disk; read flat it is exactly `[C, k]`).
+    pub kda_conv_q: Vec<f32>,
+    pub kda_conv_k: Vec<f32>,
+    pub kda_conv_v: Vec<f32>,
+    /// `[head_dim]`; the decay is derived from this as Mamba's is from `A_log`
+    pub kda_a_log: Vec<f32>,
+    /// `[n_heads * head_dim]` step bias
+    pub kda_dt_bias: Vec<f32>,
+    /// `[head_dim]` output RMSNorm weight, applied per head
+    pub kda_o_norm: Vec<f32>,
+
+    // ---- Kimi-K3 "attention residuals" (every layer) ----
+    // NOT a residual add, despite the name. K3 has NO ordinary residual stream: these
+    // drive a softmax attention over a stack of saved hidden states, which REPLACES the
+    // running state rather than adding to it (reference `_apply_attn_res`):
+    //
+    //     v      = [block_residual ; prefix_sum]        // [tokens, blocks+1, hidden]
+    //     k      = v * rsqrt(mean(v^2) + eps)           // RMSNorm each candidate
+    //     scores = sum(k * (res_norm * res_proj))       // the two [hidden] vecs multiplied
+    //     out    = softmax(scores) @ v                  // weighted avg of the RAW v
+    //
+    // So `*_res_norm` and `*_res_proj` are not a norm and a projection applied in
+    // sequence — they are multiplied elementwise into ONE `[hidden]` score vector. The
+    // `[1, hidden]` shape of `*_res_proj` is why it looks like a projection.
+    //
+    // `block_residual` grows by one entry every `attn_res_block_size` (12) layers and
+    // `prefix_sum` accumulates sublayer outputs across the whole stack, so this cannot
+    // be evaluated per-layer — it needs stack-level state (see the driver).
+    pub attn_res_norm: Vec<f32>,
+    pub attn_res_proj: Vec<f32>,
+    pub mlp_res_norm: Vec<f32>,
+    pub mlp_res_proj: Vec<f32>,
+
+    /// Kimi-K3 latent-MoE: RMSNorm applied in the `moe_latent` space, `[moe_latent]`.
+    pub routed_expert_norm: Vec<f32>,
 }
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /
@@ -190,6 +239,16 @@ pub struct KvCache {
     /// conv channel count `conv_dim` (cols per `mamba_conv` entry); 0 if unused.
     mamba_conv_dim: usize,
 
+    // ---- Kimi-K3 KDA recurrent state (per KDA layer; empty otherwise) ----
+    // Fixed-size like the Mamba2 state above and for the same reason: a delta rule
+    // carries a bounded association matrix between steps, so its memory is O(1) in
+    // context. Populated by [`KvCache::enable_kda`].
+    /// per-KDA-layer causal-conv history, each `[d_conv, 3 * n_heads * head_dim]`
+    /// (q, k and v each have their own `*_conv1d`), time-major.
+    kda_conv: Vec<Vec<f32>>,
+    /// per-KDA-layer delta-rule association matrix, each `[n_heads, head_dim, head_dim]`.
+    kda_state: Vec<Vec<f32>>,
+
     /// first valid position per layer (MTP partial caches start mid-sequence)
     pub kv_start: Vec<usize>,
     /// device-side KV shadow (persistent-KV GPU decode path); lazily allocated
@@ -242,6 +301,8 @@ impl KvCache {
             mamba_ssm: (0..n_rows).map(|_| SsmState::zeros(0, 0, 0)).collect(),
             mamba_d_conv: 0,
             mamba_conv_dim: 0,
+            kda_conv: vec![Vec::new(); n_rows],
+            kda_state: vec![Vec::new(); n_rows],
             kv_start: vec![0; n_rows],
             #[cfg(feature = "cuda")]
             dev: None,
@@ -264,8 +325,8 @@ impl KvCache {
     /// rows (attention/MoE) keep empty buffers. These are O(1) in context length, unlike
     /// the `max_t`-scaled KV rows, so they are allocated eagerly (small + always resident).
     pub(crate) fn enable_mamba2(&mut self, cfg: &Config) {
-        let conv_dim = cfg.mamba_inter as usize
-            + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
+        let conv_dim =
+            cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
         let k = cfg.mamba_d_conv as usize;
         let (nh, hd, ds) = (
             cfg.mamba_n_heads as usize,
@@ -281,6 +342,75 @@ impl KvCache {
             if cfg.layer_kind.get(li).copied() == Some(LayerKind::Mamba) {
                 self.mamba_conv[li] = vec![0.0f32; k * conv_dim];
                 self.mamba_ssm[li] = SsmState::zeros(nh, hd, ds);
+            }
+        }
+    }
+
+    /// This layer's KDA conv history: `3 * (d_conv - 1) * c` floats laid out
+    /// `[stream][token][channel]` for q, k, v (oldest token first). Zeros for a fresh
+    /// cache or a non-KDA layer, which is exactly the "convolve against nothing"
+    /// boundary a prefill wants.
+    pub(crate) fn kda_conv_take(&self, layer: usize, c: usize, k: usize) -> Vec<f32> {
+        let need = 3 * k.saturating_sub(1) * c;
+        match self.kda_conv.get(layer) {
+            Some(v) if v.len() >= need && need > 0 => v[..need].to_vec(),
+            _ => vec![0.0f32; need],
+        }
+    }
+
+    /// Replace this layer's KDA conv history. `carries` is what
+    /// [`KvCache::kda_conv_take`] returns, advanced by one step.
+    pub(crate) fn kda_conv_store(&mut self, layer: usize, carries: &[f32]) {
+        let Some(slot) = self.kda_conv.get_mut(layer) else {
+            return;
+        };
+        if slot.len() < carries.len() {
+            slot.resize(carries.len(), 0.0);
+        }
+        slot[..carries.len()].copy_from_slice(carries);
+    }
+
+    /// This layer's delta-rule association matrix, `[h, dk, dk]` flattened K-major.
+    /// Allocated by [`KvCache::enable_kda`]; empty on a non-KDA layer.
+    pub(crate) fn kda_state_mut(&mut self, layer: usize) -> &mut [f32] {
+        &mut self.kda_state[layer]
+    }
+
+    /// Element counts of one KDA layer's two fixed-size buffers, as f32 counts:
+    /// `(conv_history, delta_rule_state)`.
+    ///
+    /// The single source of truth for both [`KvCache::enable_kda`], which allocates
+    /// them, and [`KvCache::fixed_bytes`], which charges for them. Every past KV
+    /// accounting bug in this file was a second copy of a shape drifting from the
+    /// allocation, so there is deliberately only one copy of this one.
+    fn kda_state_lens(cfg: &Config) -> (usize, usize) {
+        let (nh, hd) = (cfg.kda_n_heads as usize, cfg.kda_head_dim as usize);
+        // q, k and v each carry their own `*_conv1d` over `nh * hd` channels.
+        let conv = cfg.kda_d_conv as usize * 3 * nh * hd;
+        // A delta rule keeps one `[head_dim, head_dim]` association matrix per head.
+        let state = nh * hd * hd;
+        (conv, state)
+    }
+
+    /// Enable the Kimi-K3 KDA recurrent state: for each [`LayerKind::Kda`] layer,
+    /// allocate the short causal-conv history and the per-head delta-rule matrix, both
+    /// zeroed. Gated-MLA rows keep empty buffers here and use the KV rows instead.
+    ///
+    /// O(1) in context length, like the Mamba2 state — so these are allocated eagerly
+    /// and charged to [`KvCache::fixed_bytes`], never to the per-token figure. K3
+    /// carries ~475 MB of this per *sequence* across its 69 KDA layers; a reservation
+    /// counting only per-token bytes under-commits by that much for every concurrent
+    /// sequence, and the shortfall is worst for SHORT requests, where the per-token
+    /// term is too small to accidentally cover it.
+    pub(crate) fn enable_kda(&mut self, cfg: &Config) {
+        let (conv, state) = Self::kda_state_lens(cfg);
+        let rows = self.kda_conv.len();
+        for li in 0..rows {
+            // Index by layer so the mixer can address `kda_*(li)` directly. The MTP row
+            // (if any) is past the end of `layer_kind` and is never KDA.
+            if cfg.layer_kind.get(li).copied() == Some(LayerKind::Kda) {
+                self.kda_conv[li] = vec![0.0f32; conv];
+                self.kda_state[li] = vec![0.0f32; state];
             }
         }
     }
@@ -319,6 +449,11 @@ impl KvCache {
         if model.cfg.arch == Arch::NemotronH {
             kv.enable_mamba2(&model.cfg);
         }
+        // Kimi-K3 is hybrid on the mixer axis: its 24 gated-MLA layers use the latent
+        // KV rows allocated above, its 69 KDA layers a fixed-size recurrent state.
+        if model.cfg.arch == Arch::KimiK3 {
+            kv.enable_kda(&model.cfg);
+        }
         kv
     }
 
@@ -334,14 +469,22 @@ impl KvCache {
     }
 
     /// How many layers actually hold KV. For a hybrid stack only the attention layers
-    /// do (Nemotron-H: 8 of 88) — `for_model` allocates rows for every layer, but the
-    /// non-attention rows are never written and stay lazily uncommitted, so they cost
-    /// no physical memory and must not be charged for.
-    fn kv_layers(cfg: &Config) -> usize {
+    /// do (Nemotron-H: 8 of 88; Kimi-K3: 24 of 93, the gated-MLA layers) — `for_model`
+    /// allocates rows for every layer, but the non-attention rows are never written and
+    /// stay lazily uncommitted, so they cost no physical memory and must not be charged
+    /// for.
+    ///
+    /// `pub` so the capacity planner reports the same number the reservation uses; it
+    /// used to keep its own copy of this predicate, which is exactly how the earlier
+    /// accounting bugs got in.
+    pub fn kv_layers(cfg: &Config) -> usize {
         if cfg.layer_kind.is_empty() {
             cfg.n_layers as usize
         } else {
-            cfg.layer_kind.iter().filter(|k| **k == LayerKind::Attn).count()
+            cfg.layer_kind
+                .iter()
+                .filter(|k| **k == LayerKind::Attn)
+                .count()
         }
     }
 
@@ -370,25 +513,37 @@ impl KvCache {
         Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
     }
 
-    /// Per-sequence KV bytes that do **not** scale with context length: the Mamba2
-    /// recurrent state (conv history + selective-scan state) on each Mamba layer.
+    /// Per-sequence KV bytes that do **not** scale with context length: the recurrent
+    /// state carried by every non-attention mixer in a hybrid stack.
     ///
-    /// O(1) in context, but far from free — Nemotron-H carries ~174 MB per sequence
-    /// across its 40 Mamba layers, dominated by the `[n_heads, head_dim, d_state]` scan
-    /// state. A reservation that counts only per-token bytes under-commits by that much
-    /// for every concurrent sequence, and the shortfall is worst for SHORT requests,
-    /// where the per-token term is too small to accidentally cover it.
+    /// Two contributors, one per hybrid arch:
+    /// - **Mamba2** ([`LayerKind::Mamba`], Nemotron-H): conv history + selective-scan
+    ///   state, ~174 MB/sequence across its 40 Mamba layers.
+    /// - **KDA** ([`LayerKind::Kda`], Kimi-K3): conv history + the per-head delta-rule
+    ///   association matrix, ~475 MB/sequence across its 69 KDA layers — dominated by
+    ///   the `[n_heads, head_dim, head_dim]` matrix.
+    ///
+    /// O(1) in context, but far from free. A reservation that counts only per-token
+    /// bytes under-commits by this much for every concurrent sequence, and the shortfall
+    /// is worst for SHORT requests, where the per-token term is too small to accidentally
+    /// cover it. The shapes come from [`KvCache::kda_state_lens`] and `enable_mamba2`'s
+    /// own arithmetic, so this cannot drift from what is actually allocated.
     pub fn fixed_bytes(cfg: &Config) -> usize {
         if cfg.layer_kind.is_empty() {
             return 0;
         }
-        let n_mamba = cfg.layer_kind.iter().filter(|k| **k == LayerKind::Mamba).count();
+        let count = |want: LayerKind| cfg.layer_kind.iter().filter(|k| **k == want).count();
+        // Mamba2 (Nemotron-H). Zero elsewhere: no `Mamba` layers and zeroed dims.
+        let n_mamba = count(LayerKind::Mamba);
         let conv_dim =
             cfg.mamba_inter as usize + 2 * cfg.mamba_n_groups as usize * cfg.mamba_d_state as usize;
         let conv = cfg.mamba_d_conv as usize * conv_dim;
-        let ssm = cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize
-            * cfg.mamba_d_state as usize;
-        n_mamba * (conv + ssm) * 4
+        let ssm =
+            cfg.mamba_n_heads as usize * cfg.mamba_head_dim as usize * cfg.mamba_d_state as usize;
+        // KDA (Kimi-K3). Same: zero unless the stack actually has `Kda` layers.
+        let n_kda = count(LayerKind::Kda);
+        let (kda_conv, kda_state) = Self::kda_state_lens(cfg);
+        (n_mamba * (conv + ssm) + n_kda * (kda_conv + kda_state)) * 4
     }
 
     /// Total resident bytes for a sequence of `n_tokens`: the per-token KV plus the
@@ -423,7 +578,15 @@ impl KvCache {
         let dev = self
             .dev
             .get_or_insert_with(|| crate::gpu::DeviceKv::new(n_layers, max_t));
-        dev.sync(layer, &self.latent[layer], &self.k_rot[layer], kvl, r, pos_base, tk)
+        dev.sync(
+            layer,
+            &self.latent[layer],
+            &self.k_rot[layer],
+            kvl,
+            r,
+            pos_base,
+            tk,
+        )
     }
 
     pub fn kv_lora(&self) -> usize {
@@ -564,6 +727,13 @@ pub struct Model {
     pub final_norm: Vec<f32>,
     pub layers: Vec<Layer>,
 
+    /// Kimi-K3's model-level attention-residual score vectors (`model.output_attn_res_*`),
+    /// applied once after the last layer and before [`Model::final_norm`]. Same
+    /// norm-times-proj form as the per-layer pair on [`Layer`]. Empty on every other
+    /// arch — K3 is the only one with attention residuals.
+    pub output_attn_res_norm: Vec<f32>,
+    pub output_attn_res_proj: Vec<f32>,
+
     /// whether the DSA lightning indexer weights are present
     pub has_dsa: bool,
     /// whether the native MTP speculative head is present and loaded
@@ -575,10 +745,155 @@ pub struct Model {
     pub mtp: Option<MtpHead>,
 }
 
+impl Layer {
+    /// Resident bytes this layer holds — every weight and norm it owns. Routed experts
+    /// are not here (they stream), which is exactly the split `Model::resident_bytes`
+    /// needs to budget the expert cache against.
+    ///
+    /// Enumerated per field like `mark_gpu_eligible`, and wrong in the same silent way if
+    /// a new arch's tensors are forgotten: the budget simply comes out too generous. The
+    /// unit test asserts the count of fields covered here matches the struct.
+    pub fn resident_bytes(&self) -> u64 {
+        let q = |t: &QTensor| t.bytes().max(0) as u64;
+        let oq = |t: &Option<QTensor>| t.as_ref().map(&q).unwrap_or(0);
+        let v = |x: &Vec<f32>| (x.len() * 4) as u64;
+        0 + q(&self.q_a)
+            + q(&self.q_b)
+            + q(&self.kv_a)
+            + q(&self.kv_b)
+            + q(&self.o)
+            + q(&self.gate_proj)
+            + q(&self.up_proj)
+            + q(&self.down_proj)
+            + q(&self.sh_gate)
+            + q(&self.sh_up)
+            + q(&self.sh_down)
+            + oq(&self.q_proj)
+            + oq(&self.k_proj)
+            + oq(&self.v_proj)
+            + oq(&self.qkv_proj)
+            + oq(&self.idx_q_proj)
+            + oq(&self.idx_k_proj)
+            + oq(&self.ix_wk)
+            + oq(&self.ix_wq)
+            + oq(&self.ix_wp)
+            + oq(&self.mamba_in_proj)
+            + oq(&self.mamba_out_proj)
+            + oq(&self.fc1_latent)
+            + oq(&self.fc2_latent)
+            + oq(&self.attn_gate)
+            + oq(&self.kda_b_proj)
+            + oq(&self.kda_f_a)
+            + oq(&self.kda_f_b)
+            + v(&self.in_ln)
+            + v(&self.post_ln)
+            + v(&self.q_a_ln)
+            + v(&self.kv_a_ln)
+            + v(&self.q_norm)
+            + v(&self.k_norm)
+            + v(&self.idx_q_norm)
+            + v(&self.idx_k_norm)
+            + v(&self.router)
+            + v(&self.router_bias)
+            + v(&self.ix_knorm_w)
+            + v(&self.ix_knorm_b)
+            + v(&self.mamba_conv_w)
+            + v(&self.mamba_conv_b)
+            + v(&self.mamba_a_log)
+            + v(&self.mamba_d)
+            + v(&self.mamba_dt_bias)
+            + v(&self.mamba_norm)
+            + v(&self.kda_conv_q)
+            + v(&self.kda_conv_k)
+            + v(&self.kda_conv_v)
+            + v(&self.kda_a_log)
+            + v(&self.kda_dt_bias)
+            + v(&self.kda_o_norm)
+            + v(&self.attn_res_norm)
+            + v(&self.attn_res_proj)
+            + v(&self.mlp_res_norm)
+            + v(&self.mlp_res_proj)
+            + v(&self.routed_expert_norm)
+    }
+}
+
 impl Model {
     /// Convenience accessor for the config.
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// Bytes of dense weight this model holds resident for its lifetime: embeddings,
+    /// lm_head, and every per-layer tensor. Routed experts are NOT counted — they stream
+    /// through the [`crate::ExpertCache`], which is precisely what this number is used to
+    /// budget.
+    ///
+    /// Exists because `MemAvailable` is the wrong input for that budget. Read right after
+    /// the load it looks generous — the expert cache has not filled yet, and reclaimable
+    /// page cache from reading the weights counts as available — so a budget derived from
+    /// it overshoots. This is the number that does not move: Kimi-K3 is ~63 GB of a
+    /// 121 GB box, where GLM is ~19, and that difference is the whole reason the same
+    /// `MemTotal/3` cache budget fits one and gets the other OOM-killed.
+    pub fn resident_bytes(&self) -> u64 {
+        let mut n = self.embed.bytes().max(0) as u64 + self.lm_head.bytes().max(0) as u64;
+        n += (self.final_norm.len() * 4) as u64;
+        for l in &self.layers {
+            n += l.resident_bytes();
+        }
+        n
+    }
+}
+
+#[cfg(test)]
+mod resident_bytes_tests {
+    use super::*;
+
+    /// `Layer::resident_bytes` must cover EVERY weight field on the struct.
+    ///
+    /// It is enumerated per field, like `mark_gpu_eligible`, and fails the same silent
+    /// way: forget a new arch's tensors and the number simply comes out too small, the
+    /// expert-cache budget too generous, and the process gets OOM-killed on a model
+    /// nobody re-checked. This counts the fields in the struct definition and compares
+    /// against the number the function sums, so adding a field without adding it there
+    /// fails here rather than in production.
+    #[test]
+    fn resident_bytes_covers_every_weight_field() {
+        let src = include_str!("model.rs");
+        let start = src.find("pub struct Layer {").expect("Layer struct");
+        let body = &src[start..start + src[start..].find("\n}").expect("struct end")];
+        let n_fields = body.matches(": QTensor").count()
+            + body.matches(": Option<QTensor>").count()
+            + body.matches(": Vec<f32>").count();
+
+        let fstart = src
+            .find("pub fn resident_bytes(&self) -> u64 {")
+            .expect("fn");
+        let fbody = &src[fstart..fstart + src[fstart..].find("\n    }").expect("fn end")];
+        let n_summed = fbody.matches("q(&self.").count() + fbody.matches("v(&self.").count();
+
+        assert_eq!(
+            n_summed, n_fields,
+            "Layer::resident_bytes sums {n_summed} fields but the struct has {n_fields} \
+             weight fields — a new one was added without being counted"
+        );
+    }
+
+    /// A layer with nothing in it costs nothing; one with a weight costs its bytes.
+    #[test]
+    fn resident_bytes_counts_what_is_present() {
+        let empty = Layer::default();
+        assert_eq!(empty.resident_bytes(), 0, "an empty layer holds nothing");
+
+        let mut l = Layer::default();
+        l.in_ln = vec![0.0; 16]; // 64 bytes
+        l.attn_gate = Some(QTensor {
+            fmt_code: 1,
+            o: 4,
+            i: 8,
+            ..Default::default()
+        });
+        // int8: o*i codes + o f32 scales = 32 + 16 = 48
+        assert_eq!(l.resident_bytes(), 64 + 48);
     }
 }
 
@@ -611,8 +926,15 @@ mod kv_accounting_tests {
                 "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
                 "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
         );
-        assert_eq!(KvCache::kv_layers(&cfg), 1, "only the single '*' layer holds KV");
-        assert!(KvCache::allocates_gqa_kv(&cfg), "for_model calls enable_gqa for NemotronH");
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            1,
+            "only the single '*' layer holds KV"
+        );
+        assert!(
+            KvCache::allocates_gqa_kv(&cfg),
+            "for_model calls enable_gqa for NemotronH"
+        );
 
         // per attn layer: mla(kv_lora 0 + qk_rope 4) + k_full/v_full(2*2*4=16) + shadow(mla)
         let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
@@ -667,10 +989,20 @@ mod kv_accounting_tests {
                 "scoring_func":"sigmoid","use_routing_bias":true,"hidden_act":"silu",
                 "rms_norm_eps":1e-5,"eos_token_id":2}"#,
         );
-        assert!(cfg.layer_kind.is_empty(), "uniform archs carry no layer_kind");
-        assert_eq!(KvCache::kv_layers(&cfg), cfg.n_layers as usize, "every layer holds KV");
+        assert!(
+            cfg.layer_kind.is_empty(),
+            "uniform archs carry no layer_kind"
+        );
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            cfg.n_layers as usize,
+            "every layer holds KV"
+        );
         assert_eq!(KvCache::fixed_bytes(&cfg), 0, "no recurrent state");
-        assert_eq!(KvCache::bytes_for(&cfg, 7), KvCache::bytes_per_token(&cfg) * 7);
+        assert_eq!(
+            KvCache::bytes_for(&cfg, 7),
+            KvCache::bytes_per_token(&cfg) * 7
+        );
 
         // Matches the long-standing formula for a GQA transformer.
         let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
@@ -679,5 +1011,134 @@ mod kv_accounting_tests {
             * (mla + 2 * cfg.n_kv_heads as usize * cfg.qk_head as usize + shadow)
             * 4;
         assert_eq!(KvCache::bytes_per_token(&cfg), expect);
+    }
+
+    /// The real Kimi-K3 geometry (93 layers = 69 KDA + 24 gated-MLA), so the figures the
+    /// admission path depends on are pinned to the model actually served, not a toy.
+    fn kimi_k3_cfg() -> Config {
+        cfg_from(
+            r#"{"model_type":"kimi_k3",
+                "architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{
+                  "hidden_size":7168,"num_hidden_layers":93,"num_attention_heads":96,
+                  "num_key_value_heads":96,"num_experts":896,"num_experts_per_token":16,
+                  "num_shared_experts":2,"moe_intermediate_size":3072,
+                  "intermediate_size":33792,"routed_expert_hidden_size":3584,
+                  "first_k_dense_replace":1,"q_lora_rank":1536,"kv_lora_rank":512,
+                  "qk_nope_head_dim":128,"qk_rope_head_dim":64,"v_head_dim":128,
+                  "vocab_size":163840,"max_position_embeddings":1048576,
+                  "rms_norm_eps":1e-05,"rope_theta":10000.0,"moe_renormalize":true,
+                  "mla_use_nope":true,"mla_use_output_gate":true,"hidden_act":"situ",
+                  "activation_situ_beta":4.0,"activation_situ_linear_beta":25.0,
+                  "moe_router_activation_func":"sigmoid","num_expert_group":1,
+                  "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":163586,
+                  "attn_res_block_size":12,
+                  "linear_attn_config":{"head_dim":128,"num_heads":96,
+                    "short_conv_kernel_size":4,
+                    "full_attn_layers":[4,8,12,16,20,24,28,32,36,40,44,48,52,56,60,64,68,
+                                        72,76,80,84,88,92,93]}},
+                "vision_config":{"vt_hidden_size":1024}}"#,
+        )
+    }
+
+    /// K3 splits its stack across two mixers, and each is accounted on a different axis:
+    /// the 24 gated-MLA layers hold a context-growing KV cache, the 69 KDA layers a
+    /// fixed-size recurrent state. Charging all 93 layers per token would be ~3.9x over;
+    /// omitting the KDA state (which is what happens if `fixed_bytes` only knows about
+    /// Mamba) leaves ~475 MB per concurrent sequence unreserved.
+    #[test]
+    fn kimi_k3_charges_mla_per_token_and_kda_per_sequence() {
+        let cfg = kimi_k3_cfg();
+        assert_eq!(cfg.n_layers, 93);
+        assert_eq!(
+            KvCache::kv_layers(&cfg),
+            24,
+            "only the gated-MLA layers hold KV"
+        );
+        assert!(
+            !KvCache::allocates_gqa_kv(&cfg),
+            "K3 is MLA: no k_full/v_full"
+        );
+
+        // Per token: 24 layers x (kv_lora 512 + qk_rope 64) x f32, doubled by the device
+        // shadow under cuda. 108 KiB/token there, 54 KiB on the host-only build.
+        let mla = cfg.kv_lora as usize + cfg.qk_rope as usize;
+        let shadow = if cfg!(feature = "cuda") { mla } else { 0 };
+        assert_eq!(KvCache::bytes_per_token(&cfg), 24 * (mla + shadow) * 4);
+
+        // Per sequence: 69 KDA layers x (conv history + delta-rule matrix), O(1) in ctx.
+        let conv = 4 * 3 * 96 * 128; // d_conv x (q,k,v) x n_heads*head_dim
+        let state = 96 * 128 * 128; // [n_heads, head_dim, head_dim]
+        assert_eq!(KvCache::fixed_bytes(&cfg), 69 * (conv + state) * 4);
+        assert_eq!(
+            KvCache::fixed_bytes(&cfg),
+            474_808_320,
+            "~475 MB per sequence"
+        );
+
+        // The fixed term must not scale with context — that is the whole point of it
+        // being separate, and the reason short requests are where it bites.
+        let (pt, fx) = (KvCache::bytes_per_token(&cfg), KvCache::fixed_bytes(&cfg));
+        assert_eq!(KvCache::bytes_for(&cfg, 1), pt + fx);
+        assert_eq!(KvCache::bytes_for(&cfg, 200_000), pt * 200_000 + fx);
+    }
+
+    /// The drift guard. Every KV accounting bug in this file has been a formula that
+    /// disagreed with what was actually allocated, so assert the two against each other
+    /// directly rather than against a second hand-derived constant.
+    #[test]
+    fn kimi_k3_fixed_bytes_equals_what_enable_kda_allocates() {
+        let cfg = kimi_k3_cfg();
+        let mut kv = KvCache::new(
+            cfg.n_layers as usize,
+            cfg.kv_lora as usize,
+            cfg.qk_rope as usize,
+            1,
+        );
+        kv.enable_kda(&cfg);
+
+        let allocated: usize = kv.kda_conv.iter().map(Vec::len).sum::<usize>()
+            + kv.kda_state.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(allocated * 4, KvCache::fixed_bytes(&cfg));
+
+        // ...and it landed on the KDA rows specifically, not on all 93.
+        let populated = kv.kda_state.iter().filter(|v| !v.is_empty()).count();
+        assert_eq!(populated, 69, "only KDA layers carry recurrent state");
+        for (li, k) in cfg.layer_kind.iter().enumerate() {
+            let has_state = !kv.kda_state[li].is_empty();
+            assert_eq!(
+                has_state,
+                *k == LayerKind::Kda,
+                "layer {li} state/kind mismatch"
+            );
+        }
+    }
+
+    /// A KDA layer must never be charged as a Mamba one or vice versa: the two live in
+    /// the same `fixed_bytes` sum and are distinguished only by `LayerKind`.
+    #[test]
+    fn kda_and_mamba_fixed_state_do_not_bleed_into_each_other() {
+        let k3 = kimi_k3_cfg();
+        assert_eq!(k3.mamba_n_heads, 0, "K3 sets no Mamba dims");
+        assert!(!k3.layer_kind.contains(&LayerKind::Mamba));
+
+        let nemo = cfg_from(
+            r#"{"model_type":"nemotron_h","hidden_size":8,"num_hidden_layers":4,
+                "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                "moe_intermediate_size":6,"moe_latent_size":4,
+                "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+        );
+        assert_eq!(nemo.kda_n_heads, 0, "Nemotron sets no KDA dims");
+        assert!(!nemo.layer_kind.contains(&LayerKind::Kda));
+        // Nemotron's figure is unchanged by the KDA term existing.
+        let conv_dim = nemo.mamba_inter as usize + 2 * 2;
+        assert_eq!(
+            KvCache::fixed_bytes(&nemo),
+            2 * (2 * conv_dim + 2 * 2 * 2) * 4
+        );
     }
 }

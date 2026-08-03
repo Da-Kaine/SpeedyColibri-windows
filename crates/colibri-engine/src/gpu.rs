@@ -52,6 +52,15 @@ impl GpuFfnCache {
     /// never evicting a `protect`ed key (the tensors the current op still needs).
     /// If everything left is protected, it stops (holding the minimum working set
     /// even if that exceeds the nominal budget).
+    ///
+    /// This is the same O(entries)-per-victim shape that cost the *expert* cache 1839 ms
+    /// on a profiled GLM run — worse here, in fact, since `protect.contains` linearly
+    /// scans a slice inside the inner loop. It is left alone deliberately: this cache
+    /// holds tens of entries (GLM 78 resident / 0 evictions, K3 1 / 143), not the expert
+    /// cache's ~2051, so the product is negligible and changing it would be an unmeasured
+    /// edit. Revisit **if this cache ever grows** — dropping the redundant device copy on
+    /// GB10, or Nemotron-style preloading, would make it the same problem.
+    /// See `State::evict_to_protecting` for the rank-once fix and its equivalence test.
     fn evict_to(&mut self, budget: u64, protect: &[usize]) {
         while self.bytes > budget {
             let clock = self.clock;
@@ -124,6 +133,55 @@ impl Drop for ExactExpertsGuard {
     fn drop(&mut self) {
         EXACT_EXPERTS.with(|c| c.set(self.0));
     }
+}
+
+/// How resident dense weights reach the GPU.
+///
+/// `try_matmul_qt` used to always UPLOAD: `cudaMalloc` + `cudaMemcpy` into a device
+/// buffer cached by host pointer. On GB10 "VRAM" is the same physical RAM as the host, so
+/// that is a second copy of every resident weight rather than a move — and it is charged
+/// against the same 121 GB the expert cache lives in.
+///
+/// The trade is real in both directions, so this is a choice rather than a default:
+///   * **Upload** — the kernel reads device memory (~273 GB/s measured) but the model's
+///     resident bytes are spent twice. Right when they fit.
+///   * **ZeroCopy** — `coli_cuda_tensor_wrap` points the kernel at the host buffer
+///     (~51 GB/s, the same path the streamed experts already take). Slower per access,
+///     but costs nothing. Right when Upload would not fit — and vastly better than the
+///     alternative of falling off the GPU entirely, which measured **6.8x** slower on
+///     nemotron decode.
+///
+/// Kimi-K3 is the case that forces it: ~63 GB resident of a 121 GB box, so uploading
+/// leaves no room for the expert cache and earlyoom kills the process mid-forward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightResidency {
+    /// Device copy, cached by host pointer.
+    Upload,
+    /// Host buffer read in place — no device allocation.
+    ZeroCopy,
+}
+
+thread_local! {
+    static RESIDENCY: std::cell::Cell<WeightResidency> =
+        const { std::cell::Cell::new(WeightResidency::Upload) };
+}
+
+/// Choose how resident weights reach the GPU. Set once at load, before any forward pass.
+pub fn set_weight_residency(m: WeightResidency) {
+    RESIDENCY.with(|c| c.set(m));
+    if available() {
+        cuda::set_weight_zerocopy(m == WeightResidency::ZeroCopy && zerocopy());
+    }
+}
+
+/// The current mode; `ZeroCopy` degrades to `Upload` if the device cannot read pageable
+/// host memory (nothing else in the tree could work either, but be explicit).
+pub fn weight_residency() -> WeightResidency {
+    let m = RESIDENCY.with(|c| c.get());
+    if m == WeightResidency::ZeroCopy && !zerocopy() {
+        return WeightResidency::Upload;
+    }
+    m
 }
 
 /// Whether the zero-copy wrap path is usable: a CUDA device is available and it
@@ -571,7 +629,9 @@ pub fn try_dsa_indexer_scores(
     if !available() || nsp == 0 || nh == 0 || nh > 32 || hd == 0 || t_len == 0 {
         return false;
     }
-    if qi.len() < nsp * nh * hd || hw.len() < nsp * nh || keys.len() < t_len * hd
+    if qi.len() < nsp * nh * hd
+        || hw.len() < nsp * nh
+        || keys.len() < t_len * hd
         || scores.len() < nsp * t_len
     {
         return false;
@@ -704,6 +764,20 @@ fn wrap_fresh(w: &QTensor) -> Option<cuda::ResidentTensor> {
             )
         };
     }
+    // MXFP4 (Kimi-K3): same three-buffer shape as NVFP4 — nibbles + block scales +
+    // global — but the format code selects the per-32 stride and the E8M0 decode.
+    if w.fmt_code == 6 {
+        return unsafe {
+            cuda::ResidentTensor::wrap_raw_mxfp4(
+                w.q4.as_ptr() as *const c_void,
+                w.bs.as_ptr() as *const c_void,
+                w.g,
+                w.i,
+                w.o,
+                0,
+            )
+        };
+    }
     unsafe { cuda::ResidentTensor::wrap_raw(weight_ptr(w), w.s.as_ptr(), w.fmt_code, w.i, w.o, 0) }
 }
 
@@ -772,13 +846,41 @@ pub fn try_expert_ffn(
         // download in expert_mlp_raw; out/x sized [nr, O]/[nr, I] by ffn().
         let ok = unsafe {
             if gate.fmt_code == 5 {
-                cuda::expert_mlp_nvfp4_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_nvfp4_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else if gate.fmt_code == 4 {
-                cuda::expert_mlp_fp8_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_fp8_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else if gate.fmt_code == 1 && tile_i8_enabled() {
-                cuda::expert_mlp_i8a16_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_i8a16_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             } else {
-                cuda::expert_mlp_raw(g.as_raw(), u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32)
+                cuda::expert_mlp_raw(
+                    g.as_raw(),
+                    u.as_raw(),
+                    d.as_raw(),
+                    out.as_mut_ptr(),
+                    x.as_ptr(),
+                    nr as i32,
+                )
             }
         };
         if ok {
@@ -798,9 +900,11 @@ pub fn try_expert_ffn(
         weight_ptr(up) as usize,
         weight_ptr(down) as usize,
     ];
-    let (Some(g), Some(u), Some(d)) =
-        (upload_ffn(gate, &keys), upload_ffn(up, &keys), upload_ffn(down, &keys))
-    else {
+    let (Some(g), Some(u), Some(d)) = (
+        upload_ffn(gate, &keys),
+        upload_ffn(up, &keys),
+        upload_ffn(down, &keys),
+    ) else {
         return false;
     };
     // SAFETY: handles are resident on device 0; out/x sized [nr, O]/[nr, I] by ffn().
@@ -823,6 +927,54 @@ pub fn try_expert_ffn(
 /// two-tensor expert — no gate projection). NVFP4-only: reuses the same zero-copy NVFP4
 /// decode as [`try_expert_ffn`], with a relu² activation between the up and down GEMMs.
 /// Returns `true` if it ran there; the caller falls back to the CPU reference otherwise.
+/// Kimi-K3 MXFP4 expert FFN with the situ activation: `y = down(situ(gate.x, up.x))`.
+///
+/// Exists because K3 could otherwise not use the GPU for experts at all — `ffn`
+/// deliberately declines the fused SwiGLU path when situ is set (those kernels apply
+/// oai-or-SiLU and would return success having computed a DIFFERENT activation), so K3's
+/// routed experts ran the scalar CPU loop at 85-99% of a measured forward pass.
+///
+/// Zero-copy only, like the NVFP4 paths: the nibble/block-scale plumbing has no
+/// device-copy variant.
+pub fn try_expert_ffn_mxfp4_situ(
+    gate: &QTensor,
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+    beta: f32,
+    linear_beta: f32,
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if gate.fmt_code != 6 || up.fmt_code != 6 || down.fmt_code != 6 {
+        return false;
+    }
+    let (Some(g), Some(u), Some(d)) = (wrap_fresh(gate), wrap_fresh(up), wrap_fresh(down)) else {
+        return false;
+    };
+    // SAFETY: g/u/d live to end of scope, covering the synchronous kernel + download;
+    // x/out are sized [nr, gate.i] / [nr, down.o] by `ffn`.
+    let ok = unsafe {
+        cuda::expert_mlp_mxfp4_situ_raw(
+            g.as_raw(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+            beta,
+            linear_beta,
+        )
+    };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 pub fn try_expert_ffn_relu2(
     up: &QTensor,
     down: &QTensor,
@@ -848,7 +1000,12 @@ pub fn try_expert_ffn_relu2(
     // expert_mlp_nvfp4_relu2_raw; out/x sized [nr, up.I]/[nr, up.I] by ffn() (latent-space).
     let ok = unsafe {
         cuda::expert_mlp_nvfp4_relu2_raw(
-            u.as_raw(), d.as_raw(), out.as_mut_ptr(), x.as_ptr(), nr as i32, exact_experts(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+            exact_experts(),
         )
     };
     if ok {
@@ -902,6 +1059,36 @@ fn expert_seg_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_SEG").ok().as_deref() == Some("1"))
 }
 
+/// Also take the segmented path when every expert has a SINGLE row — i.e. decode
+/// (`COLI_EXPERT_SEG_DECODE=1`).
+///
+/// The seg gate below requires some expert to have >1 row, so decode never reaches it: at
+/// one row per expert it issues a launch trio per expert instead of one for the layer.
+/// An nsys profile of Nemotron decode shows what that costs — **26,400 `nvfp4_gemv`
+/// launches averaging 15.4 us, i.e. ~407 ms, which is the whole of gpu-ffn**. Each warp
+/// handles one output row and reads ~512 B, so the kernels are latency-bound, not
+/// bandwidth-bound: widening their reads to 512 B/warp left the per-call time unchanged
+/// (15349 -> 15688 ns).
+///
+/// **MEASURED: a 2.4x REGRESSION. Leave off.** Nemotron decode, ABBA, 12 tokens, tokens
+/// identical in every arm: moe 1220 ms off vs 2963 ms on. `nvfp4_matmul_seg` tiles 16
+/// rows, so a 1-row expert wastes 15/16 of the MMA, and that redundant compute swamps the
+/// ~44x reduction in launches. It matches an earlier "seg-gemv" attempt recorded as
+/// measured-dead, so treat launch-batching for 1-row experts as settled unless someone
+/// writes a true segmented GEMV (one row per expert, many experts per grid) rather than
+/// reusing the 16-row matmul.
+///
+/// Kept as a knob because "why not just batch the launches?" is a question this profile
+/// will keep provoking, and this is the answer with a number.
+///
+/// Caveat for whoever measures next: `gpu-ffn` reports ~438 ms in BOTH arms here while
+/// `moe` differs by 1740 ms, so that timer does not capture this path's GPU work. Use
+/// `moe`, or nsys.
+fn expert_seg_decode_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_EXPERT_SEG_DECODE").ok().as_deref() == Some("1"))
+}
+
 fn group_prefill_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("COLI_EXPERT_GROUP_PREFILL").ok().as_deref() == Some("1"))
@@ -945,7 +1132,10 @@ pub fn try_expert_group(
         return true; // nothing routed — `out` unchanged
     }
     if !active.iter().all(|(ex, _, _)| {
-        ex.gate.gpu_eligible && ex.gate.fmt_code == 4 && ex.up.fmt_code == 4 && ex.down.fmt_code == 4
+        ex.gate.gpu_eligible
+            && ex.gate.fmt_code == 4
+            && ex.up.fmt_code == 4
+            && ex.down.fmt_code == 4
     }) {
         return false;
     }
@@ -969,14 +1159,15 @@ pub fn try_expert_group(
     let mut ci = 0usize;
     while ci < active.len() {
         let c1 = (ci + 64).min(active.len());
-        let (mut gs, mut us, mut ds, mut rows_i) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let (mut gs, mut us, mut ds, mut rows_i) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut keep = Vec::new(); // hold descriptors alive across the synchronous call
         let mut chunk_rows = 0usize;
         for (ex, rows, _) in &active[ci..c1] {
-            let (Some(gt), Some(ut), Some(dt)) =
-                (wrap_fresh(&ex.gate), wrap_fresh(&ex.up), wrap_fresh(&ex.down))
-            else {
+            let (Some(gt), Some(ut), Some(dt)) = (
+                wrap_fresh(&ex.gate),
+                wrap_fresh(&ex.up),
+                wrap_fresh(&ex.down),
+            ) else {
                 return false;
             };
             gs.push(gt.as_raw());
@@ -1079,6 +1270,205 @@ fn fit_usize(v: &mut Vec<usize>, n: usize) -> &mut [usize] {
 ///
 /// Returns false — leaving `out` untouched — if unavailable/ineligible, so the caller falls
 /// back to the per-expert loop.
+/// Experts staged per transfer in the grouped NVFP4 SwiGLU path (`COLI_GROUP_CHUNK`;
+/// `0` = the whole layer in one go).
+///
+/// **32, measured.** M2.7, 128-token prefill, one binary, tokens identical ([517]) at
+/// every point:
+///
+/// | experts/transfer | 1 | 8 | **32** | 128 | whole layer |
+/// |---|---|---|---|---|---|
+/// | wall | 77 s | 59 s | **56 s** | 66 s | 66 s |
+///
+/// It is a real optimum, not a monotone curve, which is why it is worth pinning rather
+/// than defaulting to "as big as possible". Small chunks pay the per-transfer latency once
+/// per expert and never let the copy engine get going; whole-layer chunks need a pinned
+/// buffer and a device arena sized to every expert the layer routed, and stall the first
+/// GEMM behind the last byte of the last expert. 32 amortizes the transfer while still
+/// letting compute start early.
+const GROUP_CHUNK_DEFAULT: usize = 32;
+
+fn group_chunk_experts() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        match std::env::var("COLI_GROUP_CHUNK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => None, // explicit 0 = whole layer
+            Some(n) => Some(n),
+            None => Some(GROUP_CHUNK_DEFAULT),
+        }
+    })
+}
+
+/// Grouped NVFP4 **SwiGLU** experts (MiniMax-M2.7 / M3 / GLM-5.2).
+///
+/// These models had no grouped path at all: `activation().relu2` is false for them, so the
+/// dispatcher offered the *fp8* group, which declines on `fmt_code == 5` and dropped every
+/// one of them to a per-expert call — ~15872 per prefill on M2.7, each with its own H2D,
+/// weight staging, D2H, sync and scratch-mutex acquire.
+///
+/// **Grouping alone is not the point.** Its ceiling was already measured at ~3% (see the
+/// relu2 twin below), and a segmented GEMM was measured and disproved as well. What this
+/// unlocks is per-layer bulk residency inside the kernel: one pinned transfer of the whole
+/// group's weights into a device arena, versus `COLI_FFN_DEVCOPY` staging one expert at a
+/// time out of pageable memory at 1.0-2.2 GB/s. Staging is 93.6% of expert-call GPU time
+/// on M2.7, so that transfer is the target — not the launches.
+pub fn try_expert_group_nvfp4(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if active.is_empty() {
+        return true;
+    }
+    // Every expert must be a gpu-eligible NVFP4 three-tensor SwiGLU of the expected shape, or
+    // decline and let the caller run per-expert.
+    if !active.iter().all(|(ex, _, _)| {
+        ex.gate.gpu_eligible
+            && ex.gate.fmt_code == 5
+            && ex.gate.i as usize == d
+            && ex.up.gpu_eligible
+            && ex.down.gpu_eligible
+            && ex.up.fmt_code == 5
+            && ex.down.fmt_code == 5
+            && ex.up.i as usize == d
+            && ex.down.o as usize == d
+    }) {
+        return false;
+    }
+    let total: usize = active.iter().map(|(_, r, _)| r.len()).sum();
+    let mut gsc = GROUP_SCRATCH.with(|c| c.take());
+    let x_all = fit_f32(&mut gsc.x_all, total * d);
+    let token_of = fit_usize(&mut gsc.token_of, total);
+    let weight_of = fit_f32(&mut gsc.weight_of, total);
+    let mut g = 0usize;
+    for (_, rows, rw) in active {
+        for (r, &t) in rows.iter().enumerate() {
+            x_all[g * d..(g + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
+            token_of[g] = t;
+            weight_of[g] = rw[r];
+            g += 1;
+        }
+    }
+    let y_all = fit_f32(&mut gsc.y_all, total * d);
+
+    // How many experts are staged per transfer (`COLI_GROUP_CHUNK`, 0 = the whole layer).
+    //
+    // This is the knob the residency win actually turns on, so it is worth a sweep rather
+    // than a guess. Bigger chunks amortize the per-transfer latency over more weight and
+    // give the copy engine a longer run; smaller chunks need a smaller pinned buffer and a
+    // smaller device arena, and start the first GEMM sooner. The arena is sized to the
+    // chunk, so this also bounds the device memory the path holds.
+    // Size the chunk to the RAM ledger, and charge it.
+    //
+    // On GB10 the staging is real system memory TWICE OVER — one pinned host buffer plus
+    // one device arena, both out of the same 121 GB pool — and neither was visible to the
+    // ledger. GLM-5.2 has the largest dense tier (34 GB with its device duplicate) and the
+    // least slack, so it was the one that tipped: earlyoom SIGTERMed it at 106.3 GiB with
+    // no tokens produced. This is the same accounting hole as the dense device duplicate,
+    // reintroduced by a new allocation, which is exactly why the rule has to be enforced
+    // where memory is taken rather than remembered per call site.
+    //
+    // Degrading is cheap, so prefer it to failing: the chunk sweep put 8 experts within 5%
+    // of 32 (59 s vs 56 s), so a short-on-memory model gives up very little by staging
+    // less at a time. If even one expert will not fit, decline and let the caller run the
+    // per-expert path, which allocates nothing beyond one expert's scratch.
+    let per_expert: u64 = active
+        .iter()
+        .map(|(ex, _, _)| ex.bytes())
+        .max()
+        .unwrap_or(0);
+    let staging_per_expert = per_expert.saturating_mul(2); // pinned host + device arena
+    let mut chunk = group_chunk_experts().unwrap_or(active.len()).max(1);
+    if staging_per_expert > 0 {
+        // Quarter of headroom: KV, activations and the read buffers draw on the same
+        // remainder, and a staging buffer that consumed all of it would simply move the
+        // kill to the next allocator.
+        let budget = crate::ram::manager()
+            .map(|m| m.headroom() / 4)
+            .unwrap_or(u64::MAX);
+        let fits = (budget / staging_per_expert) as usize;
+        if fits == 0 {
+            GROUP_SCRATCH.with(|c| c.set(gsc));
+            return false;
+        }
+        chunk = chunk.min(fits);
+        crate::ram::set_usage(
+            crate::ram::Class::Scratch,
+            staging_per_expert.saturating_mul(chunk as u64),
+        );
+    }
+    let mut ok = true;
+    let mut done = 0usize; // rows consumed so far, to slice x_all/y_all per chunk
+    for part in active.chunks(chunk) {
+        let part_rows: usize = part.iter().map(|(_, r, _)| r.len()).sum();
+        let mut gs: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(part.len());
+        let mut rws: Vec<i32> = Vec::with_capacity(part.len());
+        let mut keep = Vec::with_capacity(part.len() * 3);
+        let mut all_wrapped = true;
+        for (ex, rows, _) in part {
+            let (Some(gt), Some(ut), Some(dt)) = (
+                wrap_fresh(&ex.gate),
+                wrap_fresh(&ex.up),
+                wrap_fresh(&ex.down),
+            ) else {
+                all_wrapped = false;
+                break;
+            };
+            gs.push(gt.as_raw());
+            us.push(ut.as_raw());
+            ds.push(dt.as_raw());
+            rws.push(rows.len() as i32);
+            keep.push(gt);
+            keep.push(ut);
+            keep.push(dt);
+        }
+        if !all_wrapped {
+            drop(keep);
+            ok = false;
+            break;
+        }
+        // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
+        // synchronous through its own D2H; the sub-slices hold `part_rows * d` floats each.
+        let called = unsafe {
+            cuda::expert_group_nvfp4_raw(
+                &gs,
+                &us,
+                &ds,
+                &rws,
+                y_all[done * d..(done + part_rows) * d].as_mut_ptr(),
+                x_all[done * d..(done + part_rows) * d].as_ptr(),
+            )
+        };
+        drop(keep);
+        if !called {
+            ok = false;
+            break;
+        }
+        done += part_rows;
+    }
+    if ok {
+        for gg in 0..total {
+            let (t, wgt) = (token_of[gg], weight_of[gg]);
+            let ys = &y_all[gg * d..(gg + 1) * d];
+            let os = &mut out[t * d..(t + 1) * d];
+            for dd in 0..d {
+                os[dd] += wgt * ys[dd];
+            }
+        }
+    }
+    GROUP_SCRATCH.with(|c| c.set(gsc));
+    ok
+}
+
 pub fn try_expert_group_relu2(
     active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
     activations: &[f32],
@@ -1129,7 +1519,10 @@ pub fn try_expert_group_relu2(
     // ranges, so the weight stream gets real memory-level parallelism.
     //
     // `COLI_EXPERT_GROUP_PREFILL=1` lifts the restriction so this stays re-measurable.
-    if !group_prefill_enabled() && !expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() != 1) {
+    if !group_prefill_enabled()
+        && !expert_seg_enabled()
+        && active.iter().any(|(_, rows, _)| rows.len() != 1)
+    {
         return false;
     }
     // `d` is the expert input width (the MoE latent for Nemotron-H, not the model hidden);
@@ -1166,7 +1559,9 @@ pub fn try_expert_group_relu2(
     // SEGMENTED fast path: one grid for the whole layer. Only worth it when experts carry
     // real row counts (prefill); at decode every expert has a single row and the grouped
     // chunk path already amortizes the round-trip.
-    if expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() > 1) {
+    if (expert_seg_enabled() && active.iter().any(|(_, rows, _)| rows.len() > 1))
+        || (expert_seg_decode_enabled() && active.len() > 1)
+    {
         let mut us: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
         let mut ds: Vec<*mut cuda::ColiCudaTensor> = Vec::with_capacity(active.len());
         let mut rws: Vec<i32> = Vec::with_capacity(active.len());
@@ -1187,13 +1582,7 @@ pub fn try_expert_group_relu2(
             // SAFETY: us/ds stay resident until `keep` drops (after the synchronous call,
             // which includes the D2H); x_all/y_all hold `total * d` floats each.
             let ok = unsafe {
-                cuda::expert_seg_nvfp4_relu2_raw(
-                    &us,
-                    &ds,
-                    &rws,
-                    y_all.as_mut_ptr(),
-                    x_all.as_ptr(),
-                )
+                cuda::expert_seg_nvfp4_relu2_raw(&us, &ds, &rws, y_all.as_mut_ptr(), x_all.as_ptr())
             };
             drop(keep);
             if ok {

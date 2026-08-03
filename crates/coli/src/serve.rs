@@ -41,6 +41,16 @@ const DEFAULT_CTX: usize = 32_768;
 /// Tokens generated per warm-up prompt (enough to route a spread of experts).
 const WARMUP_TOKENS: usize = 8;
 
+/// How long a request waits for KV room before the server answers 503.
+///
+/// Two admissible requests can collide simply by overlapping, and the second only needs
+/// the first to finish. Rejecting on first try would make the node's capacity look far
+/// smaller than it is, so contention queues. A request that could never fit is separated
+/// out and answered 507 immediately — waiting cannot help it, and leaving it queued would
+/// block the requests behind it that *can* be served.
+///
+/// 30 s is well beyond a typical decode and well inside any sane client timeout.
+const KV_QUEUE_SECS: u64 = 30;
 
 /// Parse a token count like `32k`, `1m`, or `131072`.
 fn parse_ctx(s: &str) -> Option<usize> {
@@ -67,6 +77,25 @@ fn kv_bytes_per_token(cfg: &colibri_core::Config) -> usize {
 
 type Provider<'a> = ExpertCache<ShardsExpertProvider<'a>>;
 
+/// RAII release for [`ExpertCache::reserve_ram`], held for the life of a request.
+///
+/// The reservation must come back on *every* exit path — the two rejection arms, the normal
+/// completion, and any early return added later. A leak is not transient: the adaptive
+/// monitor subtracts `reserved` from the expert-cache budget on every 100 ms tick, so a
+/// forgotten release shrinks the cache permanently for the life of the process. That failure
+/// would be invisible in a smoke test and show up as a slow, unexplained decay under load,
+/// which is precisely the kind of bug worth spending a Drop impl to make impossible.
+struct KvRoom<'p, 'a> {
+    provider: &'p Provider<'a>,
+    bytes: u64,
+}
+
+impl Drop for KvRoom<'_, '_> {
+    fn drop(&mut self) {
+        self.provider.release_ram(self.bytes);
+    }
+}
+
 /// `coli serve <snap> [port] [warm-up prompt...]`. `snap` is injected by the CLI
 /// dispatcher (position 2). An optional pure-integer next arg is the port; any
 /// remaining args are one warm-up prompt. `COLI_PORT` / `COLI_WARMUP` (the latter
@@ -79,6 +108,7 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    crate::note_model_switch(&snap);
 
     // Port: a leading bare integer arg, else COLI_PORT, else the default.
     let mut rest = &args[3.min(args.len())..];
@@ -87,7 +117,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
             rest = &rest[1..];
             p
         }
-        None => std::env::var("COLI_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_PORT),
+        None => std::env::var("COLI_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_PORT),
     };
 
     // Warm-up prompts: the remaining positional args as one prompt, plus each
@@ -97,7 +130,11 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         warmups.push(rest.join(" "));
     }
     if let Ok(w) = std::env::var("COLI_WARMUP") {
-        warmups.extend(w.split('|').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+        warmups.extend(
+            w.split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
     }
 
     // ---- load model + tokenizer -------------------------------------------
@@ -163,8 +200,8 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     // when a large request finally allocates its KV.
     const CTX_RAM_RESERVE: u64 = 18 << 30;
     let kv_pt = (kv_bytes_per_token(&model.cfg) as u64).max(1); // already includes device shadow
-    // Subtract the fixed per-sequence state (Mamba2) before dividing: it is not a
-    // per-token cost, so folding it into `kv_pt` would scale it with context.
+                                                                // Subtract the fixed per-sequence state (Mamba2) before dividing: it is not a
+                                                                // per-token cost, so folding it into `kv_pt` would scale it with context.
     let kv_fixed = KvCache::fixed_bytes(&model.cfg) as u64;
     let ram_ctx = colibri_engine::total_ram_bytes()
         .map(|t| (t.saturating_sub(CTX_RAM_RESERVE).saturating_sub(kv_fixed) / kv_pt) as usize)
@@ -178,33 +215,44 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         );
     }
 
-    // Worst-case KV for the served window (a single full-context request). No longer
-    // reserved up front: each request reserves *its own* KV dynamically (evicting experts
-    // just-in-time — see `ExpertCache::reserve_ram`), so this is only the ceiling we quote.
-    // The initial expert budget leaves a modest base for it; the adaptive monitor takes over.
+    // Worst-case KV for the served window (a single full-context request). Not reserved up
+    // front — each request commits its own KV — so this is only the ceiling we quote.
+    //
+    // **This comment used to say requests evict experts just-in-time "see
+    // `ExpertCache::reserve_ram`". That is false and always was**: `reserve_ram` has no
+    // callers anywhere in the tree, and `COLI_GUARD_TRACE=1` on a serve run shows
+    // `reserved=0.00 GB` on all 998 ticks. It is the second comment found citing that dead
+    // function as a live mechanism (the first was `RUNTIME_RESERVE`, corrected earlier).
+    //
+    // What actually happens: `handle` commits through `commit_or_wait(Class::Kv, kv_bytes,
+    // rigid, …)` against `rigid = ceiling − Dense − Experts`. Nothing evicts experts for a
+    // specific pending request. `Experts` is the CURRENT cache — memory that is entirely
+    // evictable — so a prompt can be refused while tens of GB of reclaimable cache sits
+    // resident. The adaptive monitor does evict, but against *its own* ceiling on a 100 ms
+    // tick, not on behalf of a waiting request. See task #39.
     let kv_worst_case = KvCache::bytes_for(&model.cfg, ctx_len) as u64;
     let budget = crate::ram_budget_reserving(kv_worst_case.min(8 << 30));
     let gib = (1u64 << 30) as f64;
     if budget == u64::MAX {
         // No /proc/meminfo (non-Linux dev box): the budget is unbounded, and printing
         // it as a number renders "17179869184 GB". Say what actually happened.
-        println!(
-            "[serve] expert cache: unbounded (no MemAvailable to budget from) \
-             — set COLI_RAM_GB to cap it"
-        );
+        println!("[serve] expert cache: unbounded (no MemAvailable to budget from)");
     } else {
         println!(
-            "[serve] expert cache: {:.0} GB initial budget; KV reserved per request \
-             (≤ {:.1} GB at the full {} ctx{}) — set COLI_RAM_GB to override",
+            "[serve] expert cache: {:.0} GB initial budget (adaptive); KV reserved per \
+             request (≤ {:.1} GB at the full {} ctx{})",
             budget as f64 / gib,
             kv_worst_case as f64 / gib,
             ctx_len,
-            if cfg!(feature = "cuda") { ", incl. device shadow" } else { "" }
+            if cfg!(feature = "cuda") {
+                ", incl. device shadow"
+            } else {
+                ""
+            }
         );
     }
 
-    let usage_path =
-        std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
+    let usage_path = std::env::var("COLI_USAGE").unwrap_or_else(|_| format!("{snap}/.coli_usage"));
     let history = colibri_engine::UsageHistory::load(&usage_path).unwrap_or_default();
 
     // The expert->node map comes first: it gates what this node may load (below), and
@@ -230,10 +278,16 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
     );
     let provider = std::sync::Arc::new(ExpertCache::new(base, budget));
     let owned_ids: Vec<u32> = sharding.local_experts(cluster.this_node).collect();
-    let maxres = crate::wire_adaptive_cache(&provider, &model.cfg, model.ebits as u32, &owned_ids);
+    let maxres = crate::wire_adaptive_cache(
+        &provider,
+        &model.cfg,
+        model.ebits as u32,
+        &owned_ids,
+        model.resident_bytes(),
+    );
     crate::preload_all_experts(&provider, &model.cfg, maxres, &owned_ids);
     if let Some(topn) = crate::prefetch_topn() {
-        provider.enable_prefetch(topn);
+        provider.enable_prefetch(topn, model.cfg.n_experts as u64);
         println!("[serve] speculative next-layer prefetch on (top-{topn}/layer)");
     }
 
@@ -293,15 +347,26 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         if ids.is_empty() {
             continue;
         }
-        eprintln!("[serve] warm-up {}/{}: {} tokens", i + 1, warmups.len(), ids.len());
+        eprintln!(
+            "[serve] warm-up {}/{}: {} tokens",
+            i + 1,
+            warmups.len(),
+            ids.len()
+        );
         let mut kv = mk_kv(model, ids.len() + WARMUP_TOKENS);
-        if let Err(e) = colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS) {
+        if let Err(e) =
+            colibri_engine::generate_greedy(model, &mut kv, &*provider, &ids, WARMUP_TOKENS)
+        {
             eprintln!("[serve] warm-up failed: {e}");
         }
     }
     if !warmups.is_empty() {
         let s = provider.stats();
-        eprintln!("[serve] warm-up done: {} experts resident ({:.1} GB)", s.resident, s.bytes as f64 / (1u64 << 30) as f64);
+        eprintln!(
+            "[serve] warm-up done: {} experts resident ({:.1} GB)",
+            s.resident,
+            s.bytes as f64 / (1u64 << 30) as f64
+        );
     }
 
     // ---- listen -----------------------------------------------------------
@@ -325,13 +390,18 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         crate::version_string()
     );
     let kv_at_ctx = KvCache::bytes_for(&model.cfg, ctx_len) as f64 / (1u64 << 30) as f64;
-    let model_max_str =
-        if model.cfg.max_ctx > 0 { model.cfg.max_ctx.to_string() } else { "unknown".to_string() };
+    let model_max_str = if model.cfg.max_ctx > 0 {
+        model.cfg.max_ctx.to_string()
+    } else {
+        "unknown".to_string()
+    };
     println!(
         "[serve]   context length: {ctx_len} tokens (model max {model_max_str}; up to {:.1} GB KV) — set COLI_CTX to change",
         kv_at_ctx
     );
-    println!("[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health");
+    println!(
+        "[serve]   POST /v1/chat/completions   POST /v1/completions   GET /v1/models   GET /health"
+    );
 
     // Scan the ConnectX/RoCE fabric and print the other Sparks we can see, so the
     // operator can verify the multi-node wiring at startup, then keep beaconing so
@@ -341,7 +411,10 @@ pub fn cmd_serve(args: &[String]) -> ExitCode {
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(3.0);
     if disc_secs > 0.0 {
-        let rank: u32 = std::env::var("COLI_NODE_RANK").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let rank: u32 = std::env::var("COLI_NODE_RANK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let d = colibri_cluster::discover(rank, port, Duration::from_secs_f64(disc_secs));
         let _ = colibri_cluster::discovery::print_report(&d, &mut std::io::stdout());
         colibri_cluster::discovery::spawn_beacon(rank, port);
@@ -440,14 +513,32 @@ fn handle(
             );
             send_json(&mut stream, 200, &body);
         }
-        ("POST", "/v1/completions") => {
-            complete(&mut stream, model, provider, tok, model_id, &req.body, false, ctx_len)
-        }
-        ("POST", "/v1/chat/completions") => {
-            complete(&mut stream, model, provider, tok, model_id, &req.body, true, ctx_len)
-        }
+        ("POST", "/v1/completions") => complete(
+            &mut stream,
+            model,
+            provider,
+            tok,
+            model_id,
+            &req.body,
+            false,
+            ctx_len,
+        ),
+        ("POST", "/v1/chat/completions") => complete(
+            &mut stream,
+            model,
+            provider,
+            tok,
+            model_id,
+            &req.body,
+            true,
+            ctx_len,
+        ),
         ("OPTIONS", _) => send_json(&mut stream, 204, ""),
-        _ => send_json(&mut stream, 404, "{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}"),
+        _ => send_json(
+            &mut stream,
+            404,
+            "{\"error\":{\"message\":\"not found\",\"type\":\"invalid_request_error\"}}",
+        ),
     }
 }
 
@@ -482,7 +573,11 @@ fn read_request<R: BufRead>(reader: &mut R) -> Option<Request> {
     if content_length > 0 {
         reader.read_exact(&mut body).ok()?;
     }
-    Some(Request { method, path, body: String::from_utf8_lossy(&body).into_owned() })
+    Some(Request {
+        method,
+        path,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
 }
 
 /// Shared handler for `/v1/completions` (chat=false) and `/v1/chat/completions`
@@ -541,7 +636,11 @@ fn complete(
         }
     };
     if ids.is_empty() {
-        send_json(stream, 400, "{\"error\":{\"message\":\"empty prompt\",\"type\":\"invalid_request_error\"}}");
+        send_json(
+            stream,
+            400,
+            "{\"error\":{\"message\":\"empty prompt\",\"type\":\"invalid_request_error\"}}",
+        );
         return;
     }
 
@@ -562,7 +661,11 @@ fn complete(
     }
     let max_tokens = requested_max.min(ctx_len - ids.len());
 
-    let object = if chat { "chat.completion" } else { "text_completion" };
+    let object = if chat {
+        "chat.completion"
+    } else {
+        "text_completion"
+    };
     let id = format!("cmpl-{}", ids.len().wrapping_mul(2654435761) ^ max_tokens);
     // The KV cache commits lazily (grows with tokens produced), so we reserve only the
     // PROMPT's KV — what prefill commits at once. The generation tail grows one token at a
@@ -573,11 +676,39 @@ fn complete(
     // state). That is O(1) in context, so counting only per-token bytes under-reserves worst
     // for SHORT prompts — where the per-token figure is far too small to cover it.
     let kv_bytes = KvCache::bytes_for(&model.cfg, ids.len()) as u64;
+
+    // MAKE ROOM BEFORE ASKING WHETHER IT FITS.
+    //
+    // `rigid` below subtracts the CURRENT expert cache — memory that is entirely
+    // reclaimable. Measured 2026-08-02 on m2.7: a 186828-token prompt needing 93.9 GB was
+    // refused against a 37.7 GB budget while 71.4 GB of evictable cache sat resident. It
+    // would have fit by 15.2 GB. `reserve_ram` evicts LRU experts down to a floor, holds the
+    // bytes against the monitor (which subtracts `reserved` from the cache budget every
+    // tick, so experts cannot refill into the space), and rolls back if even a full eviction
+    // cannot cover the request.
+    //
+    // This is the call a comment two hundred lines up claimed already existed. It did not:
+    // `reserve_ram` had ZERO callers, and `COLI_GUARD_TRACE=1` showed reserved=0.00 GB on
+    // every tick of a serve run.
+    //
+    // COST, stated plainly: admitting one very large prompt can evict most of the expert
+    // cache, and every concurrent request then streams from disk until the monitor refills.
+    // That is the right trade against the alternative — refusing outright a request the box
+    // can serve — but it is a real cost, not a free win.
+    let experts_before = colibri_engine::ram::manager()
+        .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+        .unwrap_or(0);
     if !provider.reserve_ram(kv_bytes) {
         let gib = (1u64 << 30) as f64;
+        eprintln!(
+            "[serve] REFUSED 507: {} tokens need {:.1} GiB KV — does not fit even after \
+             evicting the expert cache to its floor",
+            ids.len(),
+            kv_bytes as f64 / gib,
+        );
         let msg = format!(
-            "Not enough memory for this prompt: {} tokens need ~{:.1} GB of KV cache, \
-             which does not fit right now. Use a shorter prompt.",
+            "Prompt too large for this node: {} tokens need ~{:.1} GiB of KV cache, which \
+             does not fit even after evicting the expert cache. Use a shorter prompt.",
             ids.len(),
             kv_bytes as f64 / gib
         );
@@ -588,15 +719,137 @@ fn complete(
         );
         return;
     }
+    // Release on EVERY exit path. A leaked reservation is permanent: the monitor subtracts
+    // `reserved` from the cache budget on every 100 ms tick, so the expert cache would stay
+    // that much smaller for the life of the process.
+    let _room = KvRoom {
+        provider,
+        bytes: kv_bytes,
+    };
+    // Say so when a request cost the cache something. Without this the fix is invisible:
+    // an admitted request looks the same as one that always fitted, and a client timeout
+    // cannot distinguish "admitted and prefilling" from "queued" — which is precisely how
+    // an earlier attempt to observe this mis-reported itself.
+    let experts_after = colibri_engine::ram::manager()
+        .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+        .unwrap_or(0);
+    if experts_after < experts_before {
+        let gib = (1u64 << 30) as f64;
+        eprintln!(
+            "[serve] ADMITTED {} tokens ({:.1} GiB KV) by evicting {:.1} GiB of expert cache \
+             ({:.1} -> {:.1} GiB) — concurrent requests will stream until the monitor refills",
+            ids.len(),
+            kv_bytes as f64 / gib,
+            (experts_before - experts_after) as f64 / gib,
+            experts_before as f64 / gib,
+            experts_after as f64 / gib,
+        );
+    }
+
+    // Admit through the RAM ledger, which knows the dense tier and the expert arena.
+    // A request that merely collides with another in flight WAITS — both may be
+    // individually admissible, and rejecting the second would make capacity look far
+    // smaller than it is. A request too large for the whole rigid budget is rejected at
+    // once, because waiting cannot help it and it would block the queue behind it.
+    //
+    // Computed AFTER `reserve_ram`, so `Class::Experts` already reflects the eviction
+    // (`evict_to_protecting` publishes the ledger on both its exit paths).
+    //
+    // Scratch and ReadBuf are subtracted too. They were omitted, which made this budget
+    // optimistic by ~4.4 GB (measured: ReadBuf 0-2.1 GB, CUDA scratch 0.17-2.30 GB across
+    // the fleet — decimal GB, as forward.rs's `[profile]` lines divide by 1e9, unlike the
+    // GiB used for the runtime figures below).
+    // That error points the OPPOSITE way to the expert one and is far smaller,
+    // so it was masked — but with experts now evicted out of the way it is what remains.
+    let rigid = colibri_engine::ram::manager()
+        .map(|m| {
+            m.ceiling()
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Dense))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Experts))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::Scratch))
+                .saturating_sub(m.committed_in(colibri_engine::ram::Class::ReadBuf))
+        })
+        .unwrap_or(u64::MAX);
+    let (verdict, kv_commit) = colibri_engine::ram::commit_or_wait(
+        colibri_engine::ram::Class::Kv,
+        kv_bytes,
+        rigid,
+        std::time::Duration::from_secs(KV_QUEUE_SECS),
+    );
+    let _kv_commit = match verdict {
+        colibri_engine::ram::Admission::Ok => kv_commit,
+        colibri_engine::ram::Admission::TooLarge => {
+            let gib = (1u64 << 30) as f64;
+            // Both refusal paths used to answer the client and record NOTHING, so a node
+            // refusing every long prompt looked identical to one nobody was calling — and a
+            // black-box probe cannot tell a rejection from a slow prefill, which is exactly
+            // how an attempt to observe this from outside failed.
+            //
+            // Reaching here now means the LEDGER refused after `reserve_ram` already evicted
+            // to fit — i.e. the accounting says no even though physical memory said yes.
+            // `still_resident` is what survived the eviction (pinned entries and the cache
+            // floor), so a large value here is a genuine signal, not the old #39 bug: it
+            // would mean eviction is not reaching what the ledger is counting.
+            let still_resident = colibri_engine::ram::manager()
+                .map(|m| m.committed_in(colibri_engine::ram::Class::Experts))
+                .unwrap_or(0);
+            eprintln!(
+                "[serve] REFUSED 507 (ledger): {} tokens need {:.1} GiB KV, rigid budget \
+                 {:.1} GiB after evicting to fit ({:.1} GiB experts still resident)",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib,
+                still_resident as f64 / gib,
+            );
+            let msg = format!(
+                "Prompt too large for this node: {} tokens need ~{:.1} GiB of KV cache, \
+                 but only ~{:.1} GiB is available for requests after the model's own \
+                 memory. Use a shorter prompt.",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib
+            );
+            send_json(
+                stream,
+                507,
+                &format!("{{\"error\":{{\"message\":{},\"type\":\"insufficient_memory\",\"code\":\"kv_cache_too_large\"}}}}", jstr(&msg)),
+            );
+            return;
+        }
+        colibri_engine::ram::Admission::Busy => {
+            let gib = (1u64 << 30) as f64;
+            eprintln!(
+                "[serve] REFUSED 503: {} tokens need {:.1} GiB KV; waited {KV_QUEUE_SECS}s and \
+                 other requests did not free it (rigid budget {:.1} GiB)",
+                ids.len(),
+                kv_bytes as f64 / gib,
+                rigid as f64 / gib,
+            );
+            let msg = format!(
+                "Server busy: this prompt needs ~{:.1} GiB of KV cache and other requests \
+                 did not free it within {KV_QUEUE_SECS}s. Retry shortly.",
+                kv_bytes as f64 / (1u64 << 30) as f64
+            );
+            send_json(
+                stream,
+                503,
+                &format!("{{\"error\":{{\"message\":{},\"type\":\"server_busy\",\"code\":\"kv_cache_contended\"}}}}", jstr(&msg)),
+            );
+            return;
+        }
+    };
     let mut kv = mk_kv(model, ids.len() + max_tokens);
 
     if stream_mode {
-        stream_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
+        stream_completion(
+            stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv,
+        );
     } else {
-        block_completion(stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv);
+        block_completion(
+            stream, model, provider, tok, &ids, max_tokens, &id, model_id, object, chat, &mut kv,
+        );
     }
-    drop(kv); // free the KV before releasing the reservation
-    provider.release_ram(kv_bytes);
+    drop(kv); // free the KV before the commitment that covers it
 }
 
 /// Official GLM-5.2 chat template (byte-matches `chat_template.jinja`, mirrored
@@ -713,7 +966,14 @@ fn block_completion(
     let seq = match colibri_engine::generate_greedy(model, kv, provider, prompt, max_tokens) {
         Ok(s) => s,
         Err(e) => {
-            send_json(stream, 500, &format!("{{\"error\":{{\"message\":{},\"type\":\"internal_error\"}}}}", jstr(&e.to_string())));
+            send_json(
+                stream,
+                500,
+                &format!(
+                    "{{\"error\":{{\"message\":{},\"type\":\"internal_error\"}}}}",
+                    jstr(&e.to_string())
+                ),
+            );
             return;
         }
     };
@@ -722,13 +982,21 @@ fn block_completion(
     // streaming path already excludes it; keep the two consistent.
     let full = &seq[prompt.len()..];
     let hit_stop = full.last().is_some_and(|t| model.cfg.stop_ids.contains(t));
-    let cont = if hit_stop { &full[..full.len() - 1] } else { full };
+    let cont = if hit_stop {
+        &full[..full.len() - 1]
+    } else {
+        full
+    };
     let text = tok.decode(cont);
     let finish = if hit_stop { "stop" } else { "length" };
     let choice = if chat {
         format!("{{\"index\":0,\"message\":{{\"role\":\"assistant\",\"content\":{}}},\"finish_reason\":{}}}", jstr(&text), jstr(finish))
     } else {
-        format!("{{\"index\":0,\"text\":{},\"finish_reason\":{}}}", jstr(&text), jstr(finish))
+        format!(
+            "{{\"index\":0,\"text\":{},\"finish_reason\":{}}}",
+            jstr(&text),
+            jstr(finish)
+        )
     };
     let usage = format!(
         "{{\"prompt_tokens\":{},\"completion_tokens\":{},\"total_tokens\":{}}}",
@@ -763,7 +1031,11 @@ fn stream_completion(
     chat: bool,
     kv: &mut KvCache,
 ) {
-    let chunk_obj = if chat { "chat.completion.chunk" } else { "text_completion" };
+    let chunk_obj = if chat {
+        "chat.completion.chunk"
+    } else {
+        "text_completion"
+    };
     // SSE response headers.
     let headers = "HTTP/1.1 200 OK\r\n\
         Content-Type: text/event-stream\r\n\
@@ -924,8 +1196,14 @@ mod tests {
              <|im_start|>assistant\n<think></think>"
         );
         // The regression this fixes: none of the GLM control tokens may appear.
-        assert!(!s.contains("[gMASK]"), "GLM opener leaked into the Nemotron prompt");
-        assert!(!s.contains("<|user|>"), "GLM role markers leaked into the Nemotron prompt");
+        assert!(
+            !s.contains("[gMASK]"),
+            "GLM opener leaked into the Nemotron prompt"
+        );
+        assert!(
+            !s.contains("<|user|>"),
+            "GLM role markers leaked into the Nemotron prompt"
+        );
     }
 
     /// No messages still yields a valid generation prompt (not an empty string),
@@ -941,7 +1219,9 @@ mod tests {
     #[test]
     fn model_id_from_hf_cache_path() {
         assert_eq!(
-            model_id_from("/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"),
+            model_id_from(
+                "/root/.cache/huggingface/hub/models--nvidia--GLM-5.2-NVFP4/snapshots/abc123"
+            ),
             "nvidia/GLM-5.2-NVFP4"
         );
         assert_eq!(model_id_from("/data/glm52-nvfp4/"), "glm52-nvfp4");

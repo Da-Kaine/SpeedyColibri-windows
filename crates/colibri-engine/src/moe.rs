@@ -38,6 +38,11 @@ struct ActCfg {
     /// Gateless ReLU² (Nemotron-H `mlp_hidden_act == "relu2"`): the FFN is
     /// `down(relu(up·x)²)` with **no gate projection**. Overrides `oai` when set.
     relu2: bool,
+    /// Kimi-K3 `situ` (see [`crate::math::situ`]). Like `oai` it is a gated SwiGLU
+    /// shape, but it also transforms the `up` half, so it cannot reuse that branch.
+    situ: bool,
+    situ_beta: f32,
+    situ_linear_beta: f32,
 }
 
 static ACTIVATION: OnceLock<ActCfg> = OnceLock::new();
@@ -85,6 +90,9 @@ fn fit_scratch(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
 pub fn set_activation(cfg: &Config) {
     let _ = ACTIVATION.set(ActCfg {
         oai: cfg.swiglu_oai,
+        situ: cfg.situ,
+        situ_beta: cfg.situ_beta,
+        situ_linear_beta: cfg.situ_linear_beta,
         alpha: cfg.swiglu_alpha,
         limit: cfg.swiglu_limit,
         relu2: cfg.relu2,
@@ -95,10 +103,42 @@ pub fn set_activation(cfg: &Config) {
     crate::gpu::set_activation(cfg.swiglu_oai, cfg.swiglu_alpha, cfg.swiglu_limit);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only activation override, consulted by [`activation`] ahead of the global.
+    ///
+    /// [`ACTIVATION`] is a write-once process global ("one model per process"), an
+    /// assumption a test binary breaks: libtest runs every `#[test]` in the same
+    /// process, in parallel threads, so one test's [`set_activation`] would reach into
+    /// every other test's math — including *mid-test*, between two calls that are
+    /// asserted equal. Tests needing a non-default variant call
+    /// [`set_activation_for_test`] instead, which scopes the choice to the one thread
+    /// libtest gave that test.
+    static ACT_OVERRIDE: std::cell::Cell<Option<ActCfg>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the SwiGLU variant for the current test only. See [`ACT_OVERRIDE`].
+#[cfg(test)]
+fn set_activation_for_test(a: ActCfg) {
+    ACT_OVERRIDE.with(|c| c.set(Some(a)));
+}
+
 /// The active SwiGLU variant (defaults to SiLU when unset — the GLM path and
 /// unit tests that never call [`set_activation`]).
 fn activation() -> ActCfg {
-    *ACTIVATION.get().unwrap_or(&ActCfg { oai: false, alpha: 0.0, limit: 0.0, relu2: false })
+    #[cfg(test)]
+    if let Some(a) = ACT_OVERRIDE.with(|c| c.get()) {
+        return a;
+    }
+    *ACTIVATION.get().unwrap_or(&ActCfg {
+        oai: false,
+        alpha: 0.0,
+        limit: 0.0,
+        relu2: false,
+        situ: false,
+        situ_beta: 0.0,
+        situ_linear_beta: 0.0,
+    })
 }
 
 /// Process-wide expert-parallel context. `serve`/`worker` set this once at startup
@@ -238,8 +278,14 @@ impl ExpertLayout {
     /// every other arch is 3-tensor SwiGLU under `.mlp.experts.`.
     pub fn for_arch(arch: Arch) -> ExpertLayout {
         match arch {
-            Arch::NemotronH => ExpertLayout { prefix: "mixer", gateless: true },
-            _ => ExpertLayout { prefix: "mlp", gateless: false },
+            Arch::NemotronH => ExpertLayout {
+                prefix: "mixer",
+                gateless: true,
+            },
+            _ => ExpertLayout {
+                prefix: "mlp",
+                gateless: false,
+            },
         }
     }
 
@@ -254,17 +300,57 @@ impl ExpertLayout {
     }
 
     /// Container weight name for one expert projection (`suf` ∈ [`ExpertLayout::projs`]).
-    fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
-        format!("model.layers.{layer}.{}.experts.{eid}.{suf}.weight", self.prefix)
+    ///
+    /// `pub(crate)` so the convert tests can assert that what convert WRITES is exactly
+    /// what the loader LOOKS UP — the two drifted once (`weight_packed` vs `weight`) and
+    /// produced an unloadable container with every test on both sides passing.
+    pub(crate) fn weight_name(&self, layer: usize, eid: usize, suf: &str) -> String {
+        format!(
+            "model.layers.{layer}.{}.experts.{eid}.{suf}.weight",
+            self.prefix
+        )
     }
 }
 
+/// The block-scaled-FP4 sidecar for `base`, if the container has one:
+/// `(sidecar name, fmt_code, block size)`.
+///
+/// Both 4-bit formats store the weight blob as `nibbles ++ block-scales` and drop `.qs`
+/// entirely, so the sidecar name is what tells them apart:
+///   * `.g`  — NVFP4: ue4m3 scales, one per **16** inputs, real per-tensor global
+///   * `.mx` — MXFP4 (Kimi-K3): OCP E8M0 scales, one per **32**, identity global
+///
+/// One function rather than a `.g` check repeated at each call site: the marker test and
+/// the block size have to agree, and when they drifted apart K3's experts fell through to
+/// the int2 branch and then failed reading a `.qs` that does not exist.
+fn fp4_sidecar(shards: &Shards, base: &str) -> Option<(String, i32, usize)> {
+    let g = format!("{base}.g");
+    if shards.has(&g) {
+        return Some((g, 5, 16));
+    }
+    let mx = format!("{base}.mx");
+    if shards.has(&mx) {
+        return Some((mx, 6, 32));
+    }
+    None
+}
+
+/// Whether `first` (an expert's first projection) looks like a pre-quantized container:
+/// `.qs` for int/e4m3 per-row scales, or a block-scaled FP4 sidecar.
+fn has_prequant_marker(shards: &Shards, first: &str) -> bool {
+    shards.has(&format!("{first}.qs")) || fp4_sidecar(shards, first).is_some()
+}
+
 /// The outer (input/output) dimension of a routed expert: the model `hidden` for the
-/// 3-tensor SwiGLU arches, but the low-rank `moe_latent` bottleneck for Nemotron-H,
-/// whose experts run entirely in latent space (`up: moe_latent→moe_inter`,
-/// `down: moe_inter→moe_latent`).
+/// plain SwiGLU arches, but the low-rank `moe_latent` bottleneck for the latent-MoE ones
+/// (Nemotron-H, Kimi-K3), whose experts run entirely in latent space
+/// (`up: moe_latent→moe_inter`, `down: moe_inter→moe_latent`).
+///
+/// This MUST agree with what the arch's MoE block computes with — `kimi_moe` and
+/// `nemotron_moe` both call `compute_experts_partial` with `moe_latent` as the width.
+/// Getting it wrong reads each expert at the wrong shape.
 fn expert_outer_dim(cfg: &Config) -> usize {
-    if matches!(cfg.arch, Arch::NemotronH) {
+    if cfg.arch.routed_experts_are_latent() {
         cfg.moe_latent as usize
     } else {
         cfg.hidden as usize
@@ -305,11 +391,16 @@ pub struct ShardsExpertProvider<'a> {
     ebits: u32,
     sharding: ExpertSharding,
     this_node: NodeId,
-    /// Concurrent readers each expert's ~18 MB read is chunked across (a single
-    /// stream tops out far below the NVMe, which needs queue depth ~10 to saturate).
-    /// `COLI_LOAD_THREADS` overrides; see [`default_read_threads`] for why the
-    /// default is 2× cores rather than the core count.
-    read_threads: usize,
+    /// Explicit reader-thread count, or `None` to resolve per read via
+    /// [`default_read_threads`].
+    ///
+    /// **Resolved lazily on purpose.** Storing it at construction made the
+    /// coverage-gated narrow-reader setting a silent no-op: the launcher builds the
+    /// provider first and only then computes coverage (`wire_adaptive_cache` takes
+    /// `&provider`), so the gate always arrived after this field was already fixed at
+    /// `2 x cores`. Caught by the fleet run — the drain-pool line still reported
+    /// 34 threads/batch and the timings were unchanged — not by review.
+    read_threads: Option<usize>,
     /// Container name/shape convention for this arch's experts (3-tensor SwiGLU vs
     /// 2-tensor gateless). Derived once from `cfg.arch` at construction.
     layout: ExpertLayout,
@@ -340,11 +431,89 @@ pub struct ShardsExpertProvider<'a> {
 /// point in that flat region rather than over-fitting to the single fastest
 /// sample. The clamp keeps tiny boxes above a useful queue depth and stops
 /// many-core hosts spawning hundreds of blocked threads for one drive.
-fn default_read_threads() -> usize {
-    std::env::var("COLI_LOAD_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| crate::preload::default_num_files().saturating_mul(2).clamp(8, 64))
+/// **2026-07-29: the table above is the PREFILL regime and it does not generalise.**
+///
+/// Re-swept in the decode regime (12-token prompt) on the same box, interleaved,
+/// token-identical at every point. GLM:
+///
+/// | threads | 2 | 4 | 6 | 8 | 12 | 16 | 34 | 64 |
+/// |---|---|---|---|---|---|---|---|---|
+/// | drain GB/s | 5.82 | 9.11 | 10.91 | 11.40 | **11.42** | 11.32 | 9.87 | 9.82 |
+/// | expert-load ms | 20293 | 13004 | 10865 | 10402 | **10389** | 10503 | 12017 | 12090 |
+///
+/// The peak is 8-12 and it degrades in *both* directions; the prefill table peaks at 40.
+/// Both are real — a prefill layer routes to ~all experts so a batch is huge, while a
+/// decode batch is ~137 jobs and 40 threads oversubscribe it.
+///
+/// **And the right answer is per-model, not per-regime.** Fleet A/B at 34 vs 8 threads,
+/// decode, token-identical:
+///
+/// | model | coverage | 34 threads | 8 threads | |
+/// |---|---|---|---|---|
+/// | GLM-5.2 | 26% | 12017 ms | **10402 ms** | 8 wins |
+/// | Kimi-K3 | 7% | 26364 ms | **22531 ms** | 8 wins (1.17x) |
+/// | MiniMax-M3 | 46% | **3718 ms** | 8611-16092 ms | 8 **loses 2-4x** |
+/// | Nemotron-3 | 172% | **12.0 s preload** | 29.5 s preload | 8 **loses 2.5x** |
+/// | MiniMax-M2.7 | 86% | 481 ms | 485 ms | neutral (all mmap views) |
+///
+/// So a constant — of any value — is wrong: 8 is a large win on two models and a 2-4x
+/// regression on two others.
+///
+/// What separates them is whether the bytes actually come off the drive. GLM reads
+/// device bytes equal to reader bytes in **both** arms (ratio 1.00, invariant), so it is
+/// genuinely disk-sourced and saturates at low queue depth; M3's ratio swings 0.26 -> 1.13
+/// with thread count, so it is not. That tracks coverage, which
+/// [`crate::coverage_pct`]-style gating already uses for the cache regime, O_DIRECT and
+/// mmap.
+///
+/// **The mechanism behind M3's behaviour is NOT established** — thread count changes the
+/// device-byte count itself, so that measurement cannot separate cause from effect. This
+/// gate is therefore deliberately one-directional: it only *lowers* the thread count for
+/// the low-coverage, measured-disk-bound models, and leaves every other model on exactly
+/// the previous default. Worst case it is neutral; it cannot reintroduce the M3/Nemotron
+/// regression.
+pub(crate) fn default_read_threads() -> usize {
+    // Memoised: this is now resolved on every read (see `ShardsExpertProvider::read_threads`),
+    // so the env lookup and `available_parallelism` must not repeat. Only the atomic is live.
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static WIDE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(n) = *ENV.get_or_init(|| {
+        std::env::var("COLI_LOAD_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }) {
+        return n;
+    }
+    let wide = *WIDE.get_or_init(|| {
+        crate::preload::default_num_files()
+            .saturating_mul(2)
+            .clamp(8, 64)
+    });
+    match disk_bound_read_threads() {
+        Some(n) => n.min(wide),
+        None => wide,
+    }
+}
+
+/// Reader threads for a **disk-bound** model, or `None` to keep the wide default.
+///
+/// Set by the launcher once coverage is known (see `wire_adaptive_cache`); unset means
+/// "not classified", which keeps today's behaviour.
+static DISK_BOUND_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn disk_bound_read_threads() -> Option<usize> {
+    match DISK_BOUND_THREADS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// Tell the reader this model streams from disk, so it should use a narrow pool.
+///
+/// `0` clears it. Must be called before the provider is constructed —
+/// [`default_read_threads`] is read once per provider, not per read.
+pub fn set_disk_bound_read_threads(n: usize) {
+    DISK_BOUND_THREADS.store(n, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl<'a> ShardsExpertProvider<'a> {
@@ -357,7 +526,7 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding: ExpertSharding::single(cfg.n_experts as u32),
             this_node: NodeId(0),
-            read_threads: default_read_threads(),
+            read_threads: None,
             layout: ExpertLayout::for_arch(cfg.arch),
         }
     }
@@ -377,9 +546,19 @@ impl<'a> ShardsExpertProvider<'a> {
             ebits,
             sharding,
             this_node,
-            read_threads: default_read_threads(),
+            read_threads: None,
             layout: ExpertLayout::for_arch(cfg.arch),
         }
+    }
+
+    /// Reader threads for this provider's next read.
+    ///
+    /// Resolved per call rather than cached at construction, so a coverage-gated setting
+    /// applied after the provider exists still takes effect. `default_read_threads`
+    /// memoises the environment lookup and the core count, so this costs one relaxed
+    /// atomic load.
+    fn read_threads(&self) -> usize {
+        self.read_threads.unwrap_or_else(default_read_threads)
     }
 }
 
@@ -462,16 +641,19 @@ pub fn load_expert(
 ) -> io::Result<Expert> {
     let projs = layout.projs();
     let first = layout.weight_name(layer, eid, projs[0]);
-    // Container marker is `.qs` (int/e4m3 per-row scales) OR `.g` (NVFP4 global scale);
-    // NVFP4 experts drop `.qs` entirely, so both must count as "pre-quantized container".
-    let mut ex = if shards.has(&format!("{first}.qs")) || shards.has(&format!("{first}.g")) {
+    // Container marker is `.qs` (int/e4m3 per-row scales) or a block-scaled FP4 sidecar
+    // (`.g` NVFP4 / `.mx` MXFP4), which drop `.qs` entirely — see `fp4_sidecar`.
+    let mut ex = if has_prequant_marker(shards, &first) {
         // Pre-quantized container: the projections are contiguous on disk (~18 MB for the
         // 3-tensor case), so read the whole group (2 gateless / 3 SwiGLU) in ONE coalesced
         // read into a shared buffer the tensors view — instead of a separate read +
         // allocation per projection (the streaming bottleneck). The read is chunked across
         // `read_threads` cores so a single miss saturates the disk. Scales are tiny and
         // elsewhere; keep them as small per-tensor reads.
-        let names: Vec<String> = projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect();
+        let names: Vec<String> = projs
+            .iter()
+            .map(|s| layout.weight_name(layer, eid, s))
+            .collect();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let ws = shards.read_raw_shared(&name_refs, read_threads)?;
         expert_from_views(shards, layout, hidden, moe_inter, layer, eid, &ws)?
@@ -575,25 +757,34 @@ fn expert_from_views(
               w: &(Arc<colibri_core::SharedBuf>, usize, usize),
               sname: String|
      -> io::Result<QTensor> {
-        // NVFP4 experts: the weight blob is `nibbles ++ ue4m3 block-scales`, read as ONE
-        // coalesced buffer together with gate/up/down (a separate `.bs` read cost one
-        // uncoalesced random-seek pread per expert — 15x slower decode). Recognized by
-        // the `.g` (per-tensor global scale) sidecar. Both halves are zero-copy views
-        // into the shared buffer. See convert::requant_experts_nvfp4.
+        // Block-scaled FP4 experts (NVFP4 `.g` / MXFP4 `.mx`): the weight blob is
+        // `nibbles ++ block-scales`, read as ONE coalesced buffer together with
+        // gate/up/down (a separate `.bs` read cost one uncoalesced random-seek pread per
+        // expert — 15x slower decode). Both halves are zero-copy views into the shared
+        // buffer. The only difference between the two formats here is the scale block
+        // size, which `fp4_sidecar` returns alongside the format code.
+        // See convert::requant_experts_nvfp4 and convert::mxfp4_passthrough_out.
         let base = sname.strip_suffix(".qs").unwrap_or(&sname);
-        let g_name = format!("{base}.g");
-        if shards.has(&g_name) {
+        if let Some((sidecar, fmt, blk)) = fp4_sidecar(shards, base) {
             let (buf, off, _len) = w;
             let nib_bytes = o * i.div_ceil(2);
-            let bs_bytes = o * i.div_ceil(16);
+            let bs_bytes = o * i.div_ceil(blk);
             let mut g = [0f32; 1];
-            shards.read_f32(&g_name, &mut g)?;
+            shards.read_f32(&sidecar, &mut g)?;
             return Ok(QTensor {
-                fmt_code: 5,
+                fmt_code: fmt,
                 o: o as i32,
                 i: i as i32,
-                q4: Bytes::Shared { buf: buf.clone(), off: *off, len: nib_bytes },
-                bs: Bytes::Shared { buf: buf.clone(), off: *off + nib_bytes, len: bs_bytes },
+                q4: Bytes::Shared {
+                    buf: buf.clone(),
+                    off: *off,
+                    len: nib_bytes,
+                },
+                bs: Bytes::Shared {
+                    buf: buf.clone(),
+                    off: *off + nib_bytes,
+                    len: bs_bytes,
+                },
                 g: g[0],
                 ..Default::default()
             });
@@ -604,7 +795,13 @@ fn expert_from_views(
         let fmt = if *len == o * i { 1 } else { 3 };
         let mut s = vec![0f32; o];
         shards.read_f32(&sname, &mut s)?;
-        let mut t = QTensor { fmt_code: fmt, o: o as i32, i: i as i32, s, ..Default::default() };
+        let mut t = QTensor {
+            fmt_code: fmt,
+            o: o as i32,
+            i: i as i32,
+            s,
+            ..Default::default()
+        };
         let fp8 = expert_fp8_enabled();
         if fmt == 1 {
             // int8 goes in q8 (signed) — a copy. Skipped under `fp8`, where `fmt == 1`
@@ -617,7 +814,11 @@ fn expert_from_views(
                 t.q8 = buf[*off..*off + *len].iter().map(|&b| b as i8).collect();
             }
         } else {
-            t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+            t.q4 = Bytes::Shared {
+                buf: buf.clone(),
+                off: *off,
+                len: *len,
+            };
         }
         if fp8 {
             if fmt == 1 {
@@ -632,7 +833,11 @@ fn expert_from_views(
                     t.s = ns;
                     t.q4 = Bytes::Owned(nc);
                 } else {
-                    t.q4 = Bytes::Shared { buf: buf.clone(), off: *off, len: *len };
+                    t.q4 = Bytes::Shared {
+                        buf: buf.clone(),
+                        off: *off,
+                        len: *len,
+                    };
                 }
                 t.fmt_code = 4;
             }
@@ -690,22 +895,40 @@ pub fn load_experts_batch(
     let projs = layout.projs();
     // The pooled path applies only to the pre-quantized container (contiguous
     // projections + sidecar scales). Detect via the first expert's first projection
-    // scale sidecar: `.qs` (int/e4m3) or `.g` (NVFP4, which has no `.qs`).
+    // scale sidecar: `.qs` (int/e4m3) or a block-scaled FP4 tag (`.g` / `.mx`).
     let first = layout.weight_name(layer, eids[0], projs[0]);
-    if !shards.has(&format!("{first}.qs")) && !shards.has(&format!("{first}.g")) {
+    if !has_prequant_marker(shards, &first) {
         return eids
             .iter()
-            .map(|&e| load_expert(shards, layout, hidden, moe_inter, ebits, layer, e, read_threads))
+            .map(|&e| {
+                load_expert(
+                    shards,
+                    layout,
+                    hidden,
+                    moe_inter,
+                    ebits,
+                    layer,
+                    e,
+                    read_threads,
+                )
+            })
             .collect();
     }
     // One projection-name group per expert (2 gateless / 3 SwiGLU); keep the owned
     // strings alive so the borrowed &str slices handed to the reader stay valid.
     let names: Vec<Vec<String>> = eids
         .iter()
-        .map(|&eid| projs.iter().map(|s| layout.weight_name(layer, eid, s)).collect())
+        .map(|&eid| {
+            projs
+                .iter()
+                .map(|s| layout.weight_name(layer, eid, s))
+                .collect()
+        })
         .collect();
-    let groups: Vec<Vec<&str>> =
-        names.iter().map(|g| g.iter().map(String::as_str).collect()).collect();
+    let groups: Vec<Vec<&str>> = names
+        .iter()
+        .map(|g| g.iter().map(String::as_str).collect())
+        .collect();
     let group_refs: Vec<&[&str]> = groups.iter().map(|g| g.as_slice()).collect();
     let views = shards.read_raw_shared_batched(&group_refs, read_threads)?;
 
@@ -746,7 +969,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
             self.ebits,
             layer,
             eid,
-            self.read_threads,
+            self.read_threads(),
         )?))
     }
 
@@ -774,7 +997,7 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
                 self.ebits,
                 layer,
                 eids,
-                self.read_threads,
+                self.read_threads(),
             )?;
             Ok(exps.into_iter().map(Arc::new).collect())
         } else {
@@ -789,6 +1012,14 @@ impl ExpertProvider for ShardsExpertProvider<'_> {
 /// Selection uses `sigmoid(logit) + bias`; the returned weights are the raw
 /// `sigmoid(logit)` of the chosen experts, then optionally renormalized and
 /// scaled by `routed_scaling_factor`.
+///
+/// The bias applies to SELECTION ONLY — the weight is the unbiased score. Verified
+/// against `KimiMoEGate.forward` in the reference `modeling_kimi_linear.py`
+/// (2026-07-28), which picks `topk(scores + e_score_correction_bias)` and then
+/// `scores.gather(1, topk_idx)`. Folding the bias into the weight too would still
+/// produce a plausible distribution, so nothing downstream would catch it. K3 also maps
+/// `moe_renormalize` (not GLM's `norm_topk_prob`) onto `cfg.norm_topk`, and its
+/// `num_expert_group == 1` disables the grouped path in both implementations.
 pub fn route(cfg: &Config, logits: &[f32], bias: &[f32]) -> (Vec<usize>, Vec<f32>) {
     let e_n = logits.len();
     let k = (cfg.topk as usize).min(e_n);
@@ -834,8 +1065,27 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
     // format, or out-of-range).
     #[cfg(feature = "cuda")]
     {
-        if activation().relu2 {
+        let a = activation();
+        if a.relu2 {
             if crate::gpu::try_expert_ffn_relu2(up, down, x, nr, out) {
+                return;
+            }
+        } else if a.situ {
+            // Kimi-K3: its own kernel, because the fused SwiGLU ones apply `oai`-or-SiLU
+            // (gpu::set_activation carries no situ params) and would return success having
+            // computed a DIFFERENT activation. `try_expert_ffn_mxfp4_situ` declines
+            // anything that is not MXFP4-on-a-zero-copy-device, so a situ model with other
+            // expert formats still lands on the CPU reference below.
+            if crate::gpu::try_expert_ffn_mxfp4_situ(
+                gate,
+                up,
+                down,
+                x,
+                nr,
+                out,
+                a.situ_beta,
+                a.situ_linear_beta,
+            ) {
                 return;
             }
         } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
@@ -877,7 +1127,9 @@ fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, o
     matmul_qt(&mut gg, x, gate, nr);
     matmul_qt(&mut uu, x, up, nr);
     for (g, &u) in gg.iter_mut().zip(uu.iter()) {
-        *g = if a.oai {
+        *g = if a.situ {
+            crate::math::situ(*g, u, a.situ_beta, a.situ_linear_beta)
+        } else if a.oai {
             crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
         } else {
             silu(*g) * u
@@ -951,8 +1203,10 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     if crate::forward::profile_on() {
         let t = std::time::Instant::now();
         provider.prefetch(layer, &eids)?;
-        crate::forward::LOAD_US
-            .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::LOAD_US.fetch_add(
+            t.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     } else {
         provider.prefetch(layer, &eids)?;
     }
@@ -978,12 +1232,14 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     // instead of a synchronous upload/kernel/download per expert — the per-expert
     // round-trip is what dominates moe-compute. Falls through per-expert if it can't run.
     #[cfg(feature = "cuda")]
-    // The gateless ReLU² grouped path is DEFAULT-ON (it declines outside decode, so it
-    // cannot hit the prefill devcopy gap); the fp8 SwiGLU one keeps its opt-in default,
-    // which earlier work chose on prefill evidence. `COLI_EXPERT_GROUP=0` disables both.
-    if (activation().relu2 && crate::gpu::expert_group_relu2_enabled())
-        || crate::gpu::expert_group_enabled()
-    {
+    // Enter unconditionally and let each backend decide — every `try_*` below declines
+    // cleanly and falls through per-expert. The gateless ReLU² path is default-on (it
+    // declines outside decode); the NVFP4 SwiGLU path is now default-on too, because with
+    // per-layer pinned residency it is a measured win rather than the ~3% round-trip
+    // shuffle that grouping alone was; the fp8 SwiGLU one keeps its opt-in default, which
+    // earlier work chose on prefill evidence and which nothing here re-measured.
+    #[allow(clippy::overly_complex_bool_expr)]
+    if true {
         let mut active = Vec::with_capacity(per_expert.len());
         for (e, rows, rw) in &per_expert {
             active.push((provider.expert(layer, *e)?, rows.clone(), rw.clone()));
@@ -992,8 +1248,15 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
-        } else {
+        } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
+            // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
+            // offered the fp8 group, which declines on fmt 5, so every one of them fell
+            // through to a per-expert call — the path that pays per-expert weight staging.
+            crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
+        } else if crate::gpu::expert_group_enabled() {
             crate::gpu::try_expert_group(&active, activations, d, &mut out)
+        } else {
+            false
         };
         if grouped {
             return Ok(out);
@@ -1010,15 +1273,19 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
         }
         if prof {
-            crate::forward::GATHER_US
-                .fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::GATHER_US.fetch_add(
+                t0.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let mut hh = vec![0f32; nr * d];
         let t1 = std::time::Instant::now();
         ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
         if prof {
-            crate::forward::GPUFFN_US
-                .fetch_add(t1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::GPUFFN_US.fetch_add(
+                t1.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
         let t2 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
@@ -1028,8 +1295,10 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             }
         }
         if prof {
-            crate::forward::SCATTER_US
-                .fetch_add(t2.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::SCATTER_US.fetch_add(
+                t2.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
     Ok(out)
@@ -1058,7 +1327,14 @@ fn subcols(w_mat: &[f32], s_len: usize, n_uniq: usize, cols: &[usize]) -> Vec<f3
 /// f32, no quality change) when CUDA is available — a single-threaded CPU `matmul_f32`
 /// here was ~40% of moe-compute at long context — falling back to CPU otherwise.
 #[inline]
-fn router_matmul(logits: &mut [f32], x: &[f32], router: &[f32], s_len: usize, d: usize, e_n: usize) {
+fn router_matmul(
+    logits: &mut [f32],
+    x: &[f32],
+    router: &[f32],
+    s_len: usize,
+    d: usize,
+    e_n: usize,
+) {
     #[cfg(feature = "cuda")]
     {
         if crate::gpu::try_matmul_f32(logits, x, router, s_len, d, e_n) {
@@ -1097,9 +1373,13 @@ fn sharded_experts_partial<P: ExpertProvider, T: Transport + ?Sized>(
     let me = transport.this_node();
 
     // Partition the unique experts by owning node (columns into w_mat).
-    let mut by_node: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut by_node: std::collections::BTreeMap<u32, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for (ui, &e) in uniq.iter().enumerate() {
-        by_node.entry(sharding.owner(e as u32).0).or_default().push(ui);
+        by_node
+            .entry(sharding.owner(e as u32).0)
+            .or_default()
+            .push(ui);
     }
 
     // Split the routed experts into this node's own shard and each peer's shard.
@@ -1262,7 +1542,16 @@ pub fn moe<P: ExpertProvider>(
     if let Some(ctx) = cluster_ctx() {
         if ctx.sharding.num_nodes() > 1 {
             return moe_sharded(
-                cfg, l, layer, x, s_len, out, with_shared, provider, &ctx.sharding, &*ctx.transport,
+                cfg,
+                l,
+                layer,
+                x,
+                s_len,
+                out,
+                with_shared,
+                provider,
+                &ctx.sharding,
+                &*ctx.transport,
             );
         }
     }
@@ -1276,8 +1565,10 @@ pub fn moe<P: ExpertProvider>(
     let _rt = std::time::Instant::now();
     router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     if crate::forward::profile_on() {
-        crate::forward::ROUTER_US
-            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     let mut idxs = vec![0usize; s_len * k];
@@ -1310,8 +1601,10 @@ pub fn moe<P: ExpertProvider>(
             *o += s;
         }
         if crate::forward::profile_on() {
-            crate::forward::SHARED_US
-                .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::forward::SHARED_US.fetch_add(
+                _st.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
     }
 
@@ -1359,8 +1652,10 @@ pub fn nemotron_moe<P: ExpertProvider>(
     let _rt = std::time::Instant::now();
     router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
     if crate::forward::profile_on() {
-        crate::forward::ROUTER_US
-            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     let mut idxs = vec![0usize; s_len * k];
     let mut ws = vec![0f32; s_len * k];
@@ -1372,8 +1667,14 @@ pub fn nemotron_moe<P: ExpertProvider>(
     log_routing(layer, s_len, k, &idxs);
 
     // ---- fc1: hidden -> latent --------------------------------------------
-    let fc1 = l.fc1_latent.as_ref().expect("nemotron MoE layer missing fc1_latent");
-    let fc2 = l.fc2_latent.as_ref().expect("nemotron MoE layer missing fc2_latent");
+    let fc1 = l
+        .fc1_latent
+        .as_ref()
+        .expect("nemotron MoE layer missing fc1_latent");
+    let fc2 = l
+        .fc2_latent
+        .as_ref()
+        .expect("nemotron MoE layer missing fc2_latent");
     let mut h_lat = vec![0f32; s_len * dl];
     matmul_qt(&mut h_lat, x, fc1, s_len);
 
@@ -1424,8 +1725,131 @@ pub fn nemotron_moe<P: ExpertProvider>(
         add_shared(&mut vec![0f32; s_len * d]);
     }
     if crate::forward::profile_on() {
-        crate::forward::SHARED_US
-            .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::forward::SHARED_US.fetch_add(
+            _st.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    Ok(())
+}
+
+/// Kimi-K3's latent MoE. Same skeleton as [`nemotron_moe`] — router on the hidden
+/// state, project down to `moe_latent`, run the routed experts there, project back —
+/// with three K3-specific differences, all of which come from the reference
+/// (`KimiSparseMoeBlock.forward`) rather than from anything the shapes reveal:
+///
+/// 1. **`routed_expert_norm` runs AFTER the experts**, in latent space, immediately
+///    before the up-projection. Normalising the latent *input* instead is the natural
+///    guess and is wrong; the reference order is
+///    `down_proj -> moe_infer -> norm -> up_proj`.
+/// 2. **The shared experts see the ORIGINAL hidden state**, not the latent, and their
+///    output is added to the up-projected routed result. They are a full 3-tensor gated
+///    FFN (`n_shared * moe_inter` = 6144 wide), unlike Nemotron's gateless pair.
+/// 3. **The routed experts are 3-tensor gated too**, running `situ` — handled by [`ffn`]
+///    reading the process-global activation, so nothing here branches on it.
+///
+/// The router reads `hidden`, NOT the latent: the top-k choice is made before the
+/// down-projection, so routing is unaffected by the bottleneck.
+pub fn kimi_moe<P: ExpertProvider>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    out: &mut [f32],
+    provider: &P,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let dl = cfg.moe_latent as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    // ---- router, on the HIDDEN state (before the bottleneck) --------------
+    let mut logits = vec![0f32; s_len * e_n];
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US.fetch_add(
+            _rt.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    for s in 0..s_len {
+        let (idx, w) = route(cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+        idxs[s * k..s * k + k].copy_from_slice(&idx);
+        ws[s * k..s * k + k].copy_from_slice(&w);
+    }
+    log_routing(layer, s_len, k, &idxs);
+
+    // ---- down-project into the latent space -------------------------------
+    let fc1 = l
+        .fc1_latent
+        .as_ref()
+        .expect("kimi MoE layer missing fc1_latent");
+    let fc2 = l
+        .fc2_latent
+        .as_ref()
+        .expect("kimi MoE layer missing fc2_latent");
+    let mut h_lat = vec![0f32; s_len * dl];
+    matmul_qt(&mut h_lat, x, fc1, s_len);
+
+    // ---- routed experts, in latent space ----------------------------------
+    // Expert-parallel dispatch, exactly as `moe` does it, but over the LATENT state:
+    // K3's experts live behind the `fc1_latent` bottleneck, so a peer request ships
+    // `dl` (3584) floats per token rather than `hidden` (7168) — half the wire bytes
+    // of a hidden-space model. Single node (or unset) falls through to the local path.
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let sharded = cluster_ctx().filter(|ctx| ctx.sharding.num_nodes() > 1);
+    let mut moe_lat = match &sharded {
+        Some(ctx) => sharded_experts_partial(
+            provider,
+            layer,
+            &uniq,
+            &w_mat,
+            &h_lat,
+            s_len,
+            dl,
+            &ctx.sharding,
+            &*ctx.transport,
+        )?,
+        None => {
+            let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+            compute_experts_partial(provider, layer, &uniq_u32, &w_mat, &h_lat, s_len, dl)?
+        }
+    };
+
+    // ---- normalise IN latent space, then project back ---------------------
+    // `latent_moe_use_norm`; skipped when the container ships no such weight.
+    if !l.routed_expert_norm.is_empty() {
+        for row in moe_lat.chunks_mut(dl) {
+            crate::math::rmsnorm_inplace(row, &l.routed_expert_norm, cfg.eps);
+        }
+    }
+    matmul_qt(out, &moe_lat, fc2, s_len);
+
+    // ---- shared experts, on the ORIGINAL hidden state ---------------------
+    // Gated 3-tensor FFN over `sh_gate`/`sh_up`/`sh_down` with the model's activation
+    // (situ), added to the routed result. Scratch pooled for the same reason as
+    // Nemotron's (task #98).
+    let _st = std::time::Instant::now();
+    let mut add_shared = |sh: &mut [f32]| {
+        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+        for (o, &sv) in out.iter_mut().zip(sh.iter()) {
+            *o += sv;
+        }
+    };
+    if shared_scratch_reuse() {
+        SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+    } else {
+        add_shared(&mut vec![0f32; s_len * d]);
+    }
+    if crate::forward::profile_on() {
+        crate::forward::SHARED_US.fetch_add(
+            _st.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
     Ok(())
 }
@@ -1435,6 +1859,49 @@ mod tests {
     use super::*;
     use crate::quantize::qtensor_from_f32;
     use std::collections::HashMap;
+
+    /// The narrow-reader gate must apply even though it is set **after** the provider is
+    /// built — the launcher constructs the provider first and only then computes coverage
+    /// (`wire_adaptive_cache` takes `&provider`).
+    ///
+    /// This shipped once as a silent no-op: `read_threads` was resolved at construction,
+    /// so the gate always arrived too late and the fleet run still reported 34
+    /// threads/batch with unchanged timings. A build that compiles and a knob that does
+    /// nothing look identical without this.
+    ///
+    /// Serialised against nothing on purpose: it touches a process-global, so it restores
+    /// the previous value rather than assuming one (see `test-globals-contaminate`).
+    #[test]
+    fn narrow_reader_gate_applies_after_the_provider_exists() {
+        // If COLI_LOAD_THREADS is set in the environment it wins by design and the gate is
+        // bypassed — the assertion below would then be testing the override, not the gate.
+        if std::env::var("COLI_LOAD_THREADS").is_ok() {
+            return;
+        }
+        let prev = DISK_BOUND_THREADS.load(std::sync::atomic::Ordering::Relaxed);
+        let wide = {
+            set_disk_bound_read_threads(0);
+            default_read_threads()
+        };
+        set_disk_bound_read_threads(12);
+        let narrow = default_read_threads();
+        set_disk_bound_read_threads(prev);
+
+        assert!(
+            wide >= 8,
+            "wide default {wide} should be the 2x-cores value (clamped >= 8)"
+        );
+        assert_eq!(
+            narrow,
+            12.min(wide),
+            "gate must lower the count, got {narrow}"
+        );
+        assert!(
+            narrow < wide || wide <= 12,
+            "gate had no effect: wide={wide}, narrow={narrow} — this is exactly the no-op \
+             that shipped when read_threads was resolved at construction"
+        );
+    }
 
     // In-memory provider for MoE math tests (no safetensors needed).
     struct MapProvider {
@@ -1511,6 +1978,160 @@ mod tests {
         }
     }
 
+    /// Kimi-K3 latent MoE: `routed_expert_norm` must be applied to the expert OUTPUT,
+    /// in latent space, immediately before the up-projection — NOT to the latent input.
+    ///
+    /// Both orderings type-check and produce same-shaped output, so this is asserted by
+    /// construction: the test computes the two candidate results itself and requires
+    /// `kimi_moe` to match the reference order and to DIFFER from the wrong one. A norm
+    /// weight far from 1.0 makes the two provably distinguishable.
+    #[test]
+    fn kimi_latent_moe_normalises_expert_output_not_latent_input() {
+        let json = colibri_json::Json::parse(
+            r#"{"model_type":"kimi_k3","architectures":["KimiK3ForConditionalGeneration"],
+                "text_config":{
+                  "hidden_size":4,"num_hidden_layers":2,"num_attention_heads":2,
+                  "num_key_value_heads":2,"num_experts":4,"num_experts_per_token":2,
+                  "num_shared_experts":1,"moe_intermediate_size":2,"intermediate_size":4,
+                  "routed_expert_hidden_size":3,"first_k_dense_replace":1,"q_lora_rank":2,
+                  "kv_lora_rank":2,"qk_nope_head_dim":2,"qk_rope_head_dim":2,"v_head_dim":2,
+                  "vocab_size":8,"max_position_embeddings":64,"rms_norm_eps":1e-5,
+                  "rope_theta":10000.0,"moe_renormalize":true,
+                  "moe_router_activation_func":"sigmoid","num_expert_group":1,
+                  "topk_group":1,"routed_scaling_factor":1.0,"eos_token_id":5,
+                  "mla_use_nope":true,"hidden_act":"situ","activation_situ_beta":4.0,
+                  "activation_situ_linear_beta":25.0,"attn_res_block_size":12,
+                  "linear_attn_config":{"head_dim":2,"num_heads":2,
+                    "short_conv_kernel_size":4,"full_attn_layers":[2]}}}"#,
+        )
+        .unwrap();
+        let cfg = Config::from_json(&json).unwrap();
+        // Thread-scoped, not `ACTIVATION.set`: the global is write-once and shared by
+        // every test in this binary, so setting it here silently switched other tests'
+        // experts to `situ` — and landing between a test's two asserted-equal calls made
+        // `moe_sharded_hot_aware_map_equals_single_node` fail ~1 run in 3.
+        set_activation_for_test(ActCfg {
+            oai: false,
+            alpha: 0.0,
+            limit: 0.0,
+            relu2: false,
+            situ: cfg.situ,
+            situ_beta: cfg.situ_beta,
+            situ_linear_beta: cfg.situ_linear_beta,
+        });
+        let (d, dl, inter, e_n) = (4usize, 3usize, 2usize, 4usize);
+        let s_len = 2usize;
+
+        let mk = |o: usize, i: usize, seed: usize| {
+            let w: Vec<f32> = (0..o * i)
+                .map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1)
+                .collect();
+            qtensor_from_f32(&w, o, i, 8)
+        };
+        let mut l = Layer::default();
+        l.sparse = true;
+        l.router = (0..e_n * d).map(|k| ((k % 5) as f32 - 2.0) * 0.2).collect();
+        l.router_bias = vec![0.0; e_n];
+        l.fc1_latent = Some(mk(dl, d, 1));
+        l.fc2_latent = Some(mk(d, dl, 2));
+        // Deliberately far from 1.0 so the two orderings cannot coincide.
+        l.routed_expert_norm = vec![3.0, 0.25, 2.0];
+        l.sh_gate = mk(inter, d, 3);
+        l.sh_up = mk(inter, d, 4);
+        l.sh_down = mk(d, inter, 5);
+
+        let mut experts = HashMap::new();
+        for e in 0..e_n {
+            // Experts live in LATENT space: [inter, dl] / [dl, inter].
+            experts.insert(
+                (1usize, e),
+                Arc::new(Expert {
+                    gate: mk(inter, dl, 10 + e),
+                    up: mk(inter, dl, 20 + e),
+                    down: mk(dl, inter, 30 + e),
+                }),
+            );
+        }
+        let prov = MapProvider { experts };
+        let x: Vec<f32> = (0..s_len * d)
+            .map(|k| ((k % 5) as f32 - 2.0) * 0.3)
+            .collect();
+
+        let mut got = vec![0f32; s_len * d];
+        kimi_moe(&cfg, &l, 1, &x, s_len, &mut got, &prov).unwrap();
+
+        // --- reference: down -> experts -> NORM -> up -> (+ shared) ---------
+        let route_all = |xx: &[f32]| {
+            let mut logits = vec![0f32; s_len * e_n];
+            router_matmul(&mut logits, xx, &l.router, s_len, d, e_n);
+            let k = cfg.topk as usize;
+            let (mut idxs, mut ws) = (vec![0usize; s_len * k], vec![0f32; s_len * k]);
+            for s in 0..s_len {
+                let (idx, w) = route(&cfg, &logits[s * e_n..(s + 1) * e_n], &l.router_bias);
+                idxs[s * k..s * k + k].copy_from_slice(&idx);
+                ws[s * k..s * k + k].copy_from_slice(&w);
+            }
+            (idxs, ws)
+        };
+        let (idxs, ws) = route_all(&x);
+        let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, cfg.topk as usize, e_n);
+        let uniq32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+
+        let mut h_lat = vec![0f32; s_len * dl];
+        matmul_qt(&mut h_lat, &x, l.fc1_latent.as_ref().unwrap(), s_len);
+
+        let build = |norm_input: bool| {
+            let mut lat = h_lat.clone();
+            if norm_input {
+                for r in lat.chunks_mut(dl) {
+                    crate::math::rmsnorm_inplace(r, &l.routed_expert_norm, cfg.eps);
+                }
+            }
+            let mut y =
+                compute_experts_partial(&prov, 1, &uniq32, &w_mat, &lat, s_len, dl).unwrap();
+            if !norm_input {
+                for r in y.chunks_mut(dl) {
+                    crate::math::rmsnorm_inplace(r, &l.routed_expert_norm, cfg.eps);
+                }
+            }
+            let mut o = vec![0f32; s_len * d];
+            matmul_qt(&mut o, &y, l.fc2_latent.as_ref().unwrap(), s_len);
+            let mut sh = vec![0f32; s_len * d];
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, &x, s_len, &mut sh);
+            for (a, b) in o.iter_mut().zip(sh.iter()) {
+                *a += b;
+            }
+            o
+        };
+        let want_after = build(false); // reference order
+        let want_before = build(true); // the plausible wrong order
+
+        for (i, (g, w)) in got.iter().zip(want_after.iter()).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-5,
+                "out[{i}]: {g} vs {w} (norm-after-experts)"
+            );
+        }
+        let diff: f32 = want_after
+            .iter()
+            .zip(want_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-3,
+            "test is not discriminating: orderings agree ({diff})"
+        );
+        let wrong: f32 = got
+            .iter()
+            .zip(want_before.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            wrong > 1e-3,
+            "kimi_moe matched the WRONG ordering (norm on latent input)"
+        );
+    }
+
     // Fused GPU expert FFN vs CPU at GLM expert sizes (hidden 6144, moe_inter 2048).
     // `cargo test -p colibri-engine --features cuda --release -- --ignored --nocapture bench_expert_ffn`
     #[cfg(feature = "cuda")]
@@ -1562,7 +2183,7 @@ mod tests {
     #[test]
     fn route_selects_top_k_by_bias_augmented_score() {
         let c = cfg(); // topk=2, 4 experts
-        // logits chosen so sigmoid is monotonic; bias flips the order.
+                       // logits chosen so sigmoid is monotonic; bias flips the order.
         let logits = [0.0f32, 1.0, 2.0, 3.0]; // sigmoids ~ .5,.73,.88,.95
         let bias = [10.0f32, 0.0, 0.0, 0.0]; // huge bias on expert 0
         let (idx, w) = route(&c, &logits, &bias);
@@ -1669,7 +2290,10 @@ mod tests {
         // Two positions, k=2: one line per position, `step layer pos e0 e1`.
         let mut buf = Vec::new();
         write_routing_lines(&mut buf, 5, 3, 2, 2, &[10, 20, 30, 40]).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "5 3 0 10 20\n5 3 1 30 40\n");
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "5 3 0 10 20\n5 3 1 30 40\n"
+        );
     }
 
     #[test]
@@ -1700,7 +2324,7 @@ mod tests {
 
         let shards = Shards::open(&dir).unwrap();
         let c = cfg(); // 4 routed experts
-        // 2 nodes over 4 experts: node 0 owns {0,1}, node 1 owns {2,3}.
+                       // 2 nodes over 4 experts: node 0 owns {0,1}, node 1 owns {2,3}.
         let sharding = ExpertSharding::new(2, c.n_experts as u32);
         let p = ShardsExpertProvider::with_sharding(&shards, &c, 4, sharding, NodeId(0));
 
@@ -1711,19 +2335,29 @@ mod tests {
                 io::ErrorKind::Unsupported,
                 "expert {peer_expert} belongs to node 1 and must be refused"
             );
-            assert!(e.to_string().contains("owned by another node"), "unhelpful: {e}");
+            assert!(
+                e.to_string().contains("owned by another node"),
+                "unhelpful: {e}"
+            );
         }
 
         // A locally-owned expert gets *past* the gate and fails for an unrelated
         // reason (this fixture has no expert data) — proving the gate discriminates
         // by ownership rather than rejecting everything.
         let local = p.expert(0, 0).unwrap_err();
-        assert_ne!(local.kind(), io::ErrorKind::Unsupported, "local expert must pass the gate");
+        assert_ne!(
+            local.kind(),
+            io::ErrorKind::Unsupported,
+            "local expert must pass the gate"
+        );
 
         // A single-node provider owns everything: no expert is ever refused.
         let solo = ShardsExpertProvider::new(&shards, &c, 4);
         for e in 0..c.n_experts as usize {
-            assert_ne!(solo.expert(0, e).unwrap_err().kind(), io::ErrorKind::Unsupported);
+            assert_ne!(
+                solo.expert(0, e).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1734,7 +2368,10 @@ mod tests {
         // copy path's device cache is keyed by their address, so caching them there
         // would compute a *different* expert's weights. COLI_GPU_EXPERTS=1 must not be
         // able to force that — it may only opt in when zero-copy is available.
-        assert!(experts_gpu_decision(Some("1"), true), "=1 opts in when zero-copy is available");
+        assert!(
+            experts_gpu_decision(Some("1"), true),
+            "=1 opts in when zero-copy is available"
+        );
         assert!(
             !experts_gpu_decision(Some("1"), false),
             "=1 must NOT force streamed experts onto the address-keyed copy path"
@@ -1784,8 +2421,9 @@ mod tests {
         l.sh_down = sh.down.clone();
 
         // All four experts live in one provider (both "nodes" share it here).
-        let experts: HashMap<(usize, usize), Arc<Expert>> =
-            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let experts: HashMap<(usize, usize), Arc<Expert>> = (0..4)
+            .map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d))))
+            .collect();
         let provider = Arc::new(MapProvider { experts });
 
         let x = vec![0.3f32, 0.5, -0.2, 0.7];
@@ -1799,19 +2437,27 @@ mod tests {
 
         // Node 1's expert server (loopback TCP), handler = compute_experts_partial.
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            let outputs = compute_experts_partial(
-                &*hp,
-                req.layer as usize,
-                &req.experts,
-                &req.weights,
-                &req.activations,
-                req.n_tokens,
-                req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
         .unwrap();
 
         let mut peers = HashMap::new();
@@ -1819,8 +2465,19 @@ mod tests {
         let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
 
         let mut out_sharded = vec![0f32; d];
-        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
-            .unwrap();
+        moe_sharded(
+            &c,
+            &l,
+            0,
+            &x,
+            1,
+            &mut out_sharded,
+            true,
+            &*provider,
+            &sharding,
+            &transport,
+        )
+        .unwrap();
 
         for dd in 0..d {
             assert!(
@@ -1828,6 +2485,104 @@ mod tests {
                 "mismatch at {dd}: single {} vs sharded {}",
                 out_single[dd],
                 out_sharded[dd]
+            );
+        }
+    }
+
+    #[test]
+    fn kimi_latent_experts_sharded_two_nodes_equal_single_node() {
+        // K3's experts live behind the `fc1_latent` bottleneck, so expert-parallel ships
+        // the LATENT state (`dl`), not `hidden`. The wire carries `hidden` per request
+        // and the worker feeds it straight into `compute_experts_partial`, so `dl` needs
+        // no protocol change — this pins that end to end over a real TCP loopback.
+        //
+        // Drives `sharded_experts_partial` directly rather than `kimi_moe`: the cluster
+        // context is a write-once process-global, so setting it here would contaminate
+        // every other test in this binary (see `set_activation_for_test`'s comment).
+        // The activation global is likewise left alone — both sides of the comparison
+        // see whatever is ambient, so they agree either way.
+        use colibri_cluster::{serve_experts, ExpertResponse, TcpTransport};
+
+        let (dl, inter, e_n, s_len) = (3usize, 2usize, 4usize, 2usize);
+        let mk = |o: usize, i: usize, seed: usize| {
+            let w: Vec<f32> = (0..o * i)
+                .map(|k| (((k + seed) % 7) as f32 - 3.0) * 0.1)
+                .collect();
+            qtensor_from_f32(&w, o, i, 8)
+        };
+        let experts: HashMap<(usize, usize), Arc<Expert>> = (0..e_n)
+            .map(|e| {
+                let ex = Expert {
+                    gate: mk(inter, dl, 10 + e),
+                    up: mk(inter, dl, 20 + e),
+                    down: mk(dl, inter, 30 + e),
+                };
+                ((1usize, e), Arc::new(ex))
+            })
+            .collect();
+        let provider = Arc::new(MapProvider { experts });
+
+        // Latent activations, and a weight matrix routing every token to every expert so
+        // both the local and the remote branch carry real work.
+        let h_lat: Vec<f32> = (0..s_len * dl)
+            .map(|k| ((k % 5) as f32 - 2.0) * 0.3)
+            .collect();
+        let uniq: Vec<usize> = (0..e_n).collect();
+        let w_mat: Vec<f32> = (0..s_len * e_n)
+            .map(|k| 0.1 + (k % 3) as f32 * 0.25)
+            .collect();
+
+        // Reference: every expert computed locally, in one call.
+        let uniq32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+        let single =
+            compute_experts_partial(&*provider, 1, &uniq32, &w_mat, &h_lat, s_len, dl).unwrap();
+
+        // Node 0 owns {0,1}, node 1 owns {2,3}; node 1 answers over loopback TCP.
+        let sharding = ExpertSharding::new(2, e_n as u32);
+        let hp = provider.clone();
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                // `req.hidden` is `dl` here, not the model's hidden size.
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
+        .unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(NodeId(1), addr);
+        let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
+
+        let sharded = sharded_experts_partial(
+            &*provider, 1, &uniq, &w_mat, &h_lat, s_len, dl, &sharding, &transport,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sharded.len(),
+            s_len * dl,
+            "sharded output must be [s_len, dl]"
+        );
+        for i in 0..s_len * dl {
+            assert!(
+                (single[i] - sharded[i]).abs() < 1e-5,
+                "mismatch at {i}: single {} vs sharded {}",
+                single[i],
+                sharded[i]
             );
         }
     }
@@ -1860,8 +2615,9 @@ mod tests {
         l.sh_up = sh.up.clone();
         l.sh_down = sh.down.clone();
 
-        let experts: HashMap<(usize, usize), Arc<Expert>> =
-            (0..4).map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d)))).collect();
+        let experts: HashMap<(usize, usize), Arc<Expert>> = (0..4)
+            .map(|e| ((0usize, e), Arc::new(expert(e * 10, inter, d))))
+            .collect();
         let provider = Arc::new(MapProvider { experts });
         let x = vec![0.3f32, 0.5, -0.2, 0.7];
 
@@ -1873,26 +2629,38 @@ mod tests {
         assert!(sharding.is_hot_aware());
 
         let hp = provider.clone();
-        let addr = serve_experts("127.0.0.1:0".parse().unwrap(), sharding.fingerprint(), move |req| {
-            let outputs = compute_experts_partial(
-                &*hp,
-                req.layer as usize,
-                &req.experts,
-                &req.weights,
-                &req.activations,
-                req.n_tokens,
-                req.hidden,
-            )
-            .unwrap();
-            ExpertResponse { outputs, n_tokens: req.n_tokens, hidden: req.hidden }
-        })
+        let addr = serve_experts(
+            "127.0.0.1:0".parse().unwrap(),
+            sharding.fingerprint(),
+            move |req| {
+                let outputs = compute_experts_partial(
+                    &*hp,
+                    req.layer as usize,
+                    &req.experts,
+                    &req.weights,
+                    &req.activations,
+                    req.n_tokens,
+                    req.hidden,
+                )
+                .unwrap();
+                ExpertResponse {
+                    outputs,
+                    n_tokens: req.n_tokens,
+                    hidden: req.hidden,
+                }
+            },
+        )
         .unwrap();
 
         let mut peers = HashMap::new();
         peers.insert(NodeId(1), addr);
         let transport = TcpTransport::new(NodeId(0), peers, sharding.fingerprint());
         // The hot pair is split across nodes, unlike the contiguous map.
-        assert_ne!(sharding.owner(0), sharding.owner(1), "hot experts must be spread");
+        assert_ne!(
+            sharding.owner(0),
+            sharding.owner(1),
+            "hot experts must be spread"
+        );
         let contig = ExpertSharding::new(2, c.n_experts as u32);
         assert_ne!(
             sharding.fingerprint(),
@@ -1901,8 +2669,19 @@ mod tests {
         );
 
         let mut out_sharded = vec![0f32; d];
-        moe_sharded(&c, &l, 0, &x, 1, &mut out_sharded, true, &*provider, &sharding, &transport)
-            .unwrap();
+        moe_sharded(
+            &c,
+            &l,
+            0,
+            &x,
+            1,
+            &mut out_sharded,
+            true,
+            &*provider,
+            &sharding,
+            &transport,
+        )
+        .unwrap();
 
         for dd in 0..d {
             assert!(
@@ -1949,7 +2728,11 @@ mod tests {
                 if i > 0 {
                     hjson.push(',');
                 }
-                let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+                let numel = if *dtype == "F32" {
+                    b.len() / 4
+                } else {
+                    b.len()
+                };
                 hjson.push_str(&format!(
                     "\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
                     name,
@@ -1984,13 +2767,23 @@ mod tests {
         let gate_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 7 + 1) as u8).collect();
         let up_q4: Vec<u8> = (0..moe_inter * rb_gu).map(|k| (k * 5 + 2) as u8).collect();
         let down_q4: Vec<u8> = (0..hidden * rb_d).map(|k| (k * 3 + 9) as u8).collect();
-        let gate_s: Vec<f32> = (0..moe_inter).map(|o| 0.011 + 0.001 * (o % 13) as f32).collect();
-        let up_s: Vec<f32> = (0..moe_inter).map(|o| 0.007 + 0.002 * (o % 11) as f32).collect();
-        let down_s: Vec<f32> = (0..hidden).map(|o| 0.013 + 0.001 * (o % 7) as f32).collect();
+        let gate_s: Vec<f32> = (0..moe_inter)
+            .map(|o| 0.011 + 0.001 * (o % 13) as f32)
+            .collect();
+        let up_s: Vec<f32> = (0..moe_inter)
+            .map(|o| 0.007 + 0.002 * (o % 11) as f32)
+            .collect();
+        let down_s: Vec<f32> = (0..hidden)
+            .map(|o| 0.013 + 0.001 * (o % 7) as f32)
+            .collect();
 
         let dir = temp_dir();
         let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
-        let (gw, uw, dw) = (p("gate_proj.weight"), p("up_proj.weight"), p("down_proj.weight"));
+        let (gw, uw, dw) = (
+            p("gate_proj.weight"),
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+        );
         let (gs, us, ds) = (
             p("gate_proj.weight.qs"),
             p("up_proj.weight.qs"),
@@ -2015,14 +2808,26 @@ mod tests {
         let ex = load_expert(&shards, glm, hidden, moe_inter, 4, 0, 0, 8).unwrap();
 
         // (a) each Bytes::Shared view holds exactly its on-disk bytes + scales + dims.
-        assert!(ex.gate.q4.as_slice() == gate_q4.as_slice(), "gate q4 mismatch");
+        assert!(
+            ex.gate.q4.as_slice() == gate_q4.as_slice(),
+            "gate q4 mismatch"
+        );
         assert!(ex.up.q4.as_slice() == up_q4.as_slice(), "up q4 mismatch");
-        assert!(ex.down.q4.as_slice() == down_q4.as_slice(), "down q4 mismatch");
+        assert!(
+            ex.down.q4.as_slice() == down_q4.as_slice(),
+            "down q4 mismatch"
+        );
         assert_eq!(ex.gate.s, gate_s);
         assert_eq!(ex.up.s, up_s);
         assert_eq!(ex.down.s, down_s);
-        assert_eq!((ex.gate.fmt_code, ex.gate.o, ex.gate.i), (3, moe_inter as i32, hidden as i32));
-        assert_eq!((ex.down.fmt_code, ex.down.o, ex.down.i), (3, hidden as i32, moe_inter as i32));
+        assert_eq!(
+            (ex.gate.fmt_code, ex.gate.o, ex.gate.i),
+            (3, moe_inter as i32, hidden as i32)
+        );
+        assert_eq!(
+            (ex.down.fmt_code, ex.down.o, ex.down.i),
+            (3, hidden as i32, moe_inter as i32)
+        );
 
         // (b) the shared views dequant identically to an owned reference through the
         // real matmul kernel (proves the QTensor is usable, not just byte-equal).
@@ -2102,7 +2907,9 @@ mod tests {
 
         // Deterministic smooth weights so the NVFP4 encoding is well-conditioned.
         let wv = |n: usize, seed: usize| -> Vec<f32> {
-            (0..n).map(|k| ((k + seed) as f32 * 0.19).sin() * 0.5).collect()
+            (0..n)
+                .map(|k| ((k + seed) as f32 * 0.19).sin() * 0.5)
+                .collect()
         };
         let w_up = wv(MOE_INTER * LATENT, 3); // up:   [MOE_INTER, LATENT]
         let w_down = wv(LATENT * MOE_INTER, 7); // down: [LATENT, MOE_INTER]
@@ -2118,8 +2925,12 @@ mod tests {
         // order. NO gate_proj, NO `.qs`.
         let dir = temp_dir();
         let p = |suf: &str| format!("model.layers.0.mixer.experts.0.{suf}");
-        let (uw, dw, ug, dg) =
-            (p("up_proj.weight"), p("down_proj.weight"), p("up_proj.weight.g"), p("down_proj.weight.g"));
+        let (uw, dw, ug, dg) = (
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+            p("up_proj.weight.g"),
+            p("down_proj.weight.g"),
+        );
         let entries: [(&str, &str, Vec<u8>); 4] = [
             (uw.as_str(), "U8", blob_u.clone()),
             (dw.as_str(), "U8", blob_d.clone()),
@@ -2132,7 +2943,11 @@ mod tests {
             if i > 0 {
                 hjson.push(',');
             }
-            let numel = if *dtype == "F32" { b.len() / 4 } else { b.len() };
+            let numel = if *dtype == "F32" {
+                b.len() / 4
+            } else {
+                b.len()
+            };
             hjson.push_str(&format!(
                 "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
                 off + b.len()
@@ -2164,13 +2979,22 @@ mod tests {
         .unwrap();
         let cfg = Config::from_json(&json).unwrap();
         assert_eq!(cfg.arch, Arch::NemotronH);
-        assert_eq!((cfg.moe_latent, cfg.moe_inter), (LATENT as i32, MOE_INTER as i32));
+        assert_eq!(
+            (cfg.moe_latent, cfg.moe_inter),
+            (LATENT as i32, MOE_INTER as i32)
+        );
 
         let shards = Shards::open(&dir).unwrap();
         let provider = ShardsExpertProvider::new(&shards, &cfg, 8);
         // The provider must have picked up the gateless/latent layout from the arch.
-        assert!(provider.layout.gateless, "Nemotron provider must use the gateless layout");
-        assert_eq!(provider.hidden, LATENT, "expert outer dim must be moe_latent");
+        assert!(
+            provider.layout.gateless,
+            "Nemotron provider must use the gateless layout"
+        );
+        assert_eq!(
+            provider.hidden, LATENT,
+            "expert outer dim must be moe_latent"
+        );
 
         // In-memory reference expert built straight from the same NVFP4 blobs.
         let ref_qt = |o: usize, i: usize, nib: &[u8], bsc: &[u8], g: f32| QTensor {
@@ -2199,15 +3023,23 @@ mod tests {
             matmul_qt(&mut y, &u, down, NR);
             y
         };
-        let x: Vec<f32> = (0..NR * LATENT).map(|k| 0.4 - 0.03 * (k % 9) as f32).collect();
+        let x: Vec<f32> = (0..NR * LATENT)
+            .map(|k| 0.4 - 0.03 * (k % 9) as f32)
+            .collect();
         let want = relu2(&up_ref, &down_ref, &x);
-        assert!(want.iter().any(|v| v.abs() > 1e-4), "reference relu2 output is all-zero");
+        assert!(
+            want.iter().any(|v| v.abs() > 1e-4),
+            "reference relu2 output is all-zero"
+        );
 
         // Both provider entry points: the single-expert load and the pooled batched read
         // (a 2-tensor group through `read_raw_shared_batched`).
         for (label, ex) in [
             ("expert", provider.expert(0, 0).unwrap()),
-            ("experts_batch", provider.experts_batch(0, &[0]).unwrap().remove(0)),
+            (
+                "experts_batch",
+                provider.experts_batch(0, &[0]).unwrap().remove(0),
+            ),
         ] {
             // Gateless: gate is empty; up/down are NVFP4 (fmt 5) with the latent-space dims.
             assert!(
@@ -2227,20 +3059,223 @@ mod tests {
             // The coalesced `.g` read materialized exactly the on-disk nibble + block-scale
             // halves and the global — byte-for-byte, at the right offsets.
             assert_eq!(ex.up.q4.as_slice(), nib_u.as_slice(), "{label}: up nibbles");
-            assert_eq!(ex.up.bs.as_slice(), bsc_u.as_slice(), "{label}: up block-scales");
+            assert_eq!(
+                ex.up.bs.as_slice(),
+                bsc_u.as_slice(),
+                "{label}: up block-scales"
+            );
             assert_eq!(ex.up.g, g_u, "{label}: up global");
-            assert_eq!(ex.down.q4.as_slice(), nib_d.as_slice(), "{label}: down nibbles");
-            assert_eq!(ex.down.bs.as_slice(), bsc_d.as_slice(), "{label}: down block-scales");
+            assert_eq!(
+                ex.down.q4.as_slice(),
+                nib_d.as_slice(),
+                "{label}: down nibbles"
+            );
+            assert_eq!(
+                ex.down.bs.as_slice(),
+                bsc_d.as_slice(),
+                "{label}: down block-scales"
+            );
             assert_eq!(ex.down.g, g_d, "{label}: down global");
 
             // Computes `down(relu(up·x)²)` identically to the in-memory reference.
             let got = relu2(&ex.up, &ex.down, &x);
             for (k, (&a, &b)) in got.iter().zip(&want).enumerate() {
                 let tol = 1e-5 * a.abs().max(b.abs()).max(1.0);
-                assert!((a - b).abs() <= tol, "{label} row {k}: loaded {a} vs reference {b}");
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{label} row {k}: loaded {a} vs reference {b}"
+                );
             }
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An MXFP4 (`.mx`) expert must load as `fmt_code == 6` with the block scales sliced
+    /// at the MXFP4 stride.
+    ///
+    /// Kimi-K3's routed experts are natively MXFP4 and pass through convert bit-exact.
+    /// The loader recognised only NVFP4's `.g`, so a K3 expert fell past that branch into
+    /// the int/int2 path — where the blob length matches neither `o*i` nor the int2 size,
+    /// and the subsequent `.qs` read fails for a sidecar that does not exist. Nothing in
+    /// the suite covered it because no test built an `.mx` container.
+    ///
+    /// The two strides differ (16 vs 32 inputs per scale byte), so a format mix-up shows
+    /// up as a wrong `bs` length rather than as a silent numeric drift.
+    #[test]
+    fn mxfp4_expert_loads_as_fmt6_with_the_right_block_stride() {
+        use std::fs::File;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // Square so gate `[moe_inter, hidden]`, up `[moe_inter, hidden]` and down
+        // `[hidden, moe_inter]` share one blob shape; 64 inputs is 2 MXFP4 blocks per row
+        // (stride 32), which would be 4 under NVFP4's stride of 16.
+        const O: usize = 64;
+        const I: usize = 64;
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir =
+            PathBuf::from(std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into())).join(format!(
+                "colibri-mx-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // nibbles ++ E8M0 block scales, the layout convert writes for a passthrough.
+        let nib_bytes = O * I / 2;
+        let bs_bytes = O * I / 32;
+        let mut blob = vec![0u8; nib_bytes + bs_bytes];
+        for (k, b) in blob[..nib_bytes].iter_mut().enumerate() {
+            *b = ((k * 7 + 3) % 256) as u8;
+        }
+        for b in blob[nib_bytes..].iter_mut() {
+            *b = 127; // 2^0
+        }
+
+        let p = |suf: &str| format!("model.layers.0.mlp.experts.0.{suf}");
+        let (gw, uw, dw) = (
+            p("gate_proj.weight"),
+            p("up_proj.weight"),
+            p("down_proj.weight"),
+        );
+        let (gg, ug, dg) = (format!("{gw}.mx"), format!("{uw}.mx"), format!("{dw}.mx"));
+        let one = 1.0f32.to_le_bytes().to_vec();
+        let entries: [(&str, &str, Vec<u8>); 6] = [
+            (gw.as_str(), "U8", blob.clone()),
+            (uw.as_str(), "U8", blob.clone()),
+            (dw.as_str(), "U8", blob.clone()),
+            (gg.as_str(), "F32", one.clone()),
+            (ug.as_str(), "F32", one.clone()),
+            (dg.as_str(), "F32", one.clone()),
+        ];
+        let mut hjson = String::from("{");
+        let mut off = 0usize;
+        for (i, (name, dtype, b)) in entries.iter().enumerate() {
+            if i > 0 {
+                hjson.push(',');
+            }
+            let numel = if *dtype == "F32" {
+                b.len() / 4
+            } else {
+                b.len()
+            };
+            hjson.push_str(&format!(
+                "\"{name}\":{{\"dtype\":\"{dtype}\",\"shape\":[{numel}],\"data_offsets\":[{off},{}]}}",
+                off + b.len()));
+            off += b.len();
+        }
+        hjson.push('}');
+        let hb = hjson.as_bytes();
+        let mut f = File::create(dir.join("model.safetensors")).unwrap();
+        f.write_all(&(hb.len() as u64).to_le_bytes()).unwrap();
+        f.write_all(hb).unwrap();
+        for (_, _, b) in &entries {
+            f.write_all(b).unwrap();
+        }
+        drop(f);
+
+        let shards = Shards::open(&dir).expect("open shards");
+        let layout = ExpertLayout::for_arch(Arch::KimiK3);
+        let e = load_expert(&shards, layout, I, O, 8, 0, 0, 1).expect("load mxfp4 expert");
+
+        for (name, t) in [("gate", &e.gate), ("up", &e.up), ("down", &e.down)] {
+            assert_eq!(
+                t.fmt_code, 6,
+                "{name} should be MXFP4 (fmt 6), got {}",
+                t.fmt_code
+            );
+            assert_eq!(t.q4.len(), nib_bytes, "{name} nibble slice");
+            // The stride is the whole point: NVFP4's 16 would give twice this.
+            assert_eq!(
+                t.bs.len(),
+                bs_bytes,
+                "{name} block-scale slice (MXFP4 stride 32)"
+            );
+            assert_eq!(t.g, 1.0, "{name} MXFP4 global is the identity");
+        }
+    }
+    /// The MXFP4+situ GPU kernel must agree with the CPU reference numerically.
+    ///
+    /// A token-identity gate cannot settle this. On the real model the kernel produced
+    /// " Paris" then `.",\n` where the CPU gave " Paris" then `.` — both continuations
+    /// start with a period, i.e. a near-tie in the argmax that benign f16/fast-math noise
+    /// can flip. That is consistent with a correct-but-lower-precision kernel AND with a
+    /// real bug, so it distinguishes nothing. This compares the actual FFN output.
+    ///
+    /// Tolerances differ by path on purpose: S==1 takes `mxfp4_gemv`, which accumulates in
+    /// f32 and should track the CPU closely; S>1 takes the WMMA path, whose MMA runs in
+    /// f16 and cannot.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn mxfp4_situ_kernel_matches_cpu_reference() {
+        use colibri_core::Bytes;
+        // Latent-space expert shapes, small but with >1 block per row (32 inputs/block).
+        const D: usize = 64; // moe_latent
+        const I: usize = 32; // moe_inter
+        let mk = |o: usize, i: usize, seed: usize| -> QTensor {
+            let rb = i.div_ceil(2);
+            let nb = i.div_ceil(32);
+            let q4: Vec<u8> = (0..o * rb).map(|k| ((k * 7 + seed) % 256) as u8).collect();
+            // Scales near 2^0 so the decoded weights stay in a sane range.
+            let bs: Vec<u8> = (0..o * nb)
+                .map(|k| (126 + ((k + seed) % 3)) as u8)
+                .collect();
+            QTensor {
+                fmt_code: 6,
+                q4: Bytes::Owned(q4),
+                bs: Bytes::Owned(bs),
+                g: 1.0,
+                o: o as i32,
+                i: i as i32,
+                gpu_eligible: true,
+                ..Default::default()
+            }
+        };
+        let (gate, up, down) = (mk(I, D, 1), mk(I, D, 5), mk(D, I, 9));
+        let (beta, linear_beta) = (4.0f32, 25.0f32);
+        let _ = ACTIVATION.set(ActCfg {
+            oai: false,
+            alpha: 0.0,
+            limit: 0.0,
+            relu2: false,
+            situ: true,
+            situ_beta: beta,
+            situ_linear_beta: linear_beta,
+        });
+
+        for (nr, tol) in [(1usize, 2e-3f32), (8usize, 5e-2f32)] {
+            let x: Vec<f32> = (0..nr * D)
+                .map(|k| ((k % 11) as f32 - 5.0) * 0.05)
+                .collect();
+            let mut want = vec![0f32; nr * D];
+            ffn_cpu(&gate, &up, &down, &x, nr, &mut want);
+
+            let mut got = vec![0f32; nr * D];
+            let ran = crate::gpu::try_expert_ffn_mxfp4_situ(
+                &gate,
+                &up,
+                &down,
+                &x,
+                nr,
+                &mut got,
+                beta,
+                linear_beta,
+            );
+            if !ran {
+                eprintln!("kernel declined at nr={nr} (no CUDA / no zero-copy) — skipping");
+                continue;
+            }
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (g - w).abs() <= tol * scale,
+                    "nr={nr} out[{k}]: gpu {g} vs cpu {w} (tol {} of scale {scale})",
+                    tol
+                );
+            }
+        }
     }
 }

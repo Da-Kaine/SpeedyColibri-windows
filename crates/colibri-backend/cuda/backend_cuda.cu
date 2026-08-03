@@ -9,6 +9,10 @@
 #include <cstring>
 #include <vector>
 #include <mutex>
+#include <chrono>
+#include <thread>
+#include <atomic>
+#include <vector>
 
 struct ColiCudaTensor {
     void *weights;
@@ -45,6 +49,12 @@ typedef struct {
     uint8_t *ewg,*ewu,*ewd; size_t ewg_cap,ewu_cap,ewd_cap;
     float *esg,*esu,*esd; size_t esg_cap,esu_cap,esd_cap;
     uint8_t *ebsg,*ebsu,*ebsd; size_t ebsg_cap,ebsu_cap,ebsd_cap;  /* NVFP4 block-scale device scratch (devcopy) */
+    /* Per-layer bulk residency (COLI_LAYER_RESIDENT): one device arena holding a whole
+     * group's expert weights, filled by a single transfer out of `host_lres`, which is
+     * PINNED. The per-expert `ewg/ewu/...` scratch above stages one expert at a time out of
+     * pageable memory, which is what measured 1.0-2.2 GB/s and 93.6% of expert-call time. */
+    uint8_t *lres; size_t lres_cap;
+    float *host_lres; size_t host_lres_cap;   /* `float*` to match reserve_pinned; bytes underneath */
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
     /* Nemotron-H Mamba2 selective-scan decode scratch (state in/out + per-step inputs). */
     float *ms_state,*ms_x,*ms_y,*ms_b,*ms_c,*ms_dth,*ms_dah,*ms_d;
@@ -117,6 +127,9 @@ __host__ __device__ static size_t row_bytes(int fmt, int I) {
     if (fmt == 3) return (size_t)(I + 3) / 4;
     if (fmt == 4) return (size_t)I;          // e4m3 fp8: 1 byte/weight
     if (fmt == 5) return (size_t)(I + 1) / 2; // nvfp4: packed e2m1 nibbles, 2/byte
+    // mxfp4: the SAME packed e2m1 nibbles as nvfp4 — the formats differ only in the
+    // separate block-scale array (E8M0 per 32 vs ue4m3 per 16), which is not counted here.
+    if (fmt == 6) return (size_t)(I + 1) / 2;
     return 0;
 }
 
@@ -348,6 +361,97 @@ __global__ static void nvfp4_gemv(float *y,const float *x,const uint8_t *w,
     if(lane==0) y[n]=acc*g;
 }
 
+/* Widest-read NVFP4 GEMV: one uint4 (16 B) per lane, 512 B per warp transaction.
+ *
+ * `nvfp4_gemv` gives one k to each lane and indexes `wr[k>>1]`, so lanes 2j/2j+1 fetch the
+ * SAME byte and a warp covers 16 B. `nvfp4_gemv_wide` gives each lane a byte: 32 B. Both
+ * are far under what the memory wants. Measured on GB10 with a pure read kernel over a
+ * real shard (mapbench2), bandwidth against access width:
+ *
+ *   4 B/lane (128 B/warp)   144.7 GB/s heap
+ *   16 B/lane (512 B/warp)  172.9 GB/s heap, 248.3 GB/s device-resident
+ *
+ * and the routed-expert gemv was measured at only ~110 GB/s, i.e. the KERNEL was the
+ * limit, not the memory. Hence 16 B/lane here.
+ *
+ * Layout: a uint4 spans 32 nibbles = 32 values of k, so it covers exactly TWO NVFP4
+ * block-16 scales — `v.x`/`v.y` take `br[2i]`, `v.z`/`v.w` take `br[2i+1]` — and the
+ * scale decode drops to 2 per 16 B instead of 1 per value.
+ *
+ * `x` IS staged in shared memory. A first version read it from global to free up
+ * occupancy, which was a mistake: each lane then pulls 32 consecutive x values (128 B) so
+ * a warp scatters over ~4 KB per step instead of broadcasting from shared, and the
+ * activation stream becomes the bottleneck the weight stream just stopped being. Measured
+ * on Nemotron decode: gpu-ffn flat but total moe 1271 -> 1503 ms, an 18% REGRESSION.
+ * Widen the weights, keep x shared.
+ *
+ * NOT bit-identical to `nvfp4_gemv`: per-lane k assignment changes the f32 reduction
+ * order, so results differ in the last ULPs. The caller must keep using the narrow kernel
+ * whenever `exact` is set (MTP verify), which is why this is a separate kernel and not a
+ * replacement. Requires `wr` 16 B aligned, i.e. `Kh % 16 == 0` and a 16 B aligned base;
+ * the caller checks both and falls back otherwise. */
+__global__ static void nvfp4_gemv_u4(float *y,const float *x,const uint8_t *w,
+                                     const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+15)>>4;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    const uint4 *wq=(const uint4*)wr;
+    int Kq=Kh>>4;                       /* whole uint4 groups; caller guarantees Kh%16==0 */
+    float acc=0.f;
+    for(int i=lane;i<Kq;i+=32){
+        uint4 v=wq[i];
+        int k0=i<<5;                    /* 32 values of k per uint4 */
+        float s0=e4m3f(br[k0>>4]);      /* k0 .. k0+15  */
+        float s1=e4m3f(br[(k0+16)>>4]); /* k0+16 .. k0+31 */
+        uint32_t word[4]={v.x,v.y,v.z,v.w};
+        #pragma unroll
+        for(int wi=0;wi<4;wi++){
+            float sc=(wi<2)?s0:s1;
+            int kb=k0+(wi<<3);
+            uint32_t wd=word[wi];
+            float part=0.f;
+            #pragma unroll
+            for(int bj=0;bj<4;bj++){
+                uint32_t byte=(wd>>(bj<<3))&0xFFu;
+                int kk=kb+(bj<<1);
+                part += xs[kk]*e2m1f(byte&0xF) + xs[kk+1]*e2m1f(byte>>4);
+            }
+            acc+=part*sc;
+        }
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Can `nvfp4_gemv_u4` read this weight? Needs every row 16 B aligned.
+ * `COLI_NVFP4_U4=0` forces the narrow kernel, so the two can be A/B'd in one binary. */
+__host__ static inline int nvfp4_u4_ok(const uint8_t *w,int K){
+    static int s_on=-1;
+    if(s_on<0){const char*e=getenv("COLI_NVFP4_U4");s_on=e?atoi(e):1;}
+    if(!s_on) return 0;
+    int Kh=(K+1)>>1;
+    int ok = ((Kh & 15)==0) && ((((uintptr_t)w) & 15)==0);
+    /* Diagnostic (COLI_U4_REPORT=1): a silently-ineligible weight is indistinguishable
+     * from "the wide kernel is no faster", and expert weights are views at arbitrary
+     * safetensors offsets, so alignment is NOT a given. */
+    static int s_rep=-1; if(s_rep<0){const char*e=getenv("COLI_U4_REPORT");s_rep=e?atoi(e):0;}
+    if(s_rep){
+        static long long yes=0,no=0,no_kh=0,no_ptr=0;
+        if(ok) yes++; else { no++; if(Kh&15) no_kh++; if(((uintptr_t)w)&15) no_ptr++; }
+        if(((yes+no)%500)==0)
+            fprintf(stderr,"[u4] eligible=%lld ineligible=%lld (Kh%%16: %lld, ptr%%16: %lld)\n",
+                    yes,no,no_kh,no_ptr);
+    }
+    return ok;
+}
+
 /* Wide-read NVFP4 GEMV — RESIDENT weights only (S==1 decode).
  *
  * `nvfp4_gemv` above assigns one k per lane and indexes `wr[k>>1]`, so lanes 2j and 2j+1
@@ -470,6 +574,132 @@ __global__ static void nvfp4_gemv_u32(float *y,const float *x,const uint8_t *w,
     #pragma unroll
     for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
     if(lane==0) y[n]=acc*g;
+}
+
+/* ---------------------------------------------------------------------------------
+ * MXFP4 (Kimi-K3) expert kernels.
+ *
+ * Same e2m1 nibbles as NVFP4 with exactly two differences, both localized:
+ *   - one OCP E8M0 (power-of-two) block scale per 32 inputs, not a ue4m3 per 16;
+ *   - no per-tensor global (a natively-MXFP4 tensor carries g == 1.0), kept as a
+ *     parameter so both formats share one call shape.
+ *
+ * Written as separate kernels rather than by templating the NVFP4 ones: those are the
+ * hot path for four shipped models, and changing their codegen to serve a fifth is not
+ * a trade worth making for ~110 lines. K3's experts are natively MXFP4 and pass through
+ * convert bit-exact, so this is the only kernel that can read them.
+ * --------------------------------------------------------------------------------- */
+
+/* Decode one OCP E8M0 byte: a bare power of two, 2^(b-127). 0xFF is NaN. */
+__device__ __forceinline__ static float e8m0f(uint8_t b) {
+    return (b == 0xFF) ? __int_as_float(0x7fffffff) : exp2f((float)b - 127.0f);
+}
+
+/* Single-row decode GEMV (S==1 decode): one warp per output column. */
+__global__ static void mxfp4_gemv(float *y,const float *x,const uint8_t *w,
+                                  const uint8_t *bs,float g,int K,int N){
+    extern __shared__ float xs[];
+    for(int k=threadIdx.x;k<K;k+=blockDim.x) xs[k]=x[k];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int n=blockIdx.x*(blockDim.x>>5)+warp;
+    if(n>=N) return;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    const uint8_t *wr=w+(size_t)n*Kh;
+    const uint8_t *br=bs+(size_t)n*nb;
+    float acc=0.f;
+    for(int k=lane;k<K;k+=32){
+        uint8_t byte=wr[k>>1];
+        int nib=(k&1)?(byte>>4):(byte&0xF);
+        acc += xs[k]*e2m1f(nib)*e8m0f(br[k>>5]);
+    }
+    #pragma unroll
+    for(int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffff,acc,o);
+    if(lane==0) y[n]=acc*g;
+}
+
+/* Tiled WMMA matmul (S>1 prefill). Mirror of `nvfp4_matmul` with the MXFP4 decode. */
+__global__ static void mxfp4_matmul(float *y,const float *x,const uint8_t *w,
+                                    const uint8_t *bs,float g,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+warp*16;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    __shared__ __half ah[256],bh[4][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){
+            int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);
+        }
+        for(int z=lane;z<256;z+=32){
+            int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e8m0f(bs[(size_t)gn*nb+(gk>>5)])*g;
+            }
+            bh[warp][z]=__float2half(v);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[4][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
+#endif
+}
+
+/* Tiled WMMA fused gate+up (S>1 prefill). Mirror of `nvfp4_gate_up` with the MXFP4 decode. */
+__global__ static void mxfp4_gate_up(float *gate,float *up,const float *x,
+        const uint8_t *gw,const uint8_t *uw,const uint8_t *gbs,const uint8_t *ubs,
+        float gg,float ug,int M,int K,int N){
+#if __CUDA_ARCH__ >= 700
+    using namespace nvcuda;int warp=threadIdx.x>>5,lane=threadIdx.x&31,which=warp&1,tile=warp>>1;
+    int m0=blockIdx.y*16,n0=blockIdx.x*64+tile*16;
+    const uint8_t *w=which?uw:gw;const uint8_t *bs=which?ubs:gbs;
+    float g=which?ug:gg;float *y=which?up:gate;
+    int Kh=(K+1)>>1, nb=(K+31)>>5;
+    __shared__ __half ah[256],bh[8][256];
+    wmma::fragment<wmma::accumulator,16,16,16,float> acc;wmma::fill_fragment(acc,0.f);
+    for(int k0=0;k0<K;k0+=16){
+        for(int z=threadIdx.x;z<256;z+=blockDim.x){int m=z/16,k=z%16,gm=m0+m,gk=k0+k;
+            ah[z]=(gm<M&&gk<K)?__float2half(x[(size_t)gm*K+gk]):__float2half(0.f);}
+        for(int z=lane;z<256;z+=32){int nn=z/16,gk=k0+(z%16),gn=n0+nn;float v=0.f;
+            if(gn<N&&gk<K){
+                uint8_t byte=w[(size_t)gn*Kh+(gk>>1)];
+                int nib=(gk&1)?(byte>>4):(byte&0xF);
+                v=e2m1f(nib)*e8m0f(bs[(size_t)gn*nb+(gk>>5)])*g;
+            }
+            bh[warp][z]=__float2half(v);}
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> bf;
+        wmma::load_matrix_sync(af,ah,16);wmma::load_matrix_sync(bf,bh[warp],16);
+        wmma::mma_sync(acc,af,bf,acc);__syncthreads();
+    }
+    __shared__ float out[8][256];wmma::store_matrix_sync(out[warp],acc,16,wmma::mem_row_major);__syncwarp();
+    for(int z=lane;z<256;z+=32){int m=z/16,nn=z%16;
+        if(m0+m<M&&n0+nn<N)y[(size_t)(m0+m)*N+n0+nn]=out[warp][z];}
+#endif
+}
+
+/* Kimi-K3 `situ`, fused into the gate/up combine:
+ *     gate = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)
+ * ASYMMETRIC — the gate half gets tanh*sigmoid, the up half only tanh — so the two
+ * arguments are not interchangeable. `linear_beta <= 0` means "unset" (the reference's
+ * `None`), leaving `up` a plain passthrough. Mirrors `math::situ` exactly. */
+__global__ static void situ_mul(float *gate,const float *up,size_t n,
+                                float beta,float linear_beta){
+    size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=n) return;
+    float gv=gate[i], uv=up[i];
+    float a = beta*tanhf(gv/beta)*(1.0f/(1.0f+__expf(-gv)));
+    float u = (linear_beta>0.0f) ? linear_beta*tanhf(uv/linear_beta) : uv;
+    gate[i]=a*u;
 }
 
 /* Tiled WMMA down-proj (S>1 prefill). Mirror of `fp8a16_matmul` with the nvfp4 decode. */
@@ -680,6 +910,64 @@ static bool nvfp4_wsmm_launch(float *y,const float *x,const uint8_t *w,const uin
     else return false;
     #undef WSMM_CASE
     return true;
+}
+
+/* Launch the S==1 NVFP4 GEMV under COLI_NVFP4_GEMV:
+ *   0 = narrow (original: one nibble-pair byte shared by lanes 2j/2j+1, x staged in shared)
+ *   1 = one byte per lane + shared x
+ *   2 = one byte per lane, x read from device (frees the shared-mem occupancy cap)
+ *   3 = uint32 per lane — a full 128 B/warp cache line (default; needs Kh % 4 == 0)
+ *
+ * ONE dispatcher for every NVFP4 decode GEMV. The read-pattern work (#46) originally lived
+ * inline in `coli_cuda_matmul_nvfp4`, so it reached the *resident* weights only and both
+ * expert MLPs kept launching the narrow kernel — the closed-set dispatch trap, and the
+ * reason that win read as "+9.4%, rest is Amdahl" when routed experts are the larger half
+ * of a decode step. Route every call site here so a read-pattern change lands everywhere.
+ *
+ * Mode is resolved once: within a call site K is fixed, so draft and verify pick the same
+ * kernel and the MTP `exact` path stays reduction-order-identical to sequential decode. */
+/* `nvfp4_gemv_u32` casts the weight row to `const uint32_t*`, so it needs BOTH a
+ * 4-aligned row stride and a 4-aligned base. The stride test alone is not enough: a
+ * resident weight comes from `cudaMalloc` (256-aligned, so the base is free), but an
+ * EXPERT weight is a view at an arbitrary safetensors offset. Routing expert GEMVs through
+ * a stride-only guard faults with `misaligned address`, and because a CUDA context error is
+ * sticky that takes down every later call — the engine silently falls back to CPU and the
+ * model gets ~3x slower with the GPU at 0%. Mirrors `nvfp4_u4_ok`, which learned this
+ * first ("expert weights are views at arbitrary safetensors offsets"). */
+__host__ static inline int nvfp4_u32_ok(const uint8_t *w,int K){
+    int Kh=(K+1)>>1;
+    return ((Kh&3)==0) && ((((uintptr_t)w)&3)==0);
+}
+
+/* Default is 2 (byte/lane, no shared x), NOT 3 (uint32/lane), and the reason is
+ * correctness rather than speed.
+ *
+ * Mode 3 is selected per call by `nvfp4_u32_ok`, which tests the weight POINTER. Expert
+ * weights come from a recycling buffer pool, so the same expert lands at a different heap
+ * address on every run — mode 3 for one run, the mode-2 fallback for the next, two
+ * different float summation orders, two different answers. MiniMax-M2.7 decode diverged at
+ * token 7 across three identical back-to-back runs; forcing mode 2 made all three
+ * byte-identical. (mmap-served spans are unaffected: page-aligned base plus a fixed file
+ * offset is reproducible, which is why short warm runs looked deterministic.)
+ *
+ * It also costs nothing to fix. M2.7 decode, two pairs: mode 3 gave 6.57/6.69 tok/s and
+ * mode 2 gave 7.03/6.87 — mode 2 is *faster*, matching the earlier finding that read width
+ * stops paying past 32 B/warp. Mode 3 was buying non-determinism for no throughput.
+ *
+ * The modes remain selectable via COLI_NVFP4_GEMV for A/B; 3 is non-deterministic on any
+ * pooled buffer and must not be used to produce reference output. */
+static void nvfp4_gemv_dispatch(float *y,const float *x,const uint8_t *w,const uint8_t *bs,
+        float g,int K,int N,cudaStream_t s){
+    static int s_mode=-1;
+    if(s_mode<0){const char*e=getenv("COLI_NVFP4_GEMV");s_mode=e?atoi(e):2;}
+    const int tpb=256,wpb=tpb>>5;
+    unsigned blocks=(unsigned)((N+wpb-1)/wpb);
+    size_t shm=(size_t)K*sizeof(float);
+    if(s_mode==0)      nvfp4_gemv     <<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(s_mode==1) nvfp4_gemv_wide<<<blocks,tpb,shm,s>>>(y,x,w,bs,g,K,N);
+    else if(s_mode==2) nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else if(nvfp4_u32_ok(w,K)) nvfp4_gemv_u32<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
+    else               nvfp4_gemv_wide_g<<<blocks,tpb,0,s>>>(y,x,w,bs,g,K,N);
 }
 
 /* Single-row decode GEMV (S==1) for int8 W8A16 — mirror of `fp8a16_gemv` with the
@@ -1362,8 +1650,17 @@ static int reserve_bytes(void **ptr,size_t *cap,size_t bytes){
     if(!cuda_ok(cudaMalloc(ptr,bytes),"descriptor allocation")) return 0; *cap=bytes; return 1;
 }
 
+/* Reallocation counters. A cudaMallocHost of ~176 MB costs ~100 ms, so if the grouped
+ * path re-reserves per chunk that alone is ~20 s over a prefill — the right order for the
+ * pack's unexplained time, given a standalone benchmark of the same copy runs at 64 GB/s
+ * while the pack manages 6. Counted rather than assumed: three mechanism guesses have
+ * already been wrong here. */
+long long g_res_pin_hit=0,g_res_pin_alloc=0,g_res_dev_hit=0,g_res_dev_alloc=0;
+
 static int reserve_pinned(float **ptr,size_t *cap,size_t bytes){
-    if(*cap>=bytes)return 1;if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
+    if(*cap>=bytes){g_res_pin_hit++;return 1;}
+    g_res_pin_alloc++;
+    if(*ptr)cudaFreeHost(*ptr);*ptr=nullptr;*cap=0;
     if(!cuda_ok(cudaMallocHost(ptr,bytes),"pinned staging allocation"))return 0;*cap=bytes;return 1;
 }
 
@@ -1434,6 +1731,7 @@ extern "C" void coli_cuda_shutdown(void) {
         ctx->ewg=ctx->ewu=ctx->ewd=nullptr;ctx->esg=ctx->esu=ctx->esd=nullptr;
         ctx->ewg_cap=ctx->ewu_cap=ctx->ewd_cap=ctx->esg_cap=ctx->esu_cap=ctx->esd_cap=0;
         ctx->ebsg=ctx->ebsu=ctx->ebsd=nullptr;ctx->ebsg_cap=ctx->ebsu_cap=ctx->ebsd_cap=0;
+        ctx->lres=nullptr;ctx->lres_cap=0;ctx->host_lres=nullptr;ctx->host_lres_cap=0;
         ctx->x_cap = ctx->y_cap = ctx->gate_cap = ctx->up_cap = 0;
         ctx->qx_cap=ctx->qscale_cap=0;
         ctx->aq_cap=ctx->al_cap=ctx->ar_cap=ctx->ac_cap=0;
@@ -1465,6 +1763,44 @@ extern "C" int coli_cuda_pageable_access(int device) {
     return v;
 }
 
+/* Page-lock a host allocation the engine already owns, so the GPU can DMA straight out of
+ * it. This is what lets the expert staging path skip its CPU pack: a copy out of PAGEABLE
+ * memory is bounced through the driver's own staging buffer (measured at 1-2 GB/s, and the
+ * reason COLI_GROUP_DIRECT came out 2.3x slower), while a copy out of registered memory is
+ * a straight DMA at the 56 GB/s this box actually does.
+ *
+ * Registration is per allocation, not per use — the expert buffer pool recycles a bounded
+ * set of allocations, so the cost is paid once each and amortised over every later expert
+ * that lands in that slot.
+ *
+ * Returns 0 on failure and CLEARS the error, which matters more than it looks: a sticky
+ * CUDA error turns the next unrelated launch into a silent CPU fallback. Failing to pin is
+ * allowed — the caller keeps the pack. Failing quietly and poisoning the context is not. */
+extern "C" int coli_cuda_host_register(void *p, size_t bytes) {
+    if (!p || !bytes) return 0;
+    cudaError_t e = cudaHostRegister(p, bytes, cudaHostRegisterDefault);
+    if (e != cudaSuccess) {
+        /* Report the first failure and the first one after any success. 10266 of 10283
+         * registrations failed on GLM after ~0.2 GB had been locked, and a bare pass/fail
+         * counter cannot tell a hard driver limit from a wrong flag — one is a reason to
+         * delete this path, the other is a one-word fix. */
+        static int s_reported = 0;
+        if (!s_reported) {
+            s_reported = 1;
+            fprintf(stderr, "[page-lock] cudaHostRegister(%p, %zu) failed: %s (%d)\n",
+                    p, bytes, cudaGetErrorString(e), (int)e);
+        }
+        cudaGetLastError();
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" void coli_cuda_host_unregister(void *p) {
+    if (!p) return;
+    if (cudaHostUnregister(p) != cudaSuccess) cudaGetLastError();
+}
+
 extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor_bytes) {
     size_t count = 0, bytes = 0;
     for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
@@ -1475,6 +1811,44 @@ extern "C" void coli_cuda_stats(int device, size_t *tensor_count, size_t *tensor
     if (tensor_bytes) *tensor_bytes = bytes;
 }
 
+/* Every live DeviceContext scratch allocation, device and pinned-host alike.
+ *
+ * On GB10 that distinction does not matter for the RAM ledger: "VRAM" and host memory are
+ * the SAME 121 GiB LPDDR5X pool, so a cudaMalloc here is exactly as real as a heap
+ * allocation in Rust. None of it was visible to the ledger — `Class::Scratch` is charged
+ * in exactly one place (gpu.rs), as a PREDICTION, and only on the grouped NVFP4 path, so
+ * an MXFP4 model like Kimi-K3 charges ~nothing while allocating all of the below.
+ *
+ * `tensor_bytes` is deliberately EXCLUDED: that is the device weight cache, a different
+ * class, already exposed by coli_cuda_stats.
+ *
+ * Sums capacities, not requested sizes. `reserve` keeps a buffer when cap >= bytes, so the
+ * capacity is what is actually held. */
+extern "C" size_t coli_cuda_scratch_bytes(int device) {
+    size_t t = 0;
+    for (int i = 0; i < g_nctx; i++) if (device < 0 || g_ctx[i].device == device) {
+        const DeviceContext *c = &g_ctx[i];
+        t += c->x_cap + c->y_cap + c->gate_cap + c->up_cap;
+        t += c->qx_cap + c->qscale_cap;
+        t += c->host_x_cap + c->host_y_cap;                       /* pinned */
+        t += c->sg_tile_e_cap + c->sg_tile_r0_cap + c->sg_off_cap + c->sg_rows_cap;
+        t += c->sg_ug_cap + c->sg_dg_cap + c->sg_uw_cap + c->sg_ubs_cap + c->sg_dw_cap + c->sg_dbs_cap;
+        t += c->ewg_cap + c->ewu_cap + c->ewd_cap;
+        t += c->esg_cap + c->esu_cap + c->esd_cap;
+        t += c->ebsg_cap + c->ebsu_cap + c->ebsd_cap;
+        t += c->lres_cap + c->host_lres_cap;                      /* host_lres is pinned */
+        t += c->aq_cap + c->al_cap + c->ar_cap + c->ac_cap;
+        t += c->ms_state_cap + c->ms_x_cap + c->ms_y_cap + c->ms_b_cap + c->ms_c_cap;
+        t += c->ms_dth_cap + c->ms_dah_cap + c->ms_d_cap;
+        t += c->ms_pin_x_cap + c->ms_pin_y_cap + c->ms_pin_state_cap;   /* pinned */
+        t += c->asel_cap + c->acnt_cap;
+        t += c->aqa_cap + c->akb_cap + c->amsk_cap;
+        t += c->group_desc_cap;
+        for (int b = 0; b < 24; b++) t += c->pipe_cap[b];
+    }
+    return t;
+}
+
 extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64_t *rows,
                                         double *h2d_ms, double *kernel_ms, double *d2h_ms) {
     if(calls) *calls=g_group_calls; if(experts) *experts=g_group_experts; if(rows) *rows=g_group_rows;
@@ -1482,11 +1856,33 @@ extern "C" void coli_cuda_group_stats(uint64_t *calls, uint64_t *experts, uint64
     if(d2h_ms) *d2h_ms=g_group_d2h_ms;
 }
 
+/* Resident-weight residency mode (see coli_cuda_set_weight_zerocopy). 0 = upload a
+ * device copy; 1 = wrap the host buffer and read it in place. */
+static int g_weight_zerocopy = 0;
+
+/* Choose how coli_cuda_tensor_upload materializes a resident weight.
+ *
+ * Uploading gives the kernel device memory (~273 GB/s) at the cost of a SECOND copy of
+ * every resident weight — and on GB10 "VRAM" is the same physical RAM, so that copy is
+ * charged against the expert cache's budget. Wrapping reads the host buffer in place
+ * (~51 GB/s, the path the streamed experts already take) for free.
+ *
+ * Kimi-K3 forces the choice: ~63 GB resident of a 121 GB box, so uploading leaves nothing
+ * for the expert cache and the process is OOM-killed mid-forward. Wrapping is slower per
+ * access but keeps the matmuls ON the GPU, and falling off the GPU entirely measured
+ * 6.8x slower on nemotron decode. */
+extern "C" void coli_cuda_set_weight_zerocopy(int on) { g_weight_zerocopy = on ? 1 : 0; }
+
 extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
                                         const void *weights, const float *scales,
                                         int fmt, int I, int O, int device) {
     DeviceContext *ctx = find_ctx(device);
     if (!tensor || !weights || I < 1 || O < 1 || !select_ctx(ctx)) return 0;
+    /* Zero-copy: hand back a wrapped tensor pointing at the host buffers. Every kernel
+     * below reads `t->weights` the same way either path; only the pointer's provenance
+     * differs, and pageable access makes a host pointer legal. */
+    if (g_weight_zerocopy && !*tensor)
+        return coli_cuda_tensor_wrap(tensor, weights, scales, fmt, I, O, device);
     size_t rb = row_bytes(fmt, I);
     if (!rb || (fmt && !scales)) return 0;
     if (*tensor) {
@@ -1580,8 +1976,24 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
         else
             i8a16_matmul<<<tg, 128>>>(ctx->y, ctx->x, (const uint8_t *)t->weights, t->scales, S, I, O);
     } else {
-        dim3 grid((unsigned)O, (unsigned)S);
-        quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->wrapped);
+        // gridDim.y is capped at 65535 and this arm launches one block per (output, row), so
+        // a prefill with more rows than that does not merely run slowly — the launch fails
+        // outright with `invalid argument`, coli_cuda_matmul returns 0, and the caller drops
+        // to the single-threaded CPU `matmul_qt`. Measured on M2.7 at S=73728 (#56): the
+        // attention core stayed on the GPU while every projection fell to one CPU thread.
+        // (The tiled fmt 1/4 arm above is already safe — its grid.y is (S+15)/16.)
+        //
+        // quant_matmul takes its row from blockIdx.y alone and never reads `S`, so a chunk is
+        // just a pointer offset. Chunks share the default stream, so they serialise in order
+        // and the single completion check below still covers all of them.
+        const unsigned YMAX = 65535u;
+        for (int s0 = 0; s0 < S; s0 += (int)YMAX) {
+            int sc = S - s0;
+            if (sc > (int)YMAX) sc = (int)YMAX;
+            dim3 grid((unsigned)O, (unsigned)sc);
+            quant_matmul<<<grid, 256>>>(ctx->y + (size_t)s0 * O, ctx->x + (size_t)s0 * I,
+                                        t->weights, t->scales, fmt, sc, I, O, rb, t->wrapped);
+        }
     }
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
@@ -1623,30 +2035,8 @@ extern "C" int coli_cuda_matmul_nvfp4(ColiCudaTensor **tensor,
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "nvfp4 matmul input")) return 0;
     const uint8_t *w = (const uint8_t *)t->weights;
     const uint8_t *bs = (const uint8_t *)t->bscale;
-    size_t gemv_shmem = (size_t)I * sizeof(float);
     if (S == 1) {
-        /* COLI_NVFP4_WIDE=0 selects the original narrow-read GEMV for A/B. */
-        /* COLI_NVFP4_GEMV: 0=narrow (original), 1=wide read + shared x, 2=wide
-         * read, no shared x, 3=uint32 full-cache-line read (default). */
-        static int s_mode = -1;
-        if (s_mode < 0) { const char *e = getenv("COLI_NVFP4_GEMV"); s_mode = e ? atoi(e) : 3; }
-        const int tpb = 256, wpb = tpb >> 5;
-        unsigned blocks = (unsigned)((O + wpb - 1) / wpb);
-        if (s_mode == 0)
-            nvfp4_gemv<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if (s_mode == 1)
-            nvfp4_gemv_wide<<<blocks, tpb, gemv_shmem, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if (s_mode == 2)
-            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else if ((((I + 1) >> 1) & 3) == 0)   /* uint32 loads need Kh % 4 == 0 */
-            nvfp4_gemv_u32<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
-        else
-            nvfp4_gemv_wide_g<<<blocks, tpb, 0, ctx->stream>>>(
-                ctx->y, ctx->x, w, bs, t->gscale, I, O);
+        nvfp4_gemv_dispatch(ctx->y, ctx->x, w, bs, t->gscale, I, O, ctx->stream);
     } else {
         dim3 grid((unsigned)((O + 63) / 64), (unsigned)((S + 15) / 16));
         nvfp4_matmul<<<grid, 128, 0, ctx->stream>>>(ctx->y, ctx->x, w, bs, t->gscale, S, I, O);
@@ -1719,13 +2109,23 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
     // zero-copy GPU read pays a cache-coherence penalty on every (dirty) weight line —
     // measured ~2.8x/matmul slower than reading clean device memory. Stage them through
     // one streaming H2D copy per weight (resolves coherence in bulk), then run the
-    // kernels on device pointers. Prefill-gated (COLI_FFN_DEVCOPY_MIN, default 16): at
-    // small S the copy can't amortize. COLI_FFN_DEVCOPY=0 forces the old zero-copy path.
+    // kernels on device pointers. The old `S >= 16` gate assumed small S could not amortize
+    // the copy; measured on the NVFP4 twin it is the opposite — a routed expert sees
+    // S = tokens*top_k/n_experts (~4), and staging won 1.24x there. Same reasoning applies
+    // here: the penalty is per dirty weight line, so it scales with the WEIGHT, not with S,
+    // and S only decides how much useful work amortizes it. COLI_FFN_DEVCOPY=0 forces the
+    // old zero-copy path. (Not re-measured on the fp8 path — see the NVFP4 twin.)
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const float *gsc=gate->scales,*usc=up->scales,*dsc=down->scales;
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    // Same per-PATH gate as the NVFP4 twins: the S==1 gemv reads each weight once, so
+    // staging it is a pure loss. See the relu2 path for the 11.04 -> 9.8 tok/s this cost
+    // on Nemotron decode when the replacement for `S >= 16` was left out.
+    static int s_gemv_pre=-1;
+    if(s_gemv_pre<0){const char*e=getenv("COLI_FFN_GEMV");s_gemv_pre=e&&atoi(e);}
+    const bool row_path=(s_gemv_pre&&S==1);
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc&&!row_path){
         size_t gwb=(size_t)I*D,dwb=(size_t)D*I;
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gwb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gwb)&&
            reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dwb)&&reserve(&ctx->esg,&ctx->esg_cap,(size_t)I*sizeof(float))&&
@@ -1773,6 +2173,56 @@ extern "C" int coli_cuda_expert_mlp_fp8(ColiCudaTensor *gate,ColiCudaTensor *up,
  * WMMA at S>1 (prefill). Requires fmt==5 on all three projections and compute>=7. Zero-copy
  * only (no device-copy staging path); the block-scale + global travel on the ColiCudaTensor.
  * `COLI_NVFP4_TILED=1` forces the tiled path even at S==1 (A/B against the GEMV). */
+/* Kimi-K3 MXFP4 expert FFN: y = down( situ(gate.x, up.x) ).
+ *
+ * Same shape as coli_cuda_expert_mlp_nvfp4 with the MXFP4 decode (E8M0 per 32) and the
+ * situ activation instead of SwiGLU. It exists because K3 could not use the GPU at all:
+ * `ffn` deliberately declines the fused SwiGLU path when situ is set (those kernels apply
+ * oai-or-SiLU and would return success having computed a DIFFERENT activation), so K3's
+ * experts ran the scalar CPU loop — 85% of a measured 5-minute forward pass.
+ *
+ * `beta`/`linear_beta` come from the model config; `linear_beta <= 0` means unset. */
+extern "C" int coli_cuda_expert_mlp_mxfp4_situ(ColiCudaTensor *gate,ColiCudaTensor *up,
+        ColiCudaTensor *down,float *y,const float *x,int S,
+        float beta,float linear_beta){
+    if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=6||up->fmt!=6||down->fmt!=6||
+       gate->device!=up->device||gate->device!=down->device||gate->I!=up->I||
+       gate->O!=up->O||down->I!=gate->O||down->O!=gate->I)return 0;
+    DeviceContext *ctx=find_ctx(gate->device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    int D=gate->I,I=gate->O;size_t xb=(size_t)S*D*sizeof(float),ib=(size_t)S*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert mxfp4 input upload"))return 0;
+    const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
+    const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
+    float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
+    unsigned sblocks=(unsigned)(((size_t)S*I+255)/256);
+    if(S==1){
+        int tpb=256,wpb=tpb>>5;
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
+        mxfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+        situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)I,beta,linear_beta);
+        mxfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+    }else{
+        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+        mxfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+        situ_mul<<<sblocks,256,0,ctx->stream>>>(ctx->gate,ctx->up,(size_t)S*I,beta,linear_beta);
+        mxfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert mxfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert mxfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert mxfp4 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    return 1;
+}
+
 extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *up,
         ColiCudaTensor *down,float *y,const float *x,int S){
     if(!gate||!up||!down||!x||!y||S<1||gate->fmt!=5||up->fmt!=5||down->fmt!=5||
@@ -1785,19 +2235,65 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
        !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
        !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
        !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    // Per-call GPU-timeline split (COLI_NVFP4_EVT=1), mirroring COLI_RELU2_EVT. This was
+    // the ONLY expert entry point without one, and it is the one the SwiGLU models take —
+    // so the question "where do M2.7's ~12 ms per expert call go?" had no instrument.
+    //
+    // It answered the first half decisively. Over 6 runs of identical work (M2.7, 128-token
+    // prefill, 79.63 GB, 10000 calls) the kernel is 2.47-2.51 s — under 2% spread — while
+    // staging is 36.9-78.7 s. **Staging is always >=15x the kernel**, so the GEMM is not
+    // where this phase goes, and it stages at 1.0-2.2 GB/s for a host->device copy on a
+    // box whose "device" memory is the same LPDDR5X. That rate is the open question.
+    //
+    // It did NOT answer the second half. Staging cost plateaus mid-run (53.53 s at 8000
+    // calls -> 53.89 s at 10000), which reads like first-touch on freshly-pread pages —
+    // but a 128-token prefill touches ~15872 DISTINCT experts, so a per-expert cost would
+    // grow linearly rather than plateau, and running with a WARM page cache made staging
+    // *slower* (78.70 s), which first-touch and I/O-contention both predict the opposite
+    // of. The mechanism is unknown; do not optimize against the first-touch story.
+    // Bucketed by input width D so the shared expert and the routed experts stay separable.
+    static int s_evt=-1; static cudaEvent_t s_v0=0,s_v1=0,s_v2=0;
+    struct NvEvt { int d; double stage_ms,kern_ms; long calls,rows,wbytes; };
+    static NvEvt s_nv[4]={}; static int s_nnv=0;
+    if(s_evt<0){ const char*e=getenv("COLI_NVFP4_EVT"); s_evt=e&&atoi(e);
+        if(s_evt){cudaEventCreate(&s_v0);cudaEventCreate(&s_v1);cudaEventCreate(&s_v2);} }
+    NvEvt *nv=nullptr;
+    if(s_evt){
+        for(int i=0;i<s_nnv;i++) if(s_nv[i].d==D){ nv=&s_nv[i]; break; }
+        if(!nv&&s_nnv<4){ s_nv[s_nnv].d=D; nv=&s_nv[s_nnv++]; }
+    }
     std::memcpy(ctx->host_x,x,xb);
     if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
                                "expert nvfp4 input upload"))return 0;
+    if(s_evt) cudaEventRecord(s_v0,ctx->stream);
     const uint8_t *gw=(const uint8_t*)gate->weights,*uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *gbs=(const uint8_t*)gate->bscale,*ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float gg=gate->gscale,ug=up->gscale,dg=down->gscale;
-    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
-    // nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory instead
-    // of freshly-pread (dirty, coherence-heavy) host pages — the fp8-path win. Decode (S==1
-    // gemv) never reaches this; zero-copy stays the decode path.
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    // Stage nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory
+    // instead of freshly-pread (dirty, coherence-heavy) host pages. Decode (S==1 gemv)
+    // never reaches this branch; zero-copy stays the decode path.
+    //
+    // This used to require S >= 16, and that threshold was wrong for every routed-expert
+    // model. An expert in prefill does not see the prompt length — it sees
+    // S = tokens*top_k/n_experts, which for MiniMax-M2.7 (top_k 8, 256 experts) is ~4 at a
+    // 128-token prompt and ~16 at 512. So the models this exists for sat at or below the
+    // gate and read dirty pages on all ~15872 expert calls of a prefill. Measured on M2.7,
+    // ABBA-interleaved, 4 runs per arm, tokens identical in all 8: gpu-ffn median
+    // 227468 ms at the old gate vs 184007 ms always-staged — **1.24x**, wall 1.20x.
+    //
+    // Gated on the path actually taken, NOT on a row-count threshold. The single-row gemv
+    // below reads the weights ONCE, so staging them costs a full H2D copy to save nothing —
+    // and decode is exactly that path. Removing the old `S >= 16` gate without this
+    // condition made every decode step stage its experts (~15.8 MB each on Nemotron) and
+    // cost **9.8 vs 11.04 tok/s**. `S >= 16` had been keeping decode out by accident; the
+    // real predicate is "am I about to run the tiled/WSMM kernel", which re-reads the
+    // weight per m-tile and therefore does benefit.
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    const bool row_path=(S==1&&!s_tiled);
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc&&!row_path){
         size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (gate/up, down)
         size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewg,&ctx->ewg_cap,gnb)&&reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,gnb)&&
@@ -1810,27 +2306,60 @@ extern "C" int coli_cuda_expert_mlp_nvfp4(ColiCudaTensor *gate,ColiCudaTensor *u
             cudaMemcpyAsync(ctx->ebsu,ubs,gsb,cudaMemcpyHostToDevice,ctx->stream);
             cudaMemcpyAsync(ctx->ebsd,dbs,dsb,cudaMemcpyHostToDevice,ctx->stream);
             gw=ctx->ewg;uw=ctx->ewu;dw=ctx->ewd;gbs=ctx->ebsg;ubs=ctx->ebsu;dbs=ctx->ebsd;
+            if(nv) nv->wbytes+=(long)(gnb+gnb+dnb+gsb+gsb+dsb);
         }
     }
-    static int s_tiled=-1;
-    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
-    if(S==1&&!s_tiled){
-        int tpb=256,wpb=tpb>>5;
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->gate,ctx->x,gw,gbs,gg,D,I);
-        nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(ctx->up,ctx->x,uw,ubs,ug,D,I);
+    if(s_evt) cudaEventRecord(s_v1,ctx->stream);
+    if(row_path){
+        nvfp4_gemv_dispatch(ctx->gate,ctx->x,gw,gbs,gg,D,I,ctx->stream);
+        nvfp4_gemv_dispatch(ctx->up,  ctx->x,uw,ubs,ug,D,I,ctx->stream);
         act_mul(ctx->gate,ctx->up,(size_t)I,ctx->stream);
-        nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,I,D);
+        nvfp4_gemv_dispatch(ctx->y,ctx->gate,dw,dbs,dg,I,D,ctx->stream);
     }else{
-        dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
-        dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
-        nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
-        act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
-        nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        // Weight-stationary small-M path, the same #90 fix the relu2 expert already had: at
+        // prefill this expert sees only S = tokens*top_k/n_experts rows (~4-16 on M2.7,
+        // ~26 on Nemotron), so the WMMA tile re-dequants the whole weight per 16-row m-tile
+        // and runs at ~0.26% of tensor peak. Reading each weight once and accumulating over
+        // all S rows in registers is the win. Wiring it only into relu2 left the three
+        // SwiGLU models (M2.7/M3/GLM) on WMMA. Measured on M2.7, ABBA, tokens identical:
+        // gpu-ffn 258623 -> 222521 ms, **1.16x**.
+        //
+        // Not a knob. `nvfp4_wsmm_launch` selects the smallest MT bucket >= S and declines
+        // above 32, where the MMA amortizes and WMMA is the better kernel — and S is
+        // already the only thing that decides this. It carries the model (top_k /
+        // n_experts) and the cluster shape: under expert parallelism a node owns fewer
+        // experts, so each expert it does own sees proportionally MORE rows and slides
+        // toward the WMMA end on its own. An env override could only disagree with the
+        // shape actually being computed.
+        bool did_ws=false;
+        if(nvfp4_wsmm_launch(ctx->gate,ctx->x,gw,gbs,gg,S,D,I,ctx->stream)){
+            // Same S ⇒ the up/down launches take the same MT bucket and cannot decline.
+            nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            did_ws=nvfp4_wsmm_launch(ctx->y,ctx->gate,dw,dbs,dg,S,I,D,ctx->stream);
+        }
+        if(!did_ws){
+            dim3 hidden((unsigned)((I+63)/64),(unsigned)((S+15)/16));
+            dim3 output((unsigned)((D+63)/64),(unsigned)((S+15)/16));
+            nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,gw,uw,gbs,ubs,gg,ug,S,D,I);
+            act_mul(ctx->gate,ctx->up,(size_t)S*I,ctx->stream);
+            nvfp4_matmul<<<output,128,0,ctx->stream>>>(ctx->y,ctx->gate,dw,dbs,dg,S,I,D);
+        }
     }
+    if(s_evt) cudaEventRecord(s_v2,ctx->stream);
     if(!cuda_ok(cudaGetLastError(),"expert nvfp4 launch")||
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert nvfp4 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert nvfp4 synchronize"))return 0;
+    if(nv){ float sm=0,km=0; cudaEventElapsedTime(&sm,s_v0,s_v1); cudaEventElapsedTime(&km,s_v1,s_v2);
+        nv->stage_ms+=sm; nv->kern_ms+=km; nv->calls++; nv->rows+=S;
+        if(nv->calls%2000==0) for(int i=0;i<s_nnv;i++){ NvEvt *e=&s_nv[i]; fprintf(stderr,
+            "[nvfp4-evt] D=%d calls=%ld rows=%ld stage=%.2fs (%.2f GB, %.2f GB/s) kernel=%.2fs "
+            "avg_rows=%.1f per_call=%.3fms\n",
+            e->d,e->calls,e->rows,e->stage_ms/1e3,e->wbytes/1e9,
+            e->stage_ms>0?(e->wbytes/1e9)/(e->stage_ms/1e3):0.0,e->kern_ms/1e3,
+            e->calls?(double)e->rows/e->calls:0.0,
+            e->calls?(e->stage_ms+e->kern_ms)/e->calls:0.0); } }
     std::memcpy(y,ctx->host_y,xb);
     return 1;
 }
@@ -1879,12 +2408,22 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
     const uint8_t *uw=(const uint8_t*)up->weights,*dw=(const uint8_t*)down->weights;
     const uint8_t *ubs=(const uint8_t*)up->bscale,*dbs=(const uint8_t*)down->bscale;
     float ug=up->gscale,dg=down->gscale;
-    // Prefill devcopy (COLI_FFN_DEVCOPY, default on for S>=COLI_FFN_DEVCOPY_MIN=16): stage
-    // up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean memory
-    // instead of freshly-pread host pages. Decode (S==1 gemv) stays zero-copy.
-    static int s_dc=-1,s_dcmin=16;
-    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));const char*m=getenv("COLI_FFN_DEVCOPY_MIN");if(m)s_dcmin=atoi(m);}
-    if(s_dc&&S>=s_dcmin){
+    // Stage up/down nibbles + ue4m3 block scales to device so the tiled kernel reads clean
+    // memory instead of freshly-pread host pages.
+    //
+    // The old `S >= 16` gate is gone for the reason measured on the SwiGLU twin: a routed
+    // expert never sees the prompt length, only S = tokens*top_k/n_experts, so the gate
+    // excluded exactly the models it was written for. But it must be replaced by the
+    // per-PATH condition below, not by nothing — **"decode stays zero-copy" is load-bearing
+    // and `S >= 16` was enforcing it by accident.** Staging on the single-row path copies
+    // the whole weight to save one read of it: Nemotron decode went 11.04 -> 9.8 tok/s
+    // before this was gated. `exact` (MTP verify) also takes the row path.
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+    const bool row_path=((S==1&&!s_tiled)||exact);
+    static int s_dc=-1;
+    if(s_dc<0){const char*e=getenv("COLI_FFN_DEVCOPY");s_dc=(!e||atoi(e));}
+    if(s_dc&&!row_path){
         size_t unb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);       // nibble bytes (up, down)
         size_t usb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);   // block-scale bytes
         if(reserve_bytes((void**)&ctx->ewu,&ctx->ewu_cap,unb)&&reserve_bytes((void**)&ctx->ewd,&ctx->ewd_cap,dnb)&&
@@ -1898,34 +2437,39 @@ extern "C" int coli_cuda_expert_mlp_nvfp4_relu2(ColiCudaTensor *up,
         }
     }
     if(s_evt) cudaEventRecord(s_e1,ctx->stream);
-    static int s_tiled=-1;
-    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
     // `exact`: force the per-row gemv path for EVERY row, even at S>1. This makes a
     // multi-row (collided-expert) call bit-identical to S separate S==1 decode calls —
     // needed by the MTP verify forward, whose S>1 logits must match sequential decode to
     // the bit or a near-tie argmax forks the accepted token from DRAFT=0. The WSMM/WMMA
     // paths below reduce over K in a different order, so they cannot be used for verify.
     // S is tiny at verify, so the lost row-parallelism costs nothing there.
-    if((S==1&&!s_tiled)||exact){
+    if(row_path){
         int tpb=256,wpb=tpb>>5;
         for(int r=0;r<S;r++){
             const float *xr=ctx->x+(size_t)r*D; float *tr=ctx->up+(size_t)r*I; float *yr=ctx->y+(size_t)r*D;
-            // t = up·x  → tr [I]
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            // t = up·x  → tr [I].  The u4 kernel reads 512 B/warp against the narrow
+            // kernel's 16 B and is the decode hot path; `exact` (MTP verify) must keep the
+            // narrow one, whose reduction order sequential decode is gated against.
+            if(!exact && nvfp4_u4_ok(uw,D))
+                nvfp4_gemv_u4<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
+            else
+                nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tr,xr,uw,ubs,ug,D,I);
             // t = relu(t)²
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tr,(size_t)I);
             // y = down·t → yr [D]
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+            if(!exact && nvfp4_u4_ok(dw,I))
+                nvfp4_gemv_u4<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
+            else
+                nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yr,tr,dw,dbs,dg,I,D);
         }
     }else{
-        // Weight-stationary small-M path (COLI_NVFP4_WSMM, default ON for S<=32): reads each
-        // weight once and amortizes the dequant across all S rows, vs the WMMA path's
-        // per-16-row-m-tile re-dequant at ~1/8 MMA utilization (#90). Falls through to WMMA
-        // for S>32 (large-M experts, where the MMA amortizes) or when disabled.
-        static int s_ws=-1;
-        if(s_ws<0){const char*e=getenv("COLI_NVFP4_WSMM");s_ws=(!e||atoi(e));}
+        // Weight-stationary small-M path: reads each weight once and amortizes the dequant
+        // across all S rows, vs the WMMA path's per-16-row-m-tile re-dequant at ~1/8 MMA
+        // utilization (#90). `nvfp4_wsmm_launch` declines above S=32, where the MMA
+        // amortizes, and the call falls through to WMMA — see the SwiGLU twin for why S is
+        // the whole decision and this is not a knob.
         bool did_ws=false;
-        if(s_ws){
+        {
             if(nvfp4_wsmm_launch(ctx->up,ctx->x,uw,ubs,ug,S,D,I,ctx->stream)){
                 relu2_inplace<<<(unsigned)(((size_t)S*I+255)/256),256,0,ctx->stream>>>(ctx->up,(size_t)S*I);
                 did_ws=nvfp4_wsmm_launch(ctx->y,ctx->up,dw,dbs,dg,S,I,D,ctx->stream);
@@ -2225,9 +2769,19 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
         // This expert's slice of the pooled buffers: rows [off, off+r).
         float *xc=ctx->x+(size_t)off*D,*tc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
         if(r==1&&!s_tiled){
-            nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            // THE decode hot path for gateless NVFP4 experts (Nemotron): one row per
+            // expert, so a gemv per projection. Prefer the 512 B/warp reader — the narrow
+            // kernel reads 16 B/warp, and the routed-expert gemv measured ~110 GB/s
+            // against a 172 GB/s host ceiling, so it is read-width bound, not memory bound.
+            if(nvfp4_u4_ok(uw,D))
+                nvfp4_gemv_u4<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
+            else
+                nvfp4_gemv<<<(unsigned)((I+wpb-1)/wpb),tpb,(size_t)D*sizeof(float),ctx->stream>>>(tc,xc,uw,ubs,ug,D,I);
             relu2_inplace<<<(unsigned)(((size_t)I+255)/256),256,0,ctx->stream>>>(tc,(size_t)I);
-            nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+            if(nvfp4_u4_ok(dw,I))
+                nvfp4_gemv_u4<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
+            else
+                nvfp4_gemv<<<(unsigned)((D+wpb-1)/wpb),tpb,(size_t)I*sizeof(float),ctx->stream>>>(yc,tc,dw,dbs,dg,I,D);
         }else{
             dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
             dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));
@@ -2241,6 +2795,424 @@ extern "C" int coli_cuda_expert_group_nvfp4_relu2(ColiCudaTensor *const *ups,
        !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
                                "expert group nvfp4 relu2 output download")||
        !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group nvfp4 relu2 synchronize"))return 0;
+    std::memcpy(y,ctx->host_y,xb);
+    { std::lock_guard<std::mutex> lock(g_group_stats_mu);
+      g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
+    return 1;
+}
+
+/* Grouped NVFP4 **SwiGLU** experts — the three-tensor twin of the relu2 group above.
+ *
+ * MiniMax-M2.7, MiniMax-M3 and GLM-5.2 had no grouped path at all. `activation().relu2`
+ * is false for them, so the dispatcher offered them the *fp8* group, which declines on
+ * fmt=5 and drops every one of them to the per-expert entry point:
+ * ~15872 separate `coli_cuda_expert_mlp_nvfp4` calls per prefill, each paying its own
+ * input H2D, weight staging, output D2H, stream sync and scratch-mutex acquire. That is
+ * the whole 40.4 vs 0.9 tok/s prefill gap against Nemotron, which has had this since #37.
+ *
+ * The win is not fewer kernels — it is one round trip for the whole group instead of one
+ * per expert, and **no weight staging at all**: weights are handed to the kernels as host
+ * pointers, exactly as the relu2 group does, so the coherence cost that measured >=15x the
+ * kernel simply does not arise. Per-expert slices of the pooled x/gate/up/y buffers keep
+ * the arithmetic identical to the ungrouped path.
+ *
+ * Same guard rails as its twin: every expert must agree on device, format and dims, or the
+ * call declines and the caller falls back per-expert. */
+static int g_grp_evt=-1; static double g_grp_pack_ms=0, g_grp_h2d_ms=0, g_grp_bytes=0; static long long g_grp_chunks=0;
+static double g_grp_thr_sum=0, g_grp_thr_max=0, g_grp_thr_cpu=0; static long long g_grp_nthr=0;
+static long long g_grp_pin_experts=0, g_grp_all_experts=0, g_grp_last_count=0;
+/* Groups that met the rows-per-expert crossover vs those too small to amortise staging.
+ * A run that is mostly `skipped` is decode; mostly `staged` is prefill. */
+static long long g_lres_staged=0, g_lres_skipped=0;
+
+/* Every-200-chunks was the only reporting, and it made a comparison wrong: a run that ends
+ * at chunk 340 last printed at 200, so "47.4 GB staged" was two thirds of a total being
+ * read against the reader's complete 119-130 GB. That is where the "the reader drains 2.7x
+ * what the pack stages" reading came from. Print the finished totals at exit so a number
+ * taken from this line is the whole run. */
+static void grp_evt_report(void){
+    if(!g_grp_chunks)return;
+    fprintf(stderr,"[group-evt FINAL] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
+            "| H2D %.2f s = %.2f GB/s | %lld experts/chunk "
+            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
+            "| DMA-direct %lld/%lld experts (%.0f%%) | groups staged %lld / skipped %lld\n",
+            g_grp_chunks,g_grp_bytes/1e9,
+            g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
+            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),g_grp_last_count,
+            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
+            g_grp_pin_experts,g_grp_all_experts,
+            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0,g_lres_staged,g_lres_skipped);
+}
+
+extern "C" int coli_cuda_expert_group_nvfp4(ColiCudaTensor *const *gates,
+        ColiCudaTensor *const *ups,ColiCudaTensor *const *downs,
+        const int *rows,int count,float *y,const float *x){
+    if(!gates||!ups||!downs||!rows||!x||!y||count<1)return 0;
+    ColiCudaTensor *first=gates[0]; if(!first)return 0;
+    int device=first->device,D=first->I,I=first->O,total=0;
+    for(int c=0;c<count;c++){
+        ColiCudaTensor *g=gates[c],*u=ups[c],*d=downs[c];
+        if(!g||!u||!d||rows[c]<1||g->fmt!=5||u->fmt!=5||d->fmt!=5||
+           g->device!=device||u->device!=device||d->device!=device||
+           g->I!=D||g->O!=I||u->I!=D||u->O!=I||d->I!=I||d->O!=D)return 0;
+        total+=rows[c];
+    }
+    DeviceContext *ctx=find_ctx(device);if(!select_ctx(ctx)||ctx->compute_major<7)return 0;
+    std::lock_guard<std::mutex> _scratch_lk(scratch_mu(ctx));
+    size_t xb=(size_t)total*D*sizeof(float),ib=(size_t)total*I*sizeof(float);
+    if(!reserve(&ctx->x,&ctx->x_cap,xb)||!reserve(&ctx->gate,&ctx->gate_cap,ib)||
+       !reserve(&ctx->up,&ctx->up_cap,ib)||!reserve(&ctx->y,&ctx->y_cap,xb)||
+       !reserve_pinned(&ctx->host_x,&ctx->host_x_cap,xb)||
+       !reserve_pinned(&ctx->host_y,&ctx->host_y_cap,xb))return 0;
+    std::memcpy(ctx->host_x,x,xb);
+    if(!cuda_ok(cudaMemcpyAsync(ctx->x,ctx->host_x,xb,cudaMemcpyHostToDevice,ctx->stream),
+                               "expert group nvfp4 input upload"))return 0;
+    static int s_tiled=-1;
+    if(s_tiled<0){const char*e=getenv("COLI_NVFP4_TILED");s_tiled=e&&atoi(e);}
+
+    /* Per-layer bulk residency (COLI_LAYER_RESIDENT, default ON here).
+     *
+     * The whole group's expert weights are packed into ONE pinned host buffer and sent to
+     * ONE device arena in a single transfer; the kernels below then read device memory.
+     *
+     * This is the option the recorded evidence left open, and it is NOT what
+     * `COLI_FFN_DEVCOPY` does. That stages one expert at a time out of PAGEABLE memory, so
+     * the driver bounces every transfer through its own staging buffer — measured at
+     * 1.0-2.2 GB/s and 93.6% of expert-call GPU time (36.91s of staging against 2.51s of
+     * kernel on M2.7). Pinned memory removes the bounce, and one transfer per group
+     * removes the per-expert launch/latency floor that made the small copies so poor.
+     *
+     * Why this rather than grouping or a segmented GEMM: both were measured and neither
+     * moved it. Grouping's whole ceiling is the ~3% round-trip; the segmented GEMM is
+     * described in its own doc as the disproof of the occupancy theory. Every one of those
+     * measurements pointed at the weight path — ~47 GB per prefill at ~6 GB/s against a
+     * ~51 GB/s ceiling — which is what this addresses and they did not.
+     *
+     * Declines silently (leaving host pointers, i.e. the previous behaviour) if the arena
+     * or the pinned buffer cannot be reserved, so a large layer degrades instead of failing. */
+    static int s_lres=-1;
+    if(s_lres<0){const char*e=getenv("COLI_LAYER_RESIDENT");s_lres=(!e||atoi(e));}
+
+    /* Stage only when the rows AMORTISE it. Enabled unconditionally, this was a **2.02x
+     * regression on serve**: decode routes one token, so a group stages ~190 MB of expert
+     * weights to compute ONE ROW each. That can never pay, and it was invisible because the
+     * path was built and measured on prefill.
+     *
+     * M2.7 serve, bench_serve 12 prompts x 32 tok, ABBA, pass1/pass2:
+     *   staged always   2.85 / 3.08 tok/s
+     *   staged never    5.20 / 6.31 tok/s   <- and 6.31 beats the 5.26 in the notes
+     *
+     * The threshold is bandwidth arithmetic, not a tuned number. With R rows per expert and
+     * W bytes of weights, reading them zero-copy costs R*W/51 GB/s; staging costs the CPU
+     * pack (W/40, measured) plus the H2D (W/56, measured) plus R*W/273 for the device reads.
+     * Staging wins when R*(1/51 - 1/273) > 1/40 + 1/56, i.e. R > 2.7. Decode is R=1 and
+     * loses; a 128-token prefill at top-8 over 256 experts is R=4 and wins, which is exactly
+     * the split the two measurements show.
+     *
+     * Deliberately expressed per EXPERT, not per token or per phase: `rows` is what the
+     * arithmetic is about, it is already known here, and it needs no caller to classify
+     * itself — a phase flag would have to be plumbed through every arch and would be the
+     * closed-set trap again. */
+    const long lres_min_rows = 3;   // ceil of the R > 2.7 crossover above
+    const bool stage_pays = total >= lres_min_rows*(long)count;
+    if(stage_pays) g_lres_staged++; else g_lres_skipped++;
+    bool resident=false;
+    size_t wtot=0;
+    if(s_lres&&stage_pays){
+        for(int c=0;c<count;c++){
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            wtot+=2*gnb+dnb+2*gsb+dsb;   // gate+up nibbles, down nibbles, and their scales
+        }
+        if(wtot&&reserve_bytes((void**)&ctx->lres,&ctx->lres_cap,wtot)&&
+           reserve_pinned(&ctx->host_lres,&ctx->host_lres_cap,wtot)){
+            /* COLI_PACK_PROBE=1: one-shot A/B inside the real pack, at the real moment, in
+             * the real process, on one thread. Same byte count, same pinned destination,
+             * only the SOURCE differs: the engine's own expert buffer versus a private
+             * malloc. A standalone reproduction of this copy runs at 64 GB/s while the pack
+             * manages 6, and every property of the copy itself is eliminated (scattered
+             * sources, pinned destination, thread count, buffer reallocation), so the source
+             * mapping is what is left to test — and it is the one thing a standalone
+             * benchmark cannot reproduce.
+             *
+             * Each source is copied twice. A cold-then-warm pair separates first-touch fault
+             * cost from steady-state read cost: slow-then-fast is faults, slow-then-slow with
+             * a fast malloc source is the mapping itself. */
+            static int s_probe=-1;
+            if(s_probe<0){const char*e=getenv("COLI_PACK_PROBE");s_probe=e&&atoi(e);}
+            if(s_probe==1&&count>0){
+                s_probe=2;                       // one shot; it perturbs the chunk it runs in
+                size_t n=(size_t)I*((D+1)/2);
+                uint8_t *scratch=(uint8_t*)malloc(n);
+                if(scratch){
+                    memset(scratch,0x5a,n);      // pre-fault, so this is steady-state reads
+                    uint8_t *dst=(uint8_t*)ctx->host_lres;
+                    const uint8_t *e0=(const uint8_t*)gates[0]->weights;
+                    double t[4]; auto mark=std::chrono::steady_clock::now();
+                    #define PROBE(i,src) std::memcpy(dst,(src),n); { auto z=std::chrono::steady_clock::now(); \
+                        t[i]=std::chrono::duration<double>(z-mark).count(); mark=z; }
+                    PROBE(0,e0)                  // expert source, cold
+                    PROBE(1,e0)                  // expert source, warm — same pages
+                    PROBE(2,scratch)             // private source, warm
+                    PROBE(3,(const uint8_t*)ups[0]->weights)   // a second expert source, cold
+                    #undef PROBE
+                    fprintf(stderr,"[pack-probe] %.1f MB/copy | expert cold %.2f warm %.2f "
+                            "| malloc %.2f | expert2 cold %.2f  (GB/s)\n",
+                            n/1e6,(n/1e9)/t[0],(n/1e9)/t[1],(n/1e9)/t[2],(n/1e9)/t[3]);
+                    free(scratch);
+                }
+            }
+            auto t_pack=std::chrono::steady_clock::now();
+            uint8_t *hp=(uint8_t*)ctx->host_lres;
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            size_t per=2*gnb+dnb+2*gsb+dsb;   // fixed stride: every expert has the same dims
+            /* PARALLEL pack. This memcpy is the whole of rule 3's gap: measured
+             * single-threaded at 37.58 s / 1.26 GB/s per prefill while the H2D that follows
+             * it runs at 56.49 GB/s — already above the ~51 GB/s zero-copy ceiling. So the
+             * transfer was never the problem and neither were the kernels; the bottleneck
+             * is a CPU copy whose SOURCES are scattered pool and mmap pages, which is why
+             * 1.26 GB/s is slow even for one core: it is fault- and latency-bound, not
+             * bandwidth-bound, and that is exactly the shape that parallelises.
+             * Each expert writes a disjoint `per`-byte slot, so no synchronisation. */
+            /* Per-expert route selection, and the reason this is asked of the POINTER rather
+             * than of the model: an expert's bytes reach us either as a recycled pool
+             * allocation or as a view into an mmap of the container, and which one it is
+             * varies by model, by coverage, and within a single run. Enumerating the models
+             * that "use heap buffers" is exactly the closed-set mistake that has silently
+             * skipped a model three times in this file. cudaPointerGetAttributes knows.
+             *
+             * A source the driver has page-locked can be DMA'd from directly, so that expert
+             * needs no CPU copy at all. An unregistered source still has to be packed, because
+             * a copy out of pageable memory bounces through the driver's staging buffer —
+             * that is what made COLI_GROUP_DIRECT 2.3x slower, and it is a property of the
+             * memory, not of the idea. Mixed groups are normal and both routes land in the
+             * same device arena slot, so they compose.
+             *
+             * COLI_PIN_DIRECT=0 forces everything back through the pack. */
+            static int s_pindirect=-1;
+            if(s_pindirect<0){const char*e=getenv("COLI_PIN_DIRECT");s_pindirect=(!e||atoi(e));}
+            std::vector<uint8_t> pinned((size_t)count,0);
+            int npin=0;
+            if(s_pindirect){
+                for(int c=0;c<count;c++){
+                    const void *sp[6]={gates[c]->weights,ups[c]->weights,downs[c]->weights,
+                                       gates[c]->bscale,ups[c]->bscale,downs[c]->bscale};
+                    int all=1;
+                    for(int k=0;k<6&&all;k++){
+                        cudaPointerAttributes a{};
+                        if(cudaPointerGetAttributes(&a,sp[k])!=cudaSuccess){cudaGetLastError();all=0;}
+                        else if(a.type!=cudaMemoryTypeHost)all=0;
+                    }
+                    pinned[(size_t)c]=(uint8_t)all; npin+=all;
+                }
+            }
+            g_grp_pin_experts+=npin; g_grp_all_experts+=count;
+
+            /* COLI_PACK_THREADS overrides the fan-out. hardware_concurrency() is the wrong
+             * default here and the counters say why: the pack's threads spend 85% of their
+             * life off-CPU (10.5 s of CPU against 68.9 s of elapsed), queued behind the
+             * expert reader's own pool on the same 20 cores. Threads added to a saturated
+             * runqueue do not copy faster, they just take the reader's slots. */
+            static int s_pthr=-1;
+            if(s_pthr<0){const char*e=getenv("COLI_PACK_THREADS");s_pthr=e?atoi(e):0;}
+            unsigned nthr=s_pthr>0?(unsigned)s_pthr:std::thread::hardware_concurrency();
+            if(!nthr)nthr=8;
+            if(nthr>(unsigned)count)nthr=(unsigned)count;
+            /* Per-thread busy time against the pack's wall time. A single-threaded copy from a
+             * real expert source measures 26-30 GB/s in this same process, so 13 threads
+             * should retire a 237 MB chunk in well under a millisecond; the chunk takes ~75.
+             * Only three shapes can produce that, and these two counters separate them: if
+             * max-thread ~= wall the threads are genuinely busy and the copies are slow in
+             * aggregate (contention or faults); if max-thread << wall the time is in spawn,
+             * join, or outside the copies entirely. */
+            std::atomic<double> thr_sum{0.0}, thr_max{0.0}, thr_cpu{0.0};
+            auto pack_range=[&](int lo,int hi){
+                auto t_thr=std::chrono::steady_clock::now();
+                /* Thread CPU time beside thread elapsed. The copies retire 30x slower in
+                 * aggregate than the same copy does alone in this process, and only two
+                 * things do that: the thread is off-CPU (oversubscribed against the reader's
+                 * pool) or it is on-CPU and stalled on memory. cpu << elapsed is the first,
+                 * cpu ~= elapsed the second — and they want different fixes, so guessing
+                 * between them is what this avoids. */
+                timespec c0,c1; clock_gettime(CLOCK_THREAD_CPUTIME_ID,&c0);
+                for(int c=lo;c<hi;c++){
+                    if(pinned[(size_t)c])continue;   // DMA'd straight from its source below
+                    uint8_t *dst=hp+(size_t)c*per;
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){ std::memcpy(dst+at,src[k],len[k]); at+=len[k]; }
+                }
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID,&c1);
+                double cpu=(c1.tv_sec-c0.tv_sec)*1e3+(c1.tv_nsec-c0.tv_nsec)/1e6;
+                double q=thr_cpu.load(std::memory_order_relaxed);
+                while(!thr_cpu.compare_exchange_weak(q,q+cpu,std::memory_order_relaxed)){}
+                double e=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-t_thr).count();
+                double s=thr_sum.load(std::memory_order_relaxed);   // fetch_add on a double is C++20
+                while(!thr_sum.compare_exchange_weak(s,s+e,std::memory_order_relaxed)){}
+                double m=thr_max.load(std::memory_order_relaxed);
+                while(e>m&&!thr_max.compare_exchange_weak(m,e,std::memory_order_relaxed)){}
+            };
+            /* COLI_GROUP_DIRECT=1: skip the pinned intermediate and issue the copies
+             * straight from the source host pointers into the arena slots. Trades the CPU
+             * pack (5.89 GB/s, fault-bound on scattered pool/mmap pages) for 6 async
+             * transfers per expert out of PAGEABLE memory. Per-expert devcopy measured
+             * 1-2 GB/s doing that, but it also synchronised per expert; here 150+ copies
+             * are queued before anything waits, so the driver can pipeline them. Worth an
+             * A/B precisely because the recorded evidence does not settle it. */
+            static int s_direct=-1;
+            if(s_direct<0){const char*e=getenv("COLI_GROUP_DIRECT");s_direct=e&&atoi(e);}
+            if(s_direct){
+                for(int c=0;c<count;c++){
+                    uint8_t *dst=(uint8_t*)ctx->lres+(size_t)c*per;
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){
+                        cudaMemcpyAsync(dst+at,src[k],len[k],cudaMemcpyHostToDevice,ctx->stream);
+                        at+=len[k];
+                    }
+                }
+            }
+            else if(npin>=count){ /* nothing to pack — every source is DMA-able */ }
+            else if(nthr<=1){ pack_range(0,count); }
+            else{
+                std::vector<std::thread> th; th.reserve(nthr);
+                int span=(count+(int)nthr-1)/(int)nthr;
+                for(unsigned t=0;t<nthr;t++){
+                    int lo=(int)t*span, hi=lo+span>count?count:lo+span;
+                    if(lo>=hi)break;
+                    th.emplace_back(pack_range,lo,hi);
+                }
+                for(auto &j:th) j.join();
+            }
+            double pack_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-t_pack).count();
+            auto t_h2d=std::chrono::steady_clock::now();
+            if(s_direct){
+                resident=cuda_ok(cudaGetLastError(),"expert group nvfp4 direct upload");
+            }else if(npin>0){
+                /* Mixed group: one transfer per expert, from whichever side that expert's
+                 * bytes are already on. Kept off the npin==0 path deliberately — splitting
+                 * one `wtot` transfer into `count` of them is a few percent of launch
+                 * overhead for no gain when nothing is pinned, and this path is on by
+                 * default, so it must cost nothing in the case where it can't help. */
+                for(int c=0;c<count;c++){
+                    uint8_t *dst=(uint8_t*)ctx->lres+(size_t)c*per;
+                    if(!pinned[(size_t)c]){
+                        cudaMemcpyAsync(dst,(const uint8_t*)ctx->host_lres+(size_t)c*per,per,
+                                        cudaMemcpyHostToDevice,ctx->stream);
+                        continue;
+                    }
+                    const uint8_t *src[6]={(const uint8_t*)gates[c]->weights,(const uint8_t*)ups[c]->weights,
+                                           (const uint8_t*)downs[c]->weights,(const uint8_t*)gates[c]->bscale,
+                                           (const uint8_t*)ups[c]->bscale,(const uint8_t*)downs[c]->bscale};
+                    size_t len[6]={gnb,gnb,dnb,gsb,gsb,dsb};
+                    size_t at=0;
+                    for(int k=0;k<6;k++){
+                        cudaMemcpyAsync(dst+at,src[k],len[k],cudaMemcpyHostToDevice,ctx->stream);
+                        at+=len[k];
+                    }
+                }
+                resident=cuda_ok(cudaGetLastError(),"expert group nvfp4 mixed upload");
+            }else{
+                resident=cuda_ok(cudaMemcpyAsync(ctx->lres,ctx->host_lres,wtot,
+                                     cudaMemcpyHostToDevice,ctx->stream),
+                                 "expert group nvfp4 layer-resident upload");
+            }
+            /* COLI_GROUP_EVT=1: split the group's transfer from its kernels. Without this
+             * the grouped path reports gpu-ffn=0 — it has no counter at all — so the one
+             * number rule 3 needs (are we transfer-bound or kernel-bound at 1.26 GB/s
+             * against a ~51 GB/s ceiling?) could not be obtained. Host-side memcpy into the
+             * pinned buffer is timed too: it is single-threaded and ~105 GB per prefill, so
+             * it is a candidate in its own right. */
+            if(g_grp_evt<0){const char*e=getenv("COLI_GROUP_EVT");g_grp_evt=e&&atoi(e);}
+            if(g_grp_evt){
+                static bool s_atexit=false;
+                if(!s_atexit){s_atexit=true;atexit(grp_evt_report);}
+                g_grp_last_count=count;
+                cudaStreamSynchronize(ctx->stream);
+                double h2d_ms=std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-t_h2d).count();
+                g_grp_pack_ms+=pack_ms; g_grp_h2d_ms+=h2d_ms;
+                g_grp_bytes+=(double)wtot; g_grp_chunks++;
+                g_grp_thr_sum+=thr_sum.load(std::memory_order_relaxed);
+                g_grp_thr_max+=thr_max.load(std::memory_order_relaxed);
+                g_grp_thr_cpu+=thr_cpu.load(std::memory_order_relaxed);
+                g_grp_nthr+=nthr;
+                if((g_grp_chunks%200)==0)
+                    fprintf(stderr,"[group-evt] chunks=%lld staged=%.1f GB | pack %.2f s = %.2f GB/s "
+                            "| H2D %.2f s = %.2f GB/s | %d experts/chunk | pinned %lld hit/%lld alloc "
+                            "| thr %lld/chunk elapsed-max %.2f s elapsed-sum %.2f s cpu-sum %.2f s "
+                            "| DMA-direct %lld/%lld experts (%.0f%%) | groups staged %lld / skipped %lld\n",
+                            g_grp_chunks,g_grp_bytes/1e9,
+                            g_grp_pack_ms/1e3,(g_grp_bytes/1e9)/(g_grp_pack_ms/1e3),
+                            g_grp_h2d_ms/1e3,(g_grp_bytes/1e9)/(g_grp_h2d_ms/1e3),count,g_res_pin_hit,g_res_pin_alloc,
+                            g_grp_nthr/g_grp_chunks,g_grp_thr_max/1e3,g_grp_thr_sum/1e3,g_grp_thr_cpu/1e3,
+                            g_grp_pin_experts,g_grp_all_experts,
+                            g_grp_all_experts?100.0*g_grp_pin_experts/g_grp_all_experts:0.0,g_lres_staged,g_lres_skipped);
+            }
+        }
+    }
+
+    int off=0;
+    size_t rat=0;   // running offset into the device arena, in the same order it was packed
+    for(int c=0;c<count;c++){
+        int r=rows[c];
+        const uint8_t *gw=(const uint8_t*)gates[c]->weights,*uw=(const uint8_t*)ups[c]->weights,
+                      *dw=(const uint8_t*)downs[c]->weights;
+        const uint8_t *gbs=(const uint8_t*)gates[c]->bscale,*ubs=(const uint8_t*)ups[c]->bscale,
+                      *dbs=(const uint8_t*)downs[c]->bscale;
+        if(resident){
+            size_t gnb=(size_t)I*((D+1)/2), dnb=(size_t)D*((I+1)/2);
+            size_t gsb=(size_t)I*((D+15)/16), dsb=(size_t)D*((I+15)/16);
+            const uint8_t *base=(const uint8_t*)ctx->lres+rat;
+            gw=base;            base+=gnb;
+            uw=base;            base+=gnb;
+            dw=base;            base+=dnb;
+            gbs=base;           base+=gsb;
+            ubs=base;           base+=gsb;
+            dbs=base;
+            rat+=2*gnb+dnb+2*gsb+dsb;
+        }
+        float gg=gates[c]->gscale,ug=ups[c]->gscale,dg=downs[c]->gscale;
+        // This expert's slice of the pooled buffers: rows [off, off+r).
+        float *xc=ctx->x+(size_t)off*D,*gc=ctx->gate+(size_t)off*I,
+              *uc=ctx->up+(size_t)off*I,*yc=ctx->y+(size_t)off*D;
+        if(r==1&&!s_tiled){
+            nvfp4_gemv_dispatch(gc,xc,gw,gbs,gg,D,I,ctx->stream);
+            nvfp4_gemv_dispatch(uc,xc,uw,ubs,ug,D,I,ctx->stream);
+            act_mul(gc,uc,(size_t)I,ctx->stream);
+            nvfp4_gemv_dispatch(yc,gc,dw,dbs,dg,I,D,ctx->stream);
+        }else{
+            // Weight-stationary for the small-M rows a routed expert actually sees;
+            // `nvfp4_wsmm_launch` declines above S=32 and the WMMA tile takes over.
+            bool did_ws=false;
+            if(nvfp4_wsmm_launch(gc,xc,gw,gbs,gg,r,D,I,ctx->stream)){
+                nvfp4_wsmm_launch(uc,xc,uw,ubs,ug,r,D,I,ctx->stream);
+                act_mul(gc,uc,(size_t)r*I,ctx->stream);
+                did_ws=nvfp4_wsmm_launch(yc,gc,dw,dbs,dg,r,I,D,ctx->stream);
+            }
+            if(!did_ws){
+                dim3 hidden((unsigned)((I+63)/64),(unsigned)((r+15)/16));
+                dim3 output((unsigned)((D+63)/64),(unsigned)((r+15)/16));
+                nvfp4_gate_up<<<hidden,256,0,ctx->stream>>>(gc,uc,xc,gw,uw,gbs,ubs,gg,ug,r,D,I);
+                act_mul(gc,uc,(size_t)r*I,ctx->stream);
+                nvfp4_matmul<<<output,128,0,ctx->stream>>>(yc,gc,dw,dbs,dg,r,I,D);
+            }
+        }
+        off+=r;
+    }
+    if(!cuda_ok(cudaGetLastError(),"expert group nvfp4 launch")||
+       !cuda_ok(cudaMemcpyAsync(ctx->host_y,ctx->y,xb,cudaMemcpyDeviceToHost,ctx->stream),
+                               "expert group nvfp4 output download")||
+       !cuda_ok(cudaStreamSynchronize(ctx->stream),"expert group nvfp4 synchronize"))return 0;
     std::memcpy(y,ctx->host_y,xb);
     { std::lock_guard<std::mutex> lock(g_group_stats_mu);
       g_group_calls++; g_group_experts+=(uint64_t)count; g_group_rows+=(uint64_t)total; }
@@ -2317,11 +3289,27 @@ extern "C" int coli_cuda_attention_absorb_batch(ColiCudaTensor *w,float *ctx,con
 extern "C" int coli_cuda_gqa_attn(int device, float *ctx, const float *q, const float *k,
         const float *v, int S, int H, int Hkv, int D, int T, float scale, int mode) {
     if (!ctx || !q || !k || !v || S < 1 || H < 1 || Hkv < 1 || D < 1 || D > 1024 ||
-        H % Hkv || T < S || T > 8192)
+        H % Hkv || T < S)
         return 0;
     // mode 1 = WMMA flash (tc_gqa_attn); requires D a multiple of 16. Anything else,
     // or D not tile-aligned, falls back to the scalar gqa_attn_kernel (mode 0).
     int flash = (mode == 1 && D % 16 == 0);
+    // The T ceiling is PER-PATH, because only the scalar kernel pays for T in shared memory:
+    //   scalar: shared = (D + T + ATTN_TPB)*4 — 33 KB at T=8192, and past the 48 KB limit by
+    //           T=16384. For that kernel 8192 is a real hardware bound.
+    //   flash:  shared = GQA_QT*8*D — INDEPENDENT of T. It tiles over keys with an online
+    //           softmax (mrow/lrow/corr); handling long context is the entire point of it.
+    // These shared a single blanket `T > 8192`, so the guard written for the scalar kernel
+    // silently refused the one path built for long context — `return 0` is indistinguishable
+    // from "no GPU", and the caller drops to the single-threaded CPU core. Measured on M2.7
+    // (#54): 8192 tokens ran the GPU core, 16384 fell off a cliff, and 113851 never finished.
+    // Flash's real bound is the grid.y hardware limit — one block per GQA_QT queries.
+    // Past it, and on scratch-allocation failure below, the CPU fallback still stands.
+    if (flash) {
+        if ((S + GQA_QT - 1) / GQA_QT > 65535) return 0;
+    } else if (T > 8192) {
+        return 0;
+    }
     DeviceContext *dc = find_ctx(device); if (!select_ctx(dc)) return 0;
     std::lock_guard<std::mutex> _scratch_lk(scratch_mu(dc));
     size_t qb = (size_t)S * H * D * sizeof(float), kb = (size_t)T * Hkv * D * sizeof(float);
@@ -2626,6 +3614,29 @@ extern "C" int coli_cuda_tensor_wrap(ColiCudaTensor **tensor,
     t->weight_bytes = rb * (size_t)O;
     t->weights = const_cast<void *>(weights);
     t->scales = const_cast<float *>(scales);
+    t->wrapped = 1;
+    *tensor = t;
+    return 1;
+}
+
+/* Zero-copy wrap of an MXFP4 expert weight (fmt=6): nibbles + E8M0 per-32 block scales.
+ * Same shape as the NVFP4 wrap; the format code is what selects the per-32 stride and the
+ * power-of-two scale decode in the kernels. `gscale` is 1.0 for a native MXFP4 tensor. */
+extern "C" int coli_cuda_tensor_wrap_mxfp4(ColiCudaTensor **tensor,
+        const void *weights, const void *bscale, float gscale,
+        int I, int O, int device) {
+    if (!tensor || !weights || !bscale || I < 1 || O < 1) return 0;
+    if (*tensor) {
+        ColiCudaTensor *t = *tensor;
+        return t->fmt == 6 && t->I == I && t->O == O && t->device == device;
+    }
+    ColiCudaTensor *t = static_cast<ColiCudaTensor *>(std::calloc(1, sizeof(*t)));
+    if (!t) return 0;
+    t->fmt = 6; t->I = I; t->O = O; t->device = device;
+    t->weight_bytes = row_bytes(6, I) * (size_t)O;
+    t->weights = const_cast<void *>(weights);
+    t->bscale = bscale;
+    t->gscale = gscale;
     t->wrapped = 1;
     *tensor = t;
     return 1;

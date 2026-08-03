@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Both follow-ups have since been measured, and both confirmed it:
 /// [`o_direct_enabled`] bypasses the same tier and is 18% slower at equal cache size
-/// despite winning the raw-bandwidth microbenchmark; and raising `COLI_RAM_GB` hurts
+/// despite winning the raw-bandwidth microbenchmark; and raising the expert-cache budget hurts
 /// for the same reason, since it moves RAM from a tier that caches at 4 KB page
 /// granularity into one that caches whole 38.3 MB experts.
 /// Runtime fadvise toggle. The adaptive max-residency path ([`ExpertCache::spawn_adaptive_budget`])
@@ -91,6 +91,268 @@ fn parse_sub_kb(v: Option<&str>) -> usize {
         .unwrap_or(DEFAULT)
 }
 
+/// Serve page-cache-resident expert spans from a shared mapping instead of copying them
+/// into a heap buffer (`COLI_MMAP_EXPERTS=0` disables).
+///
+/// The warm path is the whole point: once a span is in the page cache, `pread` still
+/// memcpy's it into a fresh buffer at ~12 GB/s, against ~146 GB/s of memory bandwidth on
+/// this box — measured as MiniMax-M2.7 spending 2805 ms moving 33.6 GB while reading
+/// **zero** bytes from the drive. A mapped view hands the same bytes to the GPU with no
+/// copy at all, and a CUDA microbenchmark puts the GPU's read rate at 163 GB/s from a
+/// file-backed mapping vs 171 GB/s from a heap buffer — a 4.5% penalty to skip the copy
+/// entirely.
+///
+/// **Measured in the engine** (42b2, ABBA, 4 runs/arm, 12-tok prompt, tokens identical in
+/// every run). It is a large win exactly where spans are resident, and a small loss where
+/// they are not — which is why it is coverage-gated rather than always on:
+///
+/// | model | coverage | pread | mapped | |
+/// |---|---|---|---|---|
+/// | MiniMax-M2.7 | 86% | 2987 ms | **529 ms** | **5.65×** |
+/// | GLM-5.2 | 26% | **14694 ms** | 15080 ms | 0.97× |
+///
+/// M2.7 is the pure case: both arms read **zero** bytes from the drive, so the whole
+/// difference is the copy. GLM at 26% mostly misses the residency gate, so each span pays
+/// a `mincore` and then reads anyway.
+/// Runtime selection, set from expert-set coverage during cache wiring — the SAME number
+/// that chooses O_DIRECT, and for the same reason, read the other way round. Below the
+/// threshold the page cache cannot hold the working set, so spans are usually absent and
+/// every one pays a `mincore` that then falls back to `pread` anyway; above it the page
+/// cache *is* the working set and mapping replaces a full copy.
+static MMAP_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the mapped expert path (called once, before any expert is read).
+pub fn set_mmap_experts(on: bool) {
+    MMAP_RUNTIME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn mmap_enabled() -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("COLI_MMAP_EXPERTS").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    env.unwrap_or_else(|| MMAP_RUNTIME.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Submit O_DIRECT expert reads through io_uring rather than a pool of blocking `pread`
+/// threads (`COLI_IO_URING=1`). **Off by default — measured a 1.58x REGRESSION.**
+///
+/// The hypothesis was good and the microbenchmark supported it: `coli iobench` on a real
+/// shard gives io_uring SQPOLL + `O_DIRECT` 10.63 GB/s against threaded `pread`'s 8.12,
+/// and io_uring had previously been rejected only because we were buffered (where it
+/// manages 5.66). `O_DIRECT` became automatic for the streaming models earlier, removing
+/// that objection — so this looked unblocked.
+///
+/// It is not. GLM-5.2, ABBA, 2 passes, tokens identical in every arm:
+///
+/// | arm | pass 1 | pass 2 |
+/// |---|---|---|
+/// | threaded `pread` | 13469 ms | 13570 ms |
+/// | io_uring | 21732 ms | 20888 ms |
+///
+/// The microbenchmark and the engine differ in a way that matters: iobench drives ONE
+/// ring over ONE file with nothing else running, while the reader spans ~90 shards and
+/// interleaves with compute. This drain is single-threaded — one submit/complete loop
+/// where the `pread` path has 40 threads blocking independently — so it replaces 40-way
+/// concurrency with one loop's throughput, and `submit_and_wait(1)` serialises the tail.
+/// Getting the microbenchmark's number would need several rings (per-thread or
+/// per-shard), not one; whether that beats 40 blocking threads is unmeasured.
+///
+/// Kept so the result is reproducible and the "just use io_uring" idea has a number
+/// attached rather than being rediscovered a third time.
+fn uring_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_IO_URING").ok().as_deref() == Some("1"))
+}
+
+/// Pages to probe in [`Mapping::resident`] instead of walking the whole span.
+/// `COLI_MINCORE_SAMPLE`; **0 = exact** (examine every page), default **8**.
+///
+/// The exact check costs ~51 ns per page and a mapped model pays it on every span of
+/// every read. Measured on MiniMax-M2.7 (which reads *zero* device bytes warm, so this
+/// syscall **is** its expert-load), interleaved, tokens identical and RSS identical:
+///
+/// | k | expert-load | `mincore` | **major faults** |
+/// |---|---|---|---|
+/// | 0 (exact) | 441 / 440 / 451 ms | 405 / 405 / 413 ms | **0** |
+/// | **8** | **61 / 61 ms** | **26 / 26 ms** | **0** |
+/// | 2 | 45 / 45 ms | 8 / 8 ms | **0** |
+///
+/// **7.2x on expert-load with zero major faults**, and minor faults matching the exact
+/// arm to within 0.007%.
+///
+/// k=8 rather than the nominally-faster k=2: the remaining 16 ms is negligible against
+/// 441, while 8 probes catch a partially-evicted span far more often than 2. One side of
+/// that trade is a little speed; the other is the 300x, 407k-major-fault regression
+/// documented on [`Mapping::resident`].
+///
+/// **What this test does NOT exercise:** every arm ran fully warm and resident, so the
+/// failure mode — a span with a hole in the middle passing the sampled check — never
+/// arose. It is bounded rather than excluded: the mapped path only runs at >=80%
+/// coverage (models that essentially fit), and `COLI_MINCORE_SAMPLE=0` restores the exact
+/// check. If major faults ever appear on a mapped model, set that first.
+fn mincore_sample() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_MINCORE_SAMPLE").ok().and_then(|s| s.parse().ok()).unwrap_or(8)
+    })
+}
+
+/// Wall time (µs) inside `read_raw_shared_batched`, split three ways. Only
+/// accumulated under `COLI_PROFILE=1`.
+///
+/// Why this exists: the engine's `expert-load` timer brackets the whole
+/// `provider.prefetch` call, so a slow *anything* in there — cache bookkeeping,
+/// eviction, span setup, the reads themselves — reports as one number. Measuring the
+/// drive directly (delta `/sys/block/nvme0n1/stat` around a run) showed GLM moving
+/// 117.6 GB at 11.7 GB/s while `expert-load` was 14.2 s: only ~10 s of that window
+/// had a request in flight. Attributing the rest needs the phases named, not guessed
+/// at — the last two times I guessed at where time went in this path I was wrong.
+///
+/// `SETUP` covers tensor lookup, span coalescing and buffer allocation (drive idle);
+/// `DRAIN` is the thread pool actually reading; `POST` is fadvise plus the Arc/view
+/// rebuild. `LOAD_US - (SETUP+DRAIN+POST)` is then everything the cache did.
+pub static BATCH_SETUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_DRAIN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_POST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Bytes the drain phase asked the kernel for, and how many jobs it split them into —
+/// the divisor for "achieved GB/s" without needing a second process to watch /sys.
+pub static BATCH_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BATCH_JOBS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Number of `read_raw_shared_batched` calls. The drain spawns a fresh `thread::scope`
+/// pool per call, so this times the thread count is how many OS threads a run creates
+/// — the suspected owner of the gap between the reader's own 9.6 GB/s and the 11.6 GB/s
+/// the device reports while busy.
+pub static BATCH_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Wall time (µs) the drain spends inside `thread::scope` issuing spawns, summed. Not
+/// all of it is lost — workers start as they are created — but it bounds the ramp.
+pub static BATCH_SPAWN_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// OS threads the drain actually created, summed over calls (`nt` is clamped to the job
+/// count, so this is not simply calls x the configured thread count).
+pub static BATCH_THREADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sub-phases of `SETUP`, plus the span count. On MiniMax-M2.7 every expert span is served
+/// from the mapping, so `drain` is 0 ms and **span-setup is 93% of the whole expert-load** —
+/// for that model this is no longer bookkeeping around the real work, it *is* the work.
+///
+/// `LOOKUP` is per-name tensor metadata (a `HashMap<String, _>` hit, so string hashing);
+/// `MINCORE` is [`Mapping::resident`], which issues a `mincore` syscall **and allocates and
+/// scans a one-byte-per-page vector** for every span on every read — ~1900 pages for a 7.6 MB
+/// M2.7 expert; `ALLOC` is `SharedBuf::with_len` for spans that still need a buffer.
+pub static SPAN_LOOKUP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_MINCORE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_ALLOC_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SPAN_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Measures how much of a span that *failed* the residency gate was resident anyway.
+///
+/// The gate is all-or-nothing: one reclaimed 4 KiB page sends a whole ~21 MB coalesced
+/// expert back through `pread`. That is obviously wasteful, but "obviously wasteful" has
+/// been wrong here before, so this counts it before anything is built to exploit it.
+///
+/// The number that decides the design is **not** the resident fraction — it is
+/// [`PARTIAL_RUNS`], the count of contiguous *missing* ranges. Repairing a partial span
+/// means replacing one large sequential read with one read per missing run. Two runs of
+/// 1 MB is a large win over re-reading 21 MB; five hundred scattered 4 KiB runs is a
+/// catastrophic loss to the same drive that measured 11.6 GB/s at 127 KiB and far less
+/// at 4 KiB. Fragmentation, not volume, is what makes the idea pay or not pay.
+///
+/// Costs an exact `mincore` walk, so it is opt-in via `COLI_RESIDENCY_PROBE=1` and only
+/// ever runs on the path that was already about to read the whole span.
+///
+/// **Answered, and the answer is no.** MiniMax-M2.7 (the only near-fit, mmap-eligible
+/// model), 512-token prompt + 32 generated:
+///
+/// ```text
+/// 17066 missed spans (135.9 GB) | 0.3% already resident
+/// 18887 missing runs (1 per span, 7173 KB each) | 12346 fully absent (72%)
+/// ```
+///
+/// Spans are reclaimed **whole**, not fragmented. Repair would save 0.3% of the bytes and
+/// would replace one large sequential read with one read of nearly the same size. GLM-5.2
+/// is the control: below [`MMAP_MIN_COVERAGE_PCT`] no mapping is opened, so it reports
+/// nothing at all.
+///
+/// The reason is structural rather than accidental, which is why this is unlikely to
+/// change: the near-fit heap cache and this mapped path are gated on the *same* 80%
+/// coverage threshold and compete for the same RAM. The heap wins — it is explicit — and
+/// took ~110 GB on M2.7, leaving ~11 GB of page cache, so the mapped path served only
+/// 1505 of 18571 spans. There is barely any page-cache residency left to be partial about.
+/// That trade is deliberate (max residency measured 8.5× on M2.7 serve against the 40 GB
+/// streaming cap), but it means the "M2.7 warm drains zero device bytes" result predates
+/// it and no longer holds.
+///
+/// Design note for anyone re-running this: a warm-up pass does **not** warm the page cache
+/// under max residency. It fills the heap, which dies with the process — after M2.7's
+/// warm-up the box showed 4 GB used, 11 GB cache, 107 GB free. Warm the page cache
+/// directly, with the heap capped, or the "warm" run is cold.
+pub static PARTIAL_SPANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_RESIDENT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PARTIAL_RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Spans where the exact walk found *nothing* resident — the honest streaming case, for
+/// which no repair scheme can help. Kept separate so it cannot flatter the average.
+pub static PARTIAL_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn residency_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_RESIDENCY_PROBE").ok().as_deref() == Some("1"))
+}
+
+/// `(spans, bytes, resident_bytes, missing_runs, fully_absent)`.
+pub fn partial_profile() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        PARTIAL_SPANS.load(Relaxed),
+        PARTIAL_BYTES.load(Relaxed),
+        PARTIAL_RESIDENT_BYTES.load(Relaxed),
+        PARTIAL_RUNS.load(Relaxed),
+        PARTIAL_EMPTY.load(Relaxed),
+    )
+}
+
+fn profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_PROFILE").ok().as_deref() == Some("1"))
+}
+
+/// `(setup_us, drain_us, post_us, bytes, jobs)` — for the profile print.
+pub fn batch_profile() -> (u64, u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BATCH_SETUP_US.load(Relaxed),
+        BATCH_DRAIN_US.load(Relaxed),
+        BATCH_POST_US.load(Relaxed),
+        BATCH_BYTES.load(Relaxed),
+        BATCH_JOBS.load(Relaxed),
+    )
+}
+
+/// `(calls, threads_created, spawn_us)` — how many drain pools a run created, how many
+/// OS threads that cost in total, and how long issuing the spawns took.
+pub fn batch_pool_profile() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BATCH_CALLS.load(Relaxed),
+        BATCH_THREADS.load(Relaxed),
+        BATCH_SPAWN_US.load(Relaxed),
+    )
+}
+
+/// `(lookup_us, mincore_us, alloc_us, spans)` — the sub-phases of span-setup.
+pub fn span_profile() -> (u64, u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        SPAN_LOOKUP_US.load(Relaxed),
+        SPAN_MINCORE_US.load(Relaxed),
+        SPAN_ALLOC_US.load(Relaxed),
+        SPAN_COUNT.load(Relaxed),
+    )
+}
+
 /// One tensor located within a shard file.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -111,38 +373,54 @@ pub struct StTensor {
 /// The NVMe's logical block size (measured 512 on the DGX Spark).
 const DIO_ALIGN: u64 = 512;
 
-/// Bypass the page cache entirely for shard reads (`COLI_O_DIRECT=1`).
+/// Bypass the page cache entirely for shard reads.
 ///
-/// Distinct from [`fadvise_enabled`], and the difference is the whole point:
-/// `fadvise` still routes every read *through* the page cache and discards it
-/// afterwards, so it pays the landing-zone cost and gets no caching in return —
-/// measured a 63% loss. `O_DIRECT` never touches the page cache, so the RAM the
-/// kernel currently needs as a landing zone for 22.6 GB/token of streaming becomes
-/// available to the expert cache instead.
+/// **Chosen automatically** from the model's expert-set coverage during cache wiring
+/// (`O_DIRECT_MAX_COVERAGE_PCT` in `coli`), not by the operator. `COLI_O_DIRECT=0|1`
+/// overrides in either direction, for pinning an arm during a measurement.
 ///
-/// **MEASURED: it does not pay, and it does not lift the `MemTotal/3` cache ceiling.
-/// Leave off.** Kept because "why don't we just use O_DIRECT?" is a question this
-/// codebase will keep attracting, and this is the answer with numbers.
+/// Distinct from [`fadvise_enabled`], and the difference is the whole point: `fadvise`
+/// still routes every read *through* the page cache and discards it afterwards, so it
+/// pays the landing-zone cost and gets no caching in return — measured a 63% loss.
+/// `O_DIRECT` never touches that tier at all.
 ///
-/// 1 node, prompt 512, ngen 12, tokens byte-identical in every arm:
+/// Whether skipping it helps depends on whether the page cache can hold a useful share
+/// of THIS model's experts. Measured across four models (table in
+/// `O_DIRECT_MAX_COVERAGE_PCT`), the crossover is monotonic in coverage: at 7% and 27%
+/// O_DIRECT wins by 1.089× and 1.145×; at 47% and 86% buffered wins. The byte counters
+/// show the mechanism directly — at 7% both arms read the same device bytes (the page
+/// cache was serving ~nothing), while at 86% the buffered arm read *zero* device bytes.
 ///
-/// | arm | ms/token | pgmajfault | compact_stall | buff/cache |
-/// |-----|----------|------------|---------------|------------|
-/// | buffered, 40 GB | **2942** | +715 | +177,766 | 43 GB |
-/// | O_DIRECT, 40 GB | 3480 (+18%) | +397 | **+23** | 37 GB |
-/// | O_DIRECT, 70 GB | 5002 (+70%) | +325,409 | +26 | 23 GB |
-/// | O_DIRECT, 90 GB | did not finish | +19,254 | +23 | 2 GB |
+/// The historical measurement that said "leave off" is still real, but it was one model
+/// (GLM) on its older 735 GB e4m3 container — roughly double today's 379 GB, so a
+/// different coverage point than the name suggests. It is the 47%/86% end of the same
+/// curve, not a contradiction. That table also showed the memory ceiling is real rather
+/// than an artifact of buffered I/O: at 70 GB the O_DIRECT arm still thrashed (+325,409
+/// major faults) and at 90 GB it could not finish.
 ///
-/// It does what it claims — compaction stalls collapse from 177,766 to 23, so the
-/// landing-zone pressure really is gone — but at equal cache size it is 18% slower,
-/// because bypassing the page cache forfeits a tier that was serving a large share
-/// of reads. And the large-cache configurations still thrash (325k major faults at
-/// 70 GB, 90 GB unable to complete), which proves the memory ceiling is **real
-/// rather than an artifact of buffered I/O**. `MemTotal/3` is the right operating
-/// point; the page cache is not waste to be reclaimed.
+/// The `O_DIRECT` twin is not a drop-in fd swap: **no tensor offset in our containers is
+/// 512-aligned** (measured: 0 of 4326 sampled), so reads are aligned at *span*
+/// granularity rather than bounced through a scratch buffer, which would otherwise
+/// reintroduce a full memcpy of every expert. Correctness is unaffected either way.
+/// Runtime O_DIRECT selection, set from the model's expert-set coverage during cache
+/// wiring (see `wire_adaptive_cache`). `COLI_O_DIRECT` still wins when set, in either
+/// direction, so a measurement can pin an arm.
+static O_DIRECT_RUNTIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose O_DIRECT for shard reads. Called once, before any expert is read, with the
+/// decision derived from how much of the model's expert set RAM can actually hold.
+pub fn set_o_direct(on: bool) {
+    O_DIRECT_RUNTIME.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn o_direct_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("COLI_O_DIRECT").ok().as_deref() == Some("1"))
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| match std::env::var("COLI_O_DIRECT").ok().as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    });
+    env.unwrap_or_else(|| O_DIRECT_RUNTIME.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Open a second, `O_DIRECT` descriptor for `path`. `None` if the platform or
@@ -166,14 +444,215 @@ fn open_direct(_path: &Path) -> Option<File> {
     None
 }
 
+/// A whole shard file mapped read-only, for the lifetime of the process.
+///
+/// **Mapped once, never per read.** A per-read `mmap`/`munmap` pair serialises every
+/// reader thread on the process-wide `mmap_lock` and tears down PTEs on each unmap, so
+/// the 40-thread read pool collapses onto one core in the kernel while the GPU starves.
+/// (The same effect is why [`colibri_core::SharedBuf`] recycles its heap allocations:
+/// a fresh `mmap` + zero-fill faults cost ~14 ms per expert, 8× the read itself.)
+/// Mapping the whole file costs only address space — 1.4 TB of it is free on 64-bit,
+/// and physical pages materialise only when touched.
+struct Mapping {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: the mapping is read-only (`PROT_READ`) and never mutated after creation, so
+// sharing the pointer across threads is sound. It is unmapped only in `Drop`, by which
+// point no `SharedBuf` view can still reference it (each holds an `Arc<Mapping>`).
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    #[cfg(target_os = "linux")]
+    fn open(file: &File, len: u64) -> Option<Mapping> {
+        use std::os::unix::io::AsRawFd;
+        if len == 0 {
+            return None;
+        }
+        // SAFETY: a fresh read-only mapping of a valid fd; failure is reported as MAP_FAILED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len as usize,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        // The kernel's default readahead is tuned for sequential streaming; our access is
+        // scattered expert spans, and we never want it faulting *ahead* of a span we only
+        // reached because `mincore` said it was already resident.
+        // SAFETY: `ptr`/`len` name the mapping just created.
+        unsafe { libc::madvise(ptr, len as usize, libc::MADV_RANDOM) };
+        Some(Mapping { ptr, len: len as usize })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_file: &File, _len: u64) -> Option<Mapping> {
+        None
+    }
+
+    /// `true` when every page of `[off, off+len)` is already in the page cache.
+    ///
+    /// This gate is the whole difference between the mapped path being free and being a
+    /// catastrophe: touching a non-resident page faults it in 4 KiB at a time, where the
+    /// `pread` path fetches the same span in one request. An earlier attempt without the
+    /// gate took 407,570 major faults and ran ~300× slower cold; `MADV_WILLNEED` did not
+    /// rescue it, because advisory readahead loses to a fault storm already underway.
+    ///
+    /// **The gate is not free, and on a model that hits the mapped path it is the single
+    /// largest cost in expert-load.** Measured on MiniMax-M2.7 (COLI_PROFILE=1): 4430
+    /// spans, `mincore` **428 ms** of a 435 ms span-setup, itself 94% of a 435 ms
+    /// expert-load that does **zero** disk I/O. That is 96.6 µs per call, because
+    /// `mincore` walks page tables and a 7.6 MB expert is ~1900 pages: 8.4M pages at
+    /// ~51 ns each. Batching calls cannot help — the cost is per page, not per call — so
+    /// the only lever is examining fewer pages.
+    ///
+    /// [`mincore_sample`] does that, and is **off by default**: a sampled check can call
+    /// a partially-evicted span resident and reintroduce faults, which is the exact
+    /// failure this gate exists to prevent. Enable it only alongside a major-fault count.
+    #[cfg(target_os = "linux")]
+    fn resident(&self, off: usize, len: usize) -> bool {
+        if len == 0 || off.saturating_add(len) > self.len {
+            return false;
+        }
+        let page = 4096usize;
+        let start = off & !(page - 1);
+        let end = off + len;
+        let pages = (end - start).div_ceil(page);
+
+        // Sampled mode: probe `k` single pages spread across the span instead of walking
+        // all of them. Endpoints are always included — a span is populated by one
+        // sequential read and reclaimed from one end, so the edges are where a partial
+        // eviction shows first.
+        let k = mincore_sample();
+        if k > 0 && pages > k {
+            let mut one = [0u8; 1];
+            for i in 0..k {
+                let p = i * (pages - 1) / (k - 1).max(1); // i=0 -> first, i=k-1 -> last
+                let rc = unsafe {
+                    libc::mincore(
+                        (self.ptr as *mut u8).add(start + p * page) as *mut libc::c_void,
+                        page,
+                        one.as_mut_ptr() as *mut _,
+                    )
+                };
+                if rc != 0 || one[0] & 1 != 1 {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        let mut vec = vec![0u8; pages];
+        // SAFETY: `start` is page-aligned and inside the mapping; `vec` has one byte per page.
+        let rc = unsafe {
+            libc::mincore(
+                (self.ptr as *mut u8).add(start) as *mut libc::c_void,
+                end - start,
+                vec.as_mut_ptr() as *mut _,
+            )
+        };
+        rc == 0 && vec.iter().all(|b| b & 1 == 1)
+    }
+
+    /// Record how much of a span that failed [`resident`] was resident anyway, and in how
+    /// many contiguous missing runs. Diagnostic only — see [`PARTIAL_SPANS`].
+    ///
+    /// Runs are counted at page granularity on the *missing* side, which is the quantity a
+    /// repair scheme would have to turn into reads.
+    #[cfg(target_os = "linux")]
+    fn probe_partial(&self, off: usize, len: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if len == 0 || off.saturating_add(len) > self.len {
+            return;
+        }
+        let page = 4096usize;
+        let start = off & !(page - 1);
+        let end = off + len;
+        let pages = (end - start).div_ceil(page);
+        let mut vec = vec![0u8; pages];
+        // SAFETY: `start` is page-aligned and inside the mapping; `vec` has one byte per page.
+        let rc = unsafe {
+            libc::mincore(
+                (self.ptr as *mut u8).add(start) as *mut libc::c_void,
+                end - start,
+                vec.as_mut_ptr() as *mut _,
+            )
+        };
+        if rc != 0 {
+            return;
+        }
+        let mut resident_pages = 0u64;
+        let mut runs = 0u64;
+        let mut in_run = false;
+        for b in &vec {
+            if b & 1 == 1 {
+                resident_pages += 1;
+                in_run = false;
+            } else {
+                if !in_run {
+                    runs += 1;
+                }
+                in_run = true;
+            }
+        }
+        PARTIAL_SPANS.fetch_add(1, Relaxed);
+        PARTIAL_BYTES.fetch_add(len as u64, Relaxed);
+        PARTIAL_RESIDENT_BYTES.fetch_add(resident_pages * page as u64, Relaxed);
+        PARTIAL_RUNS.fetch_add(runs, Relaxed);
+        if resident_pages == 0 {
+            PARTIAL_EMPTY.fetch_add(1, Relaxed);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn resident(&self, _off: usize, _len: usize) -> bool {
+        false
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn probe_partial(&self, _off: usize, _len: usize) {}
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: unmapping exactly what `open` mapped.
+        unsafe { libc::munmap(self.ptr, self.len) };
+    }
+}
+
 /// A set of indexed safetensors shards, supporting on-demand reads by name.
 pub struct Shards {
     tensors: Vec<StTensor>,
     files: Vec<(PathBuf, File)>,
-    /// Parallel to `files`: `O_DIRECT` twin descriptors, populated only when
-    /// [`o_direct_enabled`]. `None` entries fall back to the buffered fd.
-    dio: Vec<Option<File>>,
+    /// Parallel to `files`: `O_DIRECT` twin descriptors, opened **lazily** on first
+    /// dispatched read. Lazy because the choice is made from the model's expert-set
+    /// coverage during cache wiring, which happens *after* `Shards::open` — sizing the
+    /// expert set needs a real expert probed through these very shards. An inner `None`
+    /// means the open was tried and refused (non-Linux, or a filesystem that rejects
+    /// `O_DIRECT`) and reads fall back to the buffered fd.
+    dio: Vec<std::sync::OnceLock<Option<File>>>,
+    /// Parallel to `files`: the whole-file read-only mapping, opened lazily on first
+    /// eligible read. `None` means mapping was tried and refused. Only consulted when
+    /// [`mmap_enabled`]; see [`Mapping`] for why this is per-file and not per-read.
+    maps: Vec<std::sync::OnceLock<Option<std::sync::Arc<Mapping>>>>,
     index: HashMap<String, usize>,
+}
+
+/// One tiled sub-read: a 512-aligned window of a span buffer, filled from `file` at
+/// `off`. Hoisted to module scope so both drains (thread pool and io_uring) share it.
+struct Job {
+    file: usize,
+    off: u64,
+    ptr: usize,
+    len: usize,
 }
 
 impl Shards {
@@ -195,6 +674,7 @@ impl Shards {
             tensors: Vec::new(),
             files: Vec::new(),
             dio: Vec::new(),
+            maps: Vec::new(),
             index: HashMap::new(),
         };
 
@@ -262,7 +742,8 @@ impl Shards {
                 s.index.insert(name.to_string(), idx);
             }
 
-            s.dio.push(if o_direct_enabled() { open_direct(&path) } else { None });
+            s.dio.push(std::sync::OnceLock::new());
+            s.maps.push(std::sync::OnceLock::new());
             s.files.push((path, file));
         }
 
@@ -293,6 +774,30 @@ impl Shards {
     /// Number of shard files indexed.
     pub fn num_files(&self) -> usize {
         self.files.len()
+    }
+
+    /// Drop every shard's cached pages, returning the bytes advised away.
+    ///
+    /// Benchmark hygiene. Page-cache state carries between runs and is the single largest
+    /// source of contamination in this repo's measurements: the *same* configuration has
+    /// read 2.27 tok/s early in a sequence and 0.23 tok/s late, purely because an earlier
+    /// arm left the cache warm (or cold). Every A/B that does not control it is measuring
+    /// the order of its arms as much as its arms.
+    ///
+    /// `posix_fadvise(DONTNEED)` rather than `/proc/sys/vm/drop_caches` because it needs
+    /// **no root** and is *targeted*: it drops this model's pages and leaves the rest of
+    /// the machine alone. It is advisory — a page still referenced by a live mapping stays
+    /// — so it is a reset between runs, not a guarantee mid-run.
+    pub fn drop_page_cache(&self) -> u64 {
+        let mut dropped = 0u64;
+        for i in 0..self.files.len() {
+            let len = self.files[i].1.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > 0 {
+                self.fadvise_dontneed(i, 0, len as usize);
+                dropped += len;
+            }
+        }
+        dropped
     }
 
     /// Whether a tensor exists — port of `st_has`.
@@ -446,10 +951,21 @@ impl Shards {
                 }
             }
             let span = (span_end - off0) as usize;
-            // Pool-recycled buffer; on error it returns to the pool unread.
-            let mut buf = SharedBuf::with_len(span);
-            self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
-            let arc = Arc::new(buf);
+            // Zero-copy when the span is already resident; otherwise a pool-recycled
+            // buffer, which on error returns to the pool unread.
+            let arc = match self.mapped_view(file, off0, span) {
+                // SAFETY: the range was checked to lie inside the mapping and to be
+                // fully resident; the `Arc<Mapping>` keeps it alive under the view.
+                Some(map) => Arc::new(unsafe {
+                    let ptr = (map.ptr as *const u8).add(off0 as usize);
+                    SharedBuf::from_view(map, ptr, span)
+                }),
+                None => {
+                    let mut buf = SharedBuf::with_len(span);
+                    self.pread_chunked(file, off0, buf.as_mut_slice(), nthreads)?;
+                    Arc::new(buf)
+                }
+            };
             for gi in g..end {
                 let idx = order[gi];
                 let (_, o, nb) = meta[idx];
@@ -492,14 +1008,25 @@ impl Shards {
             buf: SharedBuf,
         }
         let dio = o_direct_enabled();
+        let prof = profile_on();
+        let t_setup = std::time::Instant::now();
         let mut spans: Vec<Span> = Vec::new();
         let mut mapping: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(groups.len());
         for grp in groups {
             let n = grp.len();
             let mut meta = Vec::with_capacity(n);
+            // `prof.then(...)` so the clock is not read at all with profiling off: these
+            // three timers are per-*span*, and span-setup is the very phase they exist to
+            // shrink (93% of M2.7's expert-load). An unconditional `Instant::now()` here
+            // would be part of what it measures.
+            let t_lookup = prof.then(std::time::Instant::now);
             for &nm in grp.iter() {
                 let t = self.tensor(nm)?;
                 meta.push((t.file_idx, t.off, t.nbytes));
+            }
+            if let Some(t) = t_lookup {
+                SPAN_LOOKUP_US
+                    .fetch_add(t.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             let mut order: Vec<usize> = (0..n).collect();
             order.sort_by_key(|&i| (meta[i].0, meta[i].1));
@@ -521,6 +1048,35 @@ impl Shards {
                 let span_len = (span_end - off0) as usize;
                 let span_idx = spans.len();
 
+                // Zero-copy when this span is already page-cache resident: hand out a
+                // view into the shard's mapping rather than allocating a buffer and
+                // memcpy'ing the same bytes into it. `read_len: 0` marks the span as
+                // needing no I/O, and the job builder below skips views.
+                let t_mc = prof.then(std::time::Instant::now);
+                let view = self.mapped_view(file, off0, span_len);
+                if let Some(t) = t_mc {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    SPAN_MINCORE_US.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                    SPAN_COUNT.fetch_add(1, Relaxed);
+                }
+                if let Some(map) = view {
+                    // SAFETY: `mapped_view` checked the range lies inside the mapping and
+                    // that every page of it is resident, and the `Arc<Mapping>` moved into
+                    // the buffer keeps it alive for as long as any view survives.
+                    let buf = unsafe {
+                        let ptr = (map.ptr as *const u8).add(off0 as usize);
+                        SharedBuf::from_view(map, ptr, span_len)
+                    };
+                    spans.push(Span { file, read_off: off0, read_len: 0, skew: 0, buf });
+                    for gi in g..end {
+                        let idx = order[gi];
+                        let (_, o, nb) = meta[idx];
+                        names_map[idx] = (span_idx, (o - off0) as usize, nb as usize);
+                    }
+                    g = end;
+                    continue;
+                }
+
                 // Under O_DIRECT the file offset, the length, and the destination
                 // address must all be 512-aligned, and no tensor offset in our
                 // containers is. Align the *span* rather than bouncing each read
@@ -541,7 +1097,14 @@ impl Shards {
                 } else {
                     span_len
                 };
+                let t_alloc = prof.then(std::time::Instant::now);
                 let mut buf = SharedBuf::with_len(read_len + extra);
+                if let Some(t) = t_alloc {
+                    SPAN_ALLOC_US.fetch_add(
+                        t.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
                 // Skew is derived from the *actual* allocation: `SharedBuf` recycles
                 // pooled buffers, so alignment varies between calls and cannot be
                 // assumed.
@@ -576,14 +1139,13 @@ impl Shards {
         // device requests: the block layer already splits these at ~112 KB.
         // See `read_sub_bytes` for the override.
         let sub = read_sub_bytes();
-        struct Job {
-            file: usize,
-            off: u64,
-            ptr: usize,
-            len: usize,
-        }
         let mut jobs: Vec<Job> = Vec::new();
         for s in spans.iter_mut() {
+            // Mapped spans are already satisfied — and `as_mut_slice` would panic on a
+            // read-only view.
+            if s.buf.is_view() {
+                continue;
+            }
             let (file, read_off, total, skew) = (s.file, s.read_off, s.read_len, s.skew);
             // Tiling starts at the aligned address, not the allocation base. `sub` is a
             // 512-multiple (enforced by `read_sub_bytes`) and `total` was rounded up, so
@@ -597,13 +1159,26 @@ impl Shards {
                 o += clen;
             }
         }
-        if !jobs.is_empty() {
+        // io_uring first when the reads are O_DIRECT — that combination measured 10.63
+        // GB/s against threaded pread's 8.12 on this drive. Any failure (no privileges,
+        // no direct fd, a short read) returns false and the pool below redoes the batch,
+        // so this can only fail to accelerate, never to complete.
+        if prof {
+            use std::sync::atomic::Ordering::Relaxed;
+            BATCH_SETUP_US.fetch_add(t_setup.elapsed().as_micros() as u64, Relaxed);
+            BATCH_BYTES.fetch_add(jobs.iter().map(|j| j.len as u64).sum::<u64>(), Relaxed);
+            BATCH_JOBS.fetch_add(jobs.len() as u64, Relaxed);
+        }
+        let t_drain = std::time::Instant::now();
+        let uring_done = o_direct_enabled() && uring_enabled() && self.drain_jobs_uring(&jobs, nthreads);
+        if !jobs.is_empty() && !uring_done {
             use std::sync::atomic::{AtomicUsize, Ordering};
             let nt = nthreads.max(1).min(jobs.len());
             let cursor = AtomicUsize::new(0);
             let err: Mutex<Option<io::Error>> = Mutex::new(None);
             let (jobs_ref, cursor_ref, err_ref) = (&jobs, &cursor, &err);
             std::thread::scope(|scope| {
+                let t_spawn = std::time::Instant::now();
                 for _ in 0..nt {
                     scope.spawn(move || loop {
                         let i = cursor_ref.fetch_add(1, Ordering::Relaxed);
@@ -621,10 +1196,24 @@ impl Shards {
                         }
                     });
                 }
+                if prof {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    BATCH_SPAWN_US.fetch_add(t_spawn.elapsed().as_micros() as u64, Relaxed);
+                    BATCH_CALLS.fetch_add(1, Relaxed);
+                    BATCH_THREADS.fetch_add(nt as u64, Relaxed);
+                }
             });
             if let Some(e) = err.into_inner().unwrap() {
                 return Err(e);
             }
+        }
+
+        let t_post = std::time::Instant::now();
+        if prof {
+            BATCH_DRAIN_US.fetch_add(
+                t_drain.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
         }
 
         // 3. Release the page-cache copy of everything we just streamed. Done after
@@ -638,7 +1227,7 @@ impl Shards {
 
         // 4. Arc-wrap each span, then rebuild the per-group name views.
         let arcs: Vec<Arc<SharedBuf>> = spans.into_iter().map(|s| Arc::new(s.buf)).collect();
-        Ok(mapping
+        let out = mapping
             .into_iter()
             .map(|names_map| {
                 names_map
@@ -646,7 +1235,14 @@ impl Shards {
                     .map(|(si, off, len)| (arcs[si].clone(), off, len))
                     .collect()
             })
-            .collect())
+            .collect();
+        if prof {
+            BATCH_POST_US.fetch_add(
+                t_post.elapsed().as_micros() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        Ok(out)
     }
 
     /// Read a slice of a tensor: `n_elems` starting at element `elem_off`. Used
@@ -686,6 +1282,166 @@ impl Shards {
         self.files[file_idx].1.read_exact_at(buf, off)
     }
 
+    /// Drain `jobs` through **one io_uring per worker thread**, preserving the thread-level
+    /// concurrency of the `pread` pool while replacing each thread's blocking syscalls with
+    /// batched submission. Returns `false` if io_uring is unavailable, so the caller falls
+    /// back (re-reading a job is idempotent — it overwrites the same destination).
+    ///
+    /// O_DIRECT only, and that is the point. `coli iobench` on a real shard:
+    /// io_uring SQPOLL + `O_DIRECT` **10.63 GB/s**, threaded `pread` 8.12, io_uring
+    /// *buffered* 5.66. io_uring was shelved once because we were buffered — the 5.66 row.
+    ///
+    /// A SINGLE-ring version of this lost 1.58x on GLM (21732/20888 ms vs 13469/13570):
+    /// one submit/complete loop cannot replace 40 threads blocking independently, and
+    /// `submit_and_wait(1)` serialises the tail. Hence per-thread rings: the concurrency
+    /// that made `pread` fast is kept, and io_uring only removes the per-read syscall.
+    ///
+    /// **That fix works, but the result is model-dependent and the knob stays OFF.**
+    /// ABBA, tokens identical in every arm:
+    ///
+    /// | model | `pread` | io_uring | |
+    /// |---|---|---|---|
+    /// | GLM-5.2 | 13428 / 13490 ms | **12802 / 13280** | +3.1% |
+    /// | Kimi-K3 | **25626 / 25630 ms** | 29003 ms | −13% |
+    ///
+    /// **And the GLM "+3.1%" does not survive scrutiny.** Across three sessions the
+    /// `pread` CONTROL alone read 13469/13570, 13428/13490, 13086/13247 — a ~2.6% drift,
+    /// the same size as the claimed win. Establish the control's variance before quoting
+    /// an effect this small; I did not, and reported drift as a result.
+    ///
+    /// A ring POOL was tried on the theory that per-batch `io_uring_setup` + mmaps (40
+    /// workers x every batch, and K3 runs ~2.7x more batches) explained the sign split.
+    /// It measured WORSE on GLM (13584/13414 vs 13086/13247): pooling swaps per-batch
+    /// setup for per-batch contention on one global mutex. Reverted.
+    ///
+    /// Verdict: a wash on GLM, a clear loss on K3. Opt-in, kept so the idea has numbers.
+    #[cfg(target_os = "linux")]
+    fn drain_jobs_uring(&self, jobs: &[Job], nthreads: usize) -> bool {
+        use io_uring::{opcode, types, IoUring};
+        use std::os::unix::io::AsRawFd;
+        if jobs.is_empty() {
+            return true;
+        }
+        // Resolve one O_DIRECT fd per file up front: `get_or_init` off the worker threads,
+        // and a missing direct fd means this path does not apply at all.
+        let mut fds: Vec<i32> = Vec::with_capacity(self.files.len());
+        for i in 0..self.files.len() {
+            match self.dio.get(i).and_then(|c| c.get_or_init(|| open_direct(&self.files[i].0)).as_ref())
+            {
+                Some(f) => fds.push(f.as_raw_fd()),
+                None => return false,
+            }
+        }
+        let nt = nthreads.max(1).min(jobs.len());
+        let per_ring = (jobs.len().div_ceil(nt)).clamp(8, 128).next_power_of_two() as u32;
+        let ok = std::sync::atomic::AtomicBool::new(true);
+        let (fds, okr) = (&fds, &ok);
+        std::thread::scope(|scope| {
+            for t in 0..nt {
+                scope.spawn(move || {
+                    // NO SQPOLL. With a polled SQ, `submit_and_wait(1)` can return without a
+                    // completion being ready, and this loop then spins on an empty CQ without
+                    // ever decrementing `inflight` — observed as a live-lock (state R, 10+
+                    // minutes, zero progress) on GLM. A plain ring blocks properly.
+                    let mut ring = match IoUring::new(per_ring) {
+                        Ok(r) => r,
+                        Err(_) => {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    };
+                    // Strided slice, matching how the pread pool interleaves work.
+                    let mine: Vec<&Job> = jobs.iter().skip(t).step_by(nt).collect();
+                    let (mut next, mut inflight) = (0usize, 0usize);
+                    let mk = |j: &Job| {
+                        opcode::Read::new(types::Fd(fds[j.file]), j.ptr as *mut u8, j.len as u32)
+                            .offset(j.off)
+                            .build()
+                            .user_data(0)
+                    };
+                    while next < mine.len() && inflight < per_ring as usize {
+                        // SAFETY: each job addresses a live, disjoint sub-range of a span
+                        // buffer that outlives this scope; no two jobs overlap.
+                        if unsafe { ring.submission().push(&mk(mine[next])) }.is_err() {
+                            break;
+                        }
+                        next += 1;
+                        inflight += 1;
+                    }
+                    if ring.submit().is_err() {
+                        okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    while inflight > 0 {
+                        if ring.submit_and_wait(1).is_err() {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        let res: Vec<i32> = ring.completion().map(|c| c.result()).collect();
+                        if res.is_empty() {
+                            // Belt and braces: never loop without progress.
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                        for r in res {
+                            inflight -= 1;
+                            if r < 0 {
+                                okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                            if next < mine.len() {
+                                // SAFETY: as above.
+                                if unsafe { ring.submission().push(&mk(mine[next])) }.is_ok() {
+                                    next += 1;
+                                    inflight += 1;
+                                }
+                            }
+                        }
+                        if ring.submit().is_err() {
+                            okr.store(false, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn drain_jobs_uring(&self, _jobs: &[Job], _qd: usize) -> bool {
+        false
+    }
+
+    /// A zero-copy view of `[off, off+len)` in `file_idx`, or `None` when the mapped
+    /// path is unavailable or the span is not already page-cache resident.
+    ///
+    /// Returning `None` is not a failure — it means "use the copy path", which is the
+    /// right answer whenever the bytes would have to be faulted in one page at a time.
+    fn mapped_view(&self, file_idx: usize, off: u64, len: usize) -> Option<Arc<Mapping>> {
+        if !mmap_enabled() {
+            return None;
+        }
+        let cell = self.maps.get(file_idx)?;
+        let map = cell
+            .get_or_init(|| {
+                let (_, f) = self.files.get(file_idx)?;
+                let size = f.metadata().ok()?.len();
+                Mapping::open(f, size).map(Arc::new)
+            })
+            .clone()?;
+        if map.resident(off as usize, len) {
+            return Some(map);
+        }
+        // The span is about to be re-read in full. Before building anything that would
+        // read only its missing part, measure whether that part is contiguous enough to
+        // be worth reading separately.
+        if residency_probe() {
+            map.probe_partial(off as usize, len);
+        }
+        None
+    }
+
     /// Read into `buf`, preferring the `O_DIRECT` descriptor when one was opened.
     ///
     /// The caller is responsible for 512-alignment of `off`, `buf.as_ptr()` and
@@ -695,9 +1451,17 @@ impl Shards {
     /// never break a read, only fail to accelerate it.
     fn pread_dispatch(&self, file_idx: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(f) = self.dio.get(file_idx).and_then(|o| o.as_ref()) {
-            use std::os::unix::fs::FileExt;
-            return f.read_exact_at(buf, off);
+        if o_direct_enabled() {
+            // Opened on first use, then cached for the process's life. `get_or_init` is
+            // idempotent under the read pool's concurrency: several threads may race here,
+            // one open wins and the losers drop theirs.
+            let slot = self.dio.get(file_idx).and_then(|cell| {
+                cell.get_or_init(|| open_direct(&self.files[file_idx].0)).as_ref()
+            });
+            if let Some(f) = slot {
+                use std::os::unix::fs::FileExt;
+                return f.read_exact_at(buf, off);
+            }
         }
         self.pread_into(file_idx, off, buf)
     }
@@ -1042,6 +1806,63 @@ mod tests {
         assert_eq!(got.len(), n);
         assert_eq!(got, data);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mapped_spans_are_taken_and_byte_identical_to_the_copy_path() {
+        // A just-written file is page-cache resident, so the residency gate opens and
+        // both readers should serve views. The point of the test is that they are
+        // ACTUALLY views (otherwise it silently only ever tests the copy path) and that
+        // the bytes are identical to what the file holds.
+        let dir = temp_dir();
+        let w = 1usize << 20;
+        let mut entries: Vec<(String, usize, usize)> = Vec::new();
+        let mut off = 0;
+        for part in ["g", "u", "d"] {
+            entries.push((format!("e0.{part}"), off, w));
+            off += w;
+        }
+        let data: Vec<u8> = (0..off).map(|i| ((i * 7 + 3) % 251) as u8).collect();
+        let eref: Vec<(&str, usize, usize)> =
+            entries.iter().map(|(n, o, l)| (n.as_str(), *o, *l)).collect();
+        write_u8_shard(&dir, &eref, &data);
+        let s = Shards::open(&dir).unwrap();
+
+        let names = ["e0.g", "e0.u", "e0.d"];
+        let got = s.read_raw_shared(&names, 4).unwrap();
+        assert_eq!(got.len(), 3);
+
+        // The mapped path must be the one under test wherever it exists. Mapping is
+        // Linux-only, so elsewhere this necessarily falls back to the copy path — record
+        // which one ran rather than letting the test silently cover only the fallback.
+        let was_view = got[0].0.is_view();
+        if mmap_enabled() && cfg!(target_os = "linux") {
+            assert!(was_view, "a resident span should be served from the mapping");
+        }
+
+        // Contents match the file, and the three tensors coalesced into ONE span, so
+        // all three views share a single buffer at increasing offsets.
+        for (i, (buf, o, l)) in got.iter().enumerate() {
+            assert_eq!(*l, w);
+            assert_eq!(&buf[*o..*o + *l], &data[i * w..(i + 1) * w], "tensor {i} mismatch");
+        }
+        assert!(
+            Arc::ptr_eq(&got[0].0, &got[1].0) && Arc::ptr_eq(&got[1].0, &got[2].0),
+            "contiguous tensors should share one span buffer"
+        );
+
+        // A view must never be recycled into the heap pool: dropping it and then
+        // allocating must not hand back the mapping's memory. Only meaningful when a view
+        // actually ran — for a HEAP buffer the pool is *supposed* to return the same
+        // allocation, which is what this asserts the absence of.
+        let ptr = got[0].0.as_ptr();
+        drop(got);
+        let fresh = SharedBuf::with_len(w);
+        if was_view {
+            assert_ne!(fresh.as_ptr(), ptr, "a mapped view leaked into the buffer pool");
+        } else {
+            assert_eq!(fresh.as_ptr(), ptr, "a heap span should be recycled by the pool");
+        }
     }
 
     #[test]
