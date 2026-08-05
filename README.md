@@ -133,6 +133,24 @@ Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
 | **`deepseek-v4-flash`** | — | latent attention + **O-LoRA** output projection, 128-token sliding window, Compressor on 41/43 layers, DSA-family Indexer on 21/43 | 256, top-6 + 1 shared | **MXFP4** | **Hyper-Connections replace the residual stream** — 4 copies of the hidden state, `[b,s,4,4096]`. All-MoE. Experts are QAT-native MXFP4 and pass through convert bit-exact. 3 layers route by a `tid2eid` hash table instead of the router. ~144 GB |
 | **`kimi-k3`** | 1.5T | **hybrid**: 93 layers = 69 KDA (delta-rule linear attn) + 24 gated MLA (NoPE + output gate) | 896, top-16 (latent, 3584-wide) | **MXFP4** | no ordinary residual — attention residuals thread `prefix_sum`/`block_residual` through the stack (`forward::kimi_forward`). 2 shared experts fused as one 6144-wide MLP, `situ` activation. **Run with `COLI_O_DIRECT=1`** (1.09× prefill / 1.13× decode expert-load, tokens identical — off by default because it *loses* on GLM and the mechanism is unexplained). 1561 GB source; ~1.4 TB container |
 
+**Prebuilt containers.** Every model above is published as a ready-to-run container under
+[`Kanposer`](https://huggingface.co/Kanposer), so `serve` can be fed a download instead of a
+3-hour conversion. `scripts/models.toml` carries the repo per model in `hf_repo`:
+
+| container repo | shards | state |
+|---|---|---|
+| `GLM-5.2-speedy-colibri-nvfp4` | 48 | complete |
+| `MiniMax-M3-speedy-colibri-nvfp4` | 88 | complete |
+| `MiniMax-M2.7-speedy-colibri-nvfp4` | 15 | complete |
+| `Nemotron-3-Super-120B-speedy-colibri-nvfp4` | 18 | complete |
+| `Kimi-K3-speedy-colibri-mxfp4` | 94 | complete |
+| `DeepSeek-V4-Flash-0731-speedy-colibri-mxfp4` | 45 | **uploading, ETA 2026-08-06** — build with `scripts/convert.sh deepseek-v4-flash` until then |
+
+The box's upstream is **~41 Mbps**, and that is the ceiling rather than the tooling: NIC
+`tx_bytes` measured 5.15 MB/s at the Xet default vs 5.08 MB/s with
+`HF_XET_HIGH_PERFORMANCE=1`, two real configurations at the same rate. A 145 GiB container
+is therefore ~9 hours. Don't go looking for a faster uploader.
+
 **Which one loads** is chosen by the container you point `serve` at — one model per
 process. With Docker, set `COLI_MODEL_REPO` (and `COLI_MODEL_DIR` for a local snapshot);
 without Docker, pass a registry name to `scripts/serve.sh` (it resolves the container
