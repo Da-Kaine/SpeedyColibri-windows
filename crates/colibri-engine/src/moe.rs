@@ -248,10 +248,34 @@ impl Expert {
 
     /// Mark this expert's tensors as GPU-cacheable (for preloaded/resident experts).
     /// A gateless expert's empty gate is marked too — harmless, it is never used.
+    ///
+    /// **f32 (fmt 0) and int8 (fmt 1) experts are deliberately NOT marked, and this is a
+    /// correctness guard rather than a tuning choice.** Those are exactly the two formats
+    /// `gpu::try_matmul_qt` accepts, and it caches the uploaded device tensor in a map
+    /// **keyed by the host weight pointer**. A streamed expert's payload lives in a
+    /// `SharedBuf` recycled through a global pool, so that address is handed to a
+    /// *different* expert as soon as the cache evicts — and the stale device tensor is
+    /// then reused, so the GPU computes with the WRONG expert's weights, silently.
+    ///
+    /// `gpu_experts_enabled()` documents this hazard and guards the non-zero-copy path,
+    /// but the guard was incomplete: on a zero-copy box streamed experts ARE eligible, and
+    /// only fmt 5/6 get the safe treatment (`wrap_fresh`, no pointer-keyed cache). fmt 0/1
+    /// fell through to the cached path.
+    ///
+    /// CONFIRMED, not theorised — instrumenting the `map.entry(key)` site on the K3 tiny
+    /// fixture (int8 experts) recorded **22 events where one key served different weight
+    /// bytes with `already_cached=true`**, and `kimi_stack_runs_end_to_end` /
+    /// `kimi_prefill_matches_incremental_decode` failed. With experts off the GPU: 0 events,
+    /// both pass.
+    ///
+    /// The production containers are unaffected — their routed experts are NVFP4 (5) or
+    /// MXFP4 (6), which `try_matmul_qt` declines outright. This costs speed only for
+    /// int8/f32-expert containers, where the alternative is being wrong.
     pub fn mark_gpu_eligible(&mut self) {
-        self.gate.gpu_eligible = true;
-        self.up.gpu_eligible = true;
-        self.down.gpu_eligible = true;
+        let cacheable = |t: &colibri_core::QTensor| !matches!(t.fmt_code, 0 | 1);
+        self.gate.gpu_eligible = cacheable(&self.gate);
+        self.up.gpu_eligible = cacheable(&self.up);
+        self.down.gpu_eligible = cacheable(&self.down);
     }
 }
 
