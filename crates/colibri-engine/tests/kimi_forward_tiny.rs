@@ -251,6 +251,27 @@ fn kimi_stack_runs_end_to_end() {
     );
 
     // Deterministic.
+    //
+    // KNOWN FAILURE under `--features cuda`, localized 2026-08-05 but NOT fixed. Read
+    // this before debugging: the answer is not where it looks.
+    //
+    //   `COLI_GPU_EXPERTS=0` makes this test — and `kimi_prefill_matches_incremental_decode`
+    //   — PASS. So the nondeterminism is in the GPU EXPERT path, and the prefill/decode
+    //   mismatch is a CONSEQUENCE of it, not a second bug.
+    //
+    // Ruled out by experiment, so don't re-run these: it is not atomics (there are none in
+    // backend_cuda.cu); not uninitialized MLA scratch (memset-0 on all four absorb buffers
+    // changed nothing); not hash-iteration order (`union_and_weights` uses a Vec); and not
+    // KDA (an all-MLA stack reproduces it — though that does not isolate MLA either, since
+    // the latent MoE runs in every variant). CPU-only builds are deterministic 5/5.
+    //
+    // Five consecutive forwards give five DIFFERENT results (~1e-3), so it is a genuine
+    // race, not first-call state carry.
+    //
+    // Two traps if you write your own probe: `f32::max` DISCARDS NaN, so a plain fold
+    // reports maxdiff 0.0 on an all-NaN vector — compare `to_bits()` instead; and
+    // `ShardsExpertProvider::new(shards, cfg, N)`'s third arg is **ebits**, not a thread
+    // count, so passing 1 silently means 1-bit experts and yields all-NaN.
     let mut kv2 = KvCache::for_model(&model, 32);
     let mut h2 = vec![0f32; prompt.len() * D];
     forward(&model, &mut kv2, &provider, &prompt, 0, &mut h2).expect("K3 forward");
