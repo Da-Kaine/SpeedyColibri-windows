@@ -1452,4 +1452,67 @@ mod kv_accounting_tests {
             2 * (2 * conv_dim + 2 * 2 * 2) * 4
         );
     }
+
+    /// The KV storage contract DeepSeek-V4's 128-token sliding window depends on, pinned
+    /// BEFORE that tier becomes a ring buffer (task #69).
+    ///
+    /// V4 never reads its raw latent linearly: `dsv4_attention` takes
+    /// `latent_rows(li, raw_lo, total)` where the span is at most `cfg.window`. Today the
+    /// storage IS linear and `max_t`-sized, so the property below holds trivially — which
+    /// is exactly why it is worth writing down now. Once the tier is a ring of
+    /// `R = max(window, prefill_S)` rows with writes at `pos % R`, it must STILL hold, and
+    /// an off-by-one in that modulo yields plausible WRONG TOKENS rather than a crash.
+    /// This test is what such a change has to keep passing.
+    ///
+    /// Values are position-derived and per-lane distinct, so a span returned shifted by one
+    /// row — the likeliest ring bug — fails instead of coincidentally matching.
+    #[test]
+    fn latent_and_krot_spans_read_back_the_positions_written() {
+        const LAYERS: usize = 2;
+        const KV_LORA: usize = 4;
+        const QK_ROPE: usize = 2;
+        const WINDOW: usize = 8;
+        const TOTAL: usize = 40; // >> WINDOW, so a ring would wrap several times
+
+        let mut kv = KvCache::new(LAYERS, KV_LORA, QK_ROPE, TOTAL);
+        let lat = |p: usize, j: usize| (p * 100 + j) as f32;
+        let rot = |p: usize, j: usize| -((p * 10 + j) as f32);
+        for li in 0..LAYERS {
+            for p in 0..TOTAL {
+                for (j, v) in kv.latent_row_mut(li, p).iter_mut().enumerate() {
+                    *v = lat(p, j) + li as f32 * 0.5;
+                }
+                for (j, v) in kv.krot_row_mut(li, p).iter_mut().enumerate() {
+                    *v = rot(p, j) - li as f32 * 0.5;
+                }
+            }
+        }
+
+        // Every window-sized span V4 can ask for, at every end position.
+        for li in 0..LAYERS {
+            for end in 1..=TOTAL {
+                let start = end.saturating_sub(WINDOW);
+                let got_lat = kv.latent_rows(li, start, end);
+                let got_rot = kv.krot_rows(li, start, end);
+                assert_eq!(got_lat.len(), (end - start) * KV_LORA);
+                assert_eq!(got_rot.len(), (end - start) * QK_ROPE);
+                for (i, p) in (start..end).enumerate() {
+                    for j in 0..KV_LORA {
+                        assert_eq!(
+                            got_lat[i * KV_LORA + j],
+                            lat(p, j) + li as f32 * 0.5,
+                            "layer {li} span [{start},{end}) row {p} lane {j}"
+                        );
+                    }
+                    for j in 0..QK_ROPE {
+                        assert_eq!(
+                            got_rot[i * QK_ROPE + j],
+                            rot(p, j) - li as f32 * 0.5,
+                            "layer {li} krot span [{start},{end}) row {p} lane {j}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
