@@ -654,6 +654,67 @@ pub fn try_dsa_indexer_scores(
     }
 }
 
+/// DeepSeek-V4's sparse attention core on the GPU.
+///
+/// This path was measured at **48% of V4 decode** (144 of 300 ms/token) while running as a
+/// scalar Rust loop, with `coli gen` reporting `0 attention cores` — V4 attention had never
+/// touched the GPU at all. Same contract as `dsv4::attention_dsv4_sparse`: `-1` masks a
+/// slot, duplicate indices accumulate twice on purpose, sink in the denominator only.
+///
+/// The kernel accumulates in f32 where the CPU path uses f64, so results differ in the last
+/// bits and tokens can diverge on a near-tie. That is a different-but-valid numeric path,
+/// not a regression — `COLI_DSV4_GPU_ATTN=0` selects the CPU one for an exact A/B.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsv4_sparse_attn(
+    out: &mut [f32],
+    q: &[f32],
+    kv: &[f32],
+    sink: &[f32],
+    idxs: &[i32],
+    s: usize,
+    h: usize,
+    hd: usize,
+    topk: usize,
+) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("COLI_DSV4_GPU_ATTN").ok().as_deref() != Some("0")) {
+        return false;
+    }
+    if !available() || s == 0 || h == 0 || hd == 0 || topk == 0 || hd % 32 != 0 {
+        return false;
+    }
+    let rows = kv.len() / hd;
+    if rows == 0
+        || q.len() < s * h * hd
+        || out.len() < s * h * hd
+        || sink.len() < h
+        || idxs.len() < s * topk
+    {
+        return false;
+    }
+    let scale = (hd as f32).powf(-0.5);
+    // SAFETY: every length checked above; the kernel bails on shared-memory overflow.
+    let ok = unsafe {
+        cuda::dsv4_sparse_attn_raw(
+            q.as_ptr(),
+            kv.as_ptr(),
+            sink.as_ptr(),
+            idxs.as_ptr(),
+            s as i32,
+            h as i32,
+            hd as i32,
+            topk as i32,
+            rows as i32,
+            scale,
+            out.as_mut_ptr(),
+        )
+    };
+    if ok {
+        GPU_ATTN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
 /// `h0`/`hc` select the head slice `[h0, h0+hc)` to compute (tensor-parallel
 /// attention); the full-attention call passes `(0, h)`. A partial slice writes only
 /// its `ctx` head-columns and the kernel zeroes the rest, so summing the slices'
@@ -916,6 +977,49 @@ pub fn try_expert_ffn(
         } else {
             cuda::expert_mlp_raw(g, u, d, out.as_mut_ptr(), x.as_ptr(), nr as i32)
         }
+    };
+    if ok {
+        GPU_FFN.with(|c| c.set(c.get() + 1));
+    }
+    ok
+}
+
+/// MXFP4 expert FFN with the engine's configured SwiGLU — DeepSeek-V4's experts.
+///
+/// V4's experts are MXFP4 but gated SwiGLU, which fits neither existing path: the `_situ`
+/// twin below computes K3's activation, and `coli_cuda_expert_mlp` reads BLOCK scales as
+/// a per-row f32 array and took an illegal memory access on them. So every one of V4's
+/// 258 routed experts per token ran the scalar CPU loop.
+///
+/// Zero-copy only, like the other nibble/block-scale paths.
+pub fn try_expert_ffn_mxfp4(
+    gate: &QTensor,
+    up: &QTensor,
+    down: &QTensor,
+    x: &[f32],
+    nr: usize,
+    out: &mut [f32],
+) -> bool {
+    if !available() || !zerocopy() {
+        return false;
+    }
+    if gate.fmt_code != 6 || up.fmt_code != 6 || down.fmt_code != 6 {
+        return false;
+    }
+    let (Some(g), Some(u), Some(d)) = (wrap_fresh(gate), wrap_fresh(up), wrap_fresh(down)) else {
+        return false;
+    };
+    // SAFETY: g/u/d live to end of scope, covering the synchronous kernel + download;
+    // x/out are sized [nr, gate.i] / [nr, down.o] by `ffn`.
+    let ok = unsafe {
+        cuda::expert_mlp_mxfp4_raw(
+            g.as_raw(),
+            u.as_raw(),
+            d.as_raw(),
+            out.as_mut_ptr(),
+            x.as_ptr(),
+            nr as i32,
+        )
     };
     if ok {
         GPU_FFN.with(|c| c.set(c.get() + 1));
@@ -1330,22 +1434,40 @@ pub fn try_expert_group_nvfp4(
     d: usize,
     out: &mut [f32],
 ) -> bool {
+    try_expert_group_packed(active, activations, d, out, 5)
+}
+
+/// Grouped SwiGLU experts for a packed 4-bit format — NVFP4 (`fmt` 5) or MXFP4 (`fmt` 6).
+///
+/// Parameterised rather than duplicated: the gather/scatter, the chunking, and the RAM
+/// ledger accounting are identical between the two, and only the format check and the raw
+/// entry point differ. DeepSeek-V4 is MXFP4 and had NO grouped arm at all, so every expert
+/// took the per-expert path — 301 dispatches per decode token, each paying its own stream
+/// synchronise.
+#[allow(clippy::too_many_arguments)]
+pub fn try_expert_group_packed(
+    active: &[(std::sync::Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)],
+    activations: &[f32],
+    d: usize,
+    out: &mut [f32],
+    fmt: i32,
+) -> bool {
     if !available() || !zerocopy() {
         return false;
     }
     if active.is_empty() {
         return true;
     }
-    // Every expert must be a gpu-eligible NVFP4 three-tensor SwiGLU of the expected shape, or
-    // decline and let the caller run per-expert.
+    // Every expert must be a gpu-eligible three-tensor SwiGLU of `fmt` and the expected
+    // shape, or decline and let the caller run per-expert.
     if !active.iter().all(|(ex, _, _)| {
         ex.gate.gpu_eligible
-            && ex.gate.fmt_code == 5
+            && ex.gate.fmt_code == fmt
             && ex.gate.i as usize == d
             && ex.up.gpu_eligible
             && ex.down.gpu_eligible
-            && ex.up.fmt_code == 5
-            && ex.down.fmt_code == 5
+            && ex.up.fmt_code == fmt
+            && ex.down.fmt_code == fmt
             && ex.up.i as usize == d
             && ex.down.o as usize == d
     }) {
@@ -1448,14 +1570,15 @@ pub fn try_expert_group_nvfp4(
         // SAFETY: the wrapped tensors stay alive in `keep` until after the call, which is
         // synchronous through its own D2H; the sub-slices hold `part_rows * d` floats each.
         let called = unsafe {
-            cuda::expert_group_nvfp4_raw(
-                &gs,
-                &us,
-                &ds,
-                &rws,
+            let (yp, xp) = (
                 y_all[done * d..(done + part_rows) * d].as_mut_ptr(),
                 x_all[done * d..(done + part_rows) * d].as_ptr(),
-            )
+            );
+            if fmt == 6 {
+                cuda::expert_group_mxfp4_raw(&gs, &us, &ds, &rws, yp, xp)
+            } else {
+                cuda::expert_group_nvfp4_raw(&gs, &us, &ds, &rws, yp, xp)
+            }
         };
         drop(keep);
         if !called {
@@ -1783,6 +1906,102 @@ mod tests {
     use super::*;
     use crate::linear::matmul_qt;
     use crate::quantize::qtensor_from_f32;
+
+    /// A deterministic MXFP4 weight [o, i]: nibble k of row r cycles the e2m1 codebook and
+    /// the E8M0 block scale varies per block AND per row, so a wrong nibble order or a
+    /// wrong block stride (32, not NVFP4's 16) cannot coincide with the right answer.
+    /// Same construction as `linear::tests::matmul_qt_reconstructs_mxfp4`, which pins the
+    /// CPU arm this test uses as its reference.
+    fn mxfp4_weight(o: usize, i: usize, seed: usize) -> QTensor {
+        let nb = i / 32;
+        let mut q4 = vec![0u8; o * i / 2];
+        let mut bs = vec![0u8; o * nb];
+        for r in 0..o {
+            for k in 0..i {
+                let nib = ((k + r * 3 + seed) % 16) as u8;
+                let idx = r * (i / 2) + (k >> 1);
+                if k & 1 == 1 {
+                    q4[idx] |= nib << 4;
+                } else {
+                    q4[idx] |= nib;
+                }
+            }
+            for b in 0..nb {
+                bs[r * nb + b] = (126 + ((b + r + seed) % 3) as i32) as u8;
+            }
+        }
+        QTensor {
+            fmt_code: 6,
+            q4: colibri_core::Bytes::Owned(q4),
+            bs: colibri_core::Bytes::Owned(bs),
+            g: 0.5,
+            o: o as i32,
+            i: i as i32,
+            ..Default::default()
+        }
+    }
+
+    /// The MXFP4 expert FFN on the GPU must agree with the CPU reference at every S, and
+    /// this is the ONLY check that covers it: the read-pattern and weight-stationary
+    /// kernels sum in a different order than the kernels they replace, so cross-kernel
+    /// token identity is the wrong gate — agreement with `matmul_qt` is the right one.
+    ///
+    /// S is chosen to enter each arm of `coli_cuda_expert_mlp_mxfp4`: 1 = the decode GEMV
+    /// dispatcher, 4/16/32 = the three weight-stationary MT buckets, 33 = the WMMA tile
+    /// the WSMM launcher declines into. A kernel that quietly truncates rows past its
+    /// bucket, or one that never runs at all, fails here rather than in a benchmark.
+    ///
+    /// The shapes matter as much as S. `mxfp4_wsmm` sweeps K in KT=128 tiles, so a K of
+    /// exactly 128 runs that loop ONCE and proves nothing about accumulating across tiles
+    /// or about a short final tile — which is the shape every real expert has (D=4096,
+    /// I=2048). 320x160 gives gate/up K=320 (two full tiles + 64) and down K=160 (one full
+    /// tile + 32); 128x64 keeps the exact-multiple case alongside it.
+    ///
+    /// Sets the CUDA activation globals; run CUDA tests with `--test-threads=1` (task #57).
+    #[test]
+    fn mxfp4_expert_ffn_gpu_matches_cpu_at_every_s() {
+        if !available() || !zerocopy() {
+            eprintln!("skip: no zero-copy CUDA device");
+            return;
+        }
+        set_activation(false, 0.0, 0.0); // plain SiLU: act_mul -> silu_mul
+
+        for &(d, inter) in &[(128usize, 64usize), (320, 160)] {
+            let gate = mxfp4_weight(inter, d, 0);
+            let up = mxfp4_weight(inter, d, 5);
+            let down = mxfp4_weight(d, inter, 9);
+
+            for &s in &[1usize, 4, 16, 32, 33] {
+                let x: Vec<f32> =
+                    (0..s * d).map(|k| ((k % 11) as f32 - 5.0) * 0.05).collect();
+
+                // CPU reference — exactly `moe::ffn_cpu`'s plain-SwiGLU arm.
+                let mut gg = vec![0f32; s * inter];
+                let mut uu = vec![0f32; s * inter];
+                matmul_qt(&mut gg, &x, &gate, s);
+                matmul_qt(&mut uu, &x, &up, s);
+                for (g, &u) in gg.iter_mut().zip(uu.iter()) {
+                    *g = crate::math::silu(*g) * u;
+                }
+                let mut want = vec![0f32; s * d];
+                matmul_qt(&mut want, &gg, &down, s);
+
+                let mut got = vec![0f32; s * d];
+                assert!(
+                    try_expert_ffn_mxfp4(&gate, &up, &down, &x, s, &mut got),
+                    "[{d}x{inter}] S={s}: the GPU MXFP4 expert declined — this test would \
+                     otherwise pass by comparing the CPU reference against a zero buffer"
+                );
+                let tol = 1e-3 * want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+                for (j, (&a, &b)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= tol,
+                        "[{d}x{inter}] S={s} elem {j}: gpu {a} vs cpu {b} (tol {tol})"
+                    );
+                }
+            }
+        }
+    }
 
     // GPU vs CPU-NEON matmul at GLM-scale sizes.
     // `cargo test -p colibri-engine --features cuda --release -- --ignored --nocapture bench_matmul`

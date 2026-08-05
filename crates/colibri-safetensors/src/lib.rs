@@ -1564,6 +1564,28 @@ fn bad(path: &Path, name: &str, field: &str) -> io::Error {
 /// Convert `raw` bytes of the given dtype into `out[..numel]` as f32.
 fn convert_to_f32(dtype: DType, raw: &[u8], out: &mut [f32]) {
     match dtype {
+        // An I64 tensor is an index table (DeepSeek-V4's `tid2eid` token->expert lookup),
+        // not a weight. Converting it by VALUE is exact and intended — expert IDs are
+        // small non-negative integers, and every integer below 2^24 round-trips through
+        // f32 — which is how the container stores the table without needing an integer
+        // tensor path of its own.
+        //
+        // The guard that used to live here (an unconditional panic) was aimed at a
+        // different mistake: BIT-reinterpreting expert IDs as floats, which yields a model
+        // that runs and is silently wrong. The range check keeps that protection — a real
+        // weight tensor misread as I64 carries huge or negative values and still stops
+        // here — while allowing the one conversion that is well-defined.
+        DType::I64 => {
+            for (o, chunk) in out.iter_mut().zip(raw.chunks_exact(8)) {
+                let v = i64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+                assert!(
+                    (0..=(1i64 << 24)).contains(&v),
+                    "I64 tensor holds {v}, which is not a small non-negative index — \
+                     refusing to convert it to f32 (expected a token->expert table)"
+                );
+                *o = v as f32;
+            }
+        }
         DType::F32 => {
             for (o, chunk) in out.iter_mut().zip(raw.chunks_exact(4)) {
                 *o = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);

@@ -47,6 +47,29 @@ pub enum Arch {
     /// [`LayerKind::Moe`]; the MoE layers are the `first_dense` prefix rule instead.
     /// Ask [`Config::moe_layers`] for that count, never `layer_kind` directly.
     KimiK3,
+    /// DeepSeek-V4-Flash: MoE on every layer, latent attention with **O-LoRA**, and
+    /// **Hyper-Connections** in place of the residual stream.
+    ///
+    /// Hyper-Connections are the load-bearing difference and the reason this cannot reuse
+    /// another arch's block loop. Instead of `x = x + f(norm(x))`, the inter-block state is
+    /// `hc_mult` (4) copies of the hidden state, `[b, s, 4, hidden]`. Each block does
+    /// `hc_pre` (collapse 4 -> 1 by a learned weighted sum) -> norm -> mixer -> `hc_post`
+    /// (expand 1 -> 4, mixing the previous copies through a 4x4 matrix), twice: once around
+    /// attention and once around the FFN. The collapse/expand weights are produced per
+    /// token by a Sinkhorn normalisation (20 iterations) of a 24-wide projection of the
+    /// flattened state — see `hc_split_sinkhorn` in the checkpoint's `inference/kernel.py`.
+    ///
+    /// Crucially the mixer itself still sees `[b, s, hidden]`, because `hc_pre` collapses
+    /// *before* `attn_norm` and `hc_post` expands *after* the block. So attention, the MoE
+    /// and every scratch buffer keep their usual shape; only the carried residual is 4-wide
+    /// (+201 MB at a 4096-token prefill). Do NOT widen the rest of the engine for this.
+    ///
+    /// Routed experts are natively **MXFP4** (`fmt=6`, block-32 E8M0), the same format as
+    /// [`Arch::KimiK3`] and for the same reason: the checkpoint is trained in it, so a
+    /// requantisation to NVFP4 is measured pure loss (6.40% rel-RMS) *and* 5.9% more bytes.
+    /// Dense/resident weights are fp8 e4m3 with **128x128** E8M0 block scales — a third
+    /// scale layout, neither NVFP4's `ceil(I/16)` nor MXFP4's `ceil(I/32)`.
+    DeepseekV4,
 }
 
 /// Per-layer mixer type for a hybrid architecture. Homogeneous arches leave
@@ -114,6 +137,15 @@ pub struct Config {
     pub dense_inter: i32,
     pub first_dense: i32,
     pub q_lora: i32,
+    /// DeepSeek-V4 output LoRA: rank per group (`o_lora_rank`) and the number of groups
+    /// (`o_groups`). V4 replaces the plain o_proj with `o_a` [g*rank, n_heads*head_dim/g]
+    /// then `o_b` [hidden, g*rank]. 0 on every other arch.
+    ///
+    /// These are carried in Config rather than read back from the weights because the
+    /// container stores quantised tensors as FLAT blobs — `o_a` arrives as [33554432] with
+    /// no shape to recover, and 8192x4096 is not the only factorisation of it.
+    pub o_lora: i32,
+    pub o_groups: i32,
     pub kv_lora: i32,
     pub qk_nope: i32,
     pub qk_rope: i32,
@@ -167,6 +199,45 @@ pub struct Config {
     pub swiglu_alpha: f32,
     /// SwiGLU clamp limit (`swiglu_limit`, MiniMax-M3) — used only when `swiglu_oai`.
     pub swiglu_limit: f32,
+    /// DeepSeek-V4 Hyper-Connections. `hc_mult` copies of the hidden state replace the
+    /// residual, so the stream is `[s, hc_mult, hidden]` and **every activation buffer is
+    /// `hc_mult` times wider**. 0 for every other arch, which is also the "no HC" switch:
+    /// `hc_mult == 0` must behave exactly as a plain residual.
+    ///
+    /// `hc_sinkhorn_iters` is the normalisation loop count inside `hc_split_sinkhorn`, and
+    /// `hc_eps` is the floor added to the Sinkhorn/sigmoid weights — NOT the RMS epsilon.
+    /// The reference uses `norm_eps` for the rsqrt inside `hc_pre` and `hc_eps` only for
+    /// the weights; conflating them is silent and shifts every mixing weight slightly.
+    /// DeepSeek-V4 Compressor: per-layer `compress_ratio`, 0 where the layer has none
+    /// (V4: layers 0-1 and 42+ are 0, the other 41 alternate 4 and 128). A ratio of 4
+    /// additionally turns on OVERLAPPING windows, which doubles the projection width —
+    /// so this vector determines tensor SHAPES, not just behaviour, and a wrong entry is
+    /// a load failure rather than a silent quality loss.
+    pub compress_ratios: Vec<i32>,
+    /// The Compressor's rope base, SEPARATE from `theta`: V4 uses 160000 here against
+    /// 10000 for attention. Reusing `theta` would place every compressed block wrongly.
+    pub compress_theta: f32,
+    /// DeepSeek-V4 hash routing: the FIRST `num_hash_layers` (3) MoE layers pick their
+    /// experts from a `tid2eid[token_id]` table instead of by top-k score. Those layers
+    /// still run the router matmul — it supplies the WEIGHTS — and ship no bias at all,
+    /// because a bias only ever shifts a comparison and there is no comparison here.
+    /// 0 on every other arch.
+    pub n_hash_layers: i32,
+    /// DeepSeek-V4 DSpark (speculative drafting, stored under `mtp.*`). All 0/empty on
+    /// every other arch. `dspark_targets` are the MAIN layers whose hidden states are
+    /// concatenated into stage 0's `main_proj` — they are sources, not DSpark layers.
+    pub dspark_block: i32,
+    pub dspark_noise_id: i32,
+    pub markov_rank: i32,
+    pub dspark_targets: Vec<i32>,
+    pub hc_mult: i32,
+    pub hc_sinkhorn_iters: i32,
+    pub hc_eps: f32,
+    /// DeepSeek-V4 sliding window (`sliding_window`, 128). The raw KV cache is a RING
+    /// BUFFER of exactly this many entries — older context is reachable only through the
+    /// Compressor. So a build without the Compressor is exact for prompts up to this
+    /// length and wrong beyond it, rather than approximate everywhere.
+    pub window: i32,
     /// Sigmoid expert scoring with an additive routing bias (MiniMax-M3
     /// `scoring_func == "sigmoid"` + `e_score_correction_bias`); `false` = GLM.
     pub sigmoid_route: bool,
@@ -384,6 +455,15 @@ impl Config {
         // `text_config` as MiniMax-M3, and K3 carries one (it is a VL model too), so
         // reversing these two silently parses K3 as M3 — wrong attention family, wrong
         // expert geometry, and no KDA state, with nothing to signal it.
+        // DeepSeek-V4-Flash. Like the K3 arm below, this MUST precede the M3 check: that
+        // one claims any config carrying a `text_config`, and matching on `model_type`
+        // first is the only thing keeping a new arch from being silently parsed as M3.
+        // Keyed on `deepseek_v4` / `DeepseekV4ForCausalLM` — deliberately NOT on the
+        // presence of `hc_mult` or `dspark_*`, so a V4 variant that drops one of those
+        // still lands here rather than falling through to a wrong family.
+        if model_type == Some("deepseek_v4") || arch_is("DeepseekV4ForCausalLM") {
+            return Config::from_json_deepseek_v4(r);
+        }
         if model_type == Some("kimi_k3")
             || arch_is("KimiK3ForConditionalGeneration")
             || arch_is("KimiLinearForCausalLM")
@@ -414,6 +494,8 @@ impl Config {
             dense_inter: gi("intermediate_size"),
             first_dense: gi("first_k_dense_replace"),
             q_lora: gi("q_lora_rank"),
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: gi("kv_lora_rank"),
             qk_nope: gi("qk_nope_head_dim"),
             qk_rope: gi("qk_rope_head_dim"),
@@ -452,6 +534,19 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
+            n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: false,
             // Nemotron-H-only fields (unused by GLM).
             layer_kind: Vec::new(),
@@ -595,6 +690,8 @@ impl Config {
             dense_inter: gt("dense_intermediate_size"),
             first_dense,
             q_lora: 0,  // GQA: no query LoRA
+            o_lora: 0,  // GQA: plain o_proj, no output LoRA
+            o_groups: 0,
             kv_lora: 0, // GQA: no latent KV
             qk_nope,
             qk_rope,
@@ -648,6 +745,19 @@ impl Config {
                 .and_then(Json::as_f64)
                 .unwrap_or(1.702) as f32,
             swiglu_limit: t.get("swiglu_limit").and_then(Json::as_f64).unwrap_or(7.0) as f32,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
+            n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: scoring == "sigmoid",
             // Nemotron-H-only fields (unused by MiniMax).
             layer_kind: Vec::new(),
@@ -732,6 +842,172 @@ impl Config {
     /// - **MoE is not on that axis.** Every layer after `first_k_dense_replace` carries
     ///   experts regardless of its mixer, so `layer_kind` holds no `Moe` entries and
     ///   [`Config::moe_layers`] falls through to the prefix rule.
+    /// DeepSeek-V4-Flash (`deepseek_v4`).
+    ///
+    /// Everything here is read straight from `config.json`. Two geometry fields are
+    /// deliberately left at 0 with no fallback guess — see the note on `qk_nope`/`v_head`
+    /// below. A wrong attention geometry does not fail loudly, it produces plausible
+    /// garbage, so these stay 0 until they are derived from the checkpoint's own
+    /// `inference/model.py` and pinned by a test against real tensor shapes.
+    fn from_json_deepseek_v4(r: &Json) -> Result<Config, ConfigError> {
+        let g = |k: &str| gi_in(r, k);
+        let nlc = (g("num_hidden_layers").max(0) as usize).min(MAX_LAYERS_IDX);
+
+        let mut c = Config {
+            hidden: g("hidden_size"),
+            n_layers: g("num_hidden_layers"),
+            n_heads: g("num_attention_heads"),
+            n_experts: g("n_routed_experts"),
+            topk: g("num_experts_per_tok"),
+            moe_inter: g("moe_intermediate_size"),
+            // No `intermediate_size` and no `first_k_dense_replace`: EVERY layer is MoE.
+            // Confirmed against the checkpoint inventory, which carries 43 x 256 expert
+            // tensor groups (11008) with no dense-FFN layer among them.
+            dense_inter: 0,
+            first_dense: 0,
+            q_lora: g("q_lora_rank"),
+            o_lora: g("o_lora_rank"),
+            o_groups: g("o_groups").max(1),
+            // Attention geometry, taken from the checkpoint's own `inference/model.py`
+            // (class `Attention`) rather than inferred, and cross-checked against the
+            // released tensor shapes:
+            //   nope_head_dim = head_dim - rope_head_dim      => 512 - 64 = 448
+            //   wkv  = Linear(dim, head_dim)                  => [512, 4096],  scale [4,32]
+            //   kv_norm = RMSNorm(head_dim)                   => [512]
+            //   wq_b = Linear(q_lora_rank, n_heads*head_dim)  => [32768, 1024], scale [256,8]
+            //
+            // There is NO separate V projection: `wkv` emits one `head_dim`-wide latent
+            // that serves as both K and V (`kv_cache` is `(batch, t, head_dim)`), which is
+            // what `num_key_value_heads: 1` is describing. So the KV latent, the qk head
+            // width and the v head width are all `head_dim`, and KV costs 512 f32 per token
+            // per layer — cheap for a 43-layer model, which is how it affords 1M context.
+            kv_lora: g("head_dim"),
+            qk_nope: g("head_dim") - g("qk_rope_head_dim"),
+            qk_head: g("head_dim"),
+            v_head: g("head_dim"),
+            qk_rope: g("qk_rope_head_dim"),
+            n_shared: g("n_shared_experts"),
+            vocab: g("vocab_size"),
+            max_ctx: g("max_position_embeddings"),
+            n_group: g("n_group").max(1),
+            topk_group: g("topk_group").max(1),
+            norm_topk: r
+                .get("norm_topk_prob")
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
+            stop_ids: Vec::new(),
+            // V4 DOES carry a DSA-family indexer, but on only 21 of 43 layers (the
+            // checkpoint has 21 `attn.indexer.*` groups). These dims describe the indexer
+            // where it exists; which layers have one is a per-layer fact the loader must
+            // read from the weights, not something this scalar config can express.
+            index_topk: g("index_topk"),
+            index_nh: g("index_n_heads"),
+            index_hd: g("index_head_dim"),
+            index_block_size: 0,
+            index_topk_blocks: 0,
+            index_local_blocks: 0,
+            idx_type: Vec::new(),
+            eps: r.get("rms_norm_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+            theta: r
+                .get("rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
+            attn_scale: 0.0,
+            routed_scale: r
+                .get("routed_scaling_factor")
+                .and_then(Json::as_f64)
+                .unwrap_or(1.0) as f32,
+            arch: Arch::DeepseekV4,
+            n_kv_heads: g("num_key_value_heads"),
+            shared_inter: g("n_shared_experts") * g("moe_intermediate_size"),
+            qk_norm: false,
+            gemma_norm: false,
+            // `swiglu_limit` is a clamp on the SwiGLU product, as on M3 — but V4 states it
+            // as a bare float with no `swiglu_alpha`, so only the limit is set.
+            swiglu_oai: false,
+            swiglu_alpha: 0.0,
+            swiglu_limit: r
+                .get("swiglu_limit")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as f32,
+            // Hyper-Connections: the residual stream becomes `[s, hc_mult, hidden]`.
+            // Defaulted to 0 rather than 4 — a V4 variant that drops HC must run as a
+            // plain residual, not silently get four copies it has no weights for.
+            compress_ratios: r
+                .get("compress_ratios")
+                .and_then(Json::as_array)
+                .map(|a| a.iter().filter_map(Json::as_f64).map(|v| v as i32).collect())
+                .unwrap_or_default(),
+            compress_theta: r
+                .get("compress_rope_theta")
+                .and_then(Json::as_f64)
+                .unwrap_or(10000.0) as f32,
+            n_hash_layers: r
+                .get("num_hash_layers")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
+            dspark_block: r.get("dspark_block_size").and_then(Json::as_f64).unwrap_or(0.0) as i32,
+            dspark_noise_id: r
+                .get("dspark_noise_token_id")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
+            markov_rank: r
+                .get("dspark_markov_rank")
+                .and_then(Json::as_f64)
+                .unwrap_or(0.0) as i32,
+            dspark_targets: r
+                .get("dspark_target_layer_ids")
+                .and_then(Json::as_array)
+                .map(|a| a.iter().filter_map(Json::as_f64).map(|v| v as i32).collect())
+                .unwrap_or_default(),
+            hc_mult: g("hc_mult"),
+            hc_sinkhorn_iters: g("hc_sinkhorn_iters"),
+            // Distinct from `eps` (the RMS epsilon): this one floors the Sinkhorn/sigmoid
+            // mixing weights. The reference uses `norm_eps` for the rsqrt and `hc_eps`
+            // only for the weights.
+            hc_eps: r.get("hc_eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+            // The raw KV cache is a ring buffer of this many rows; everything older lives
+            // in the Compressor. Until that lands, context is exact to `window` and wrong
+            // past it — a hard edge, not a gentle degradation.
+            window: g("sliding_window"),
+            // Routing is `sqrtsoftplus` + `noaux_tc`, which is neither the sigmoid nor the
+            // softmax arm this bool selects between. Left false so it cannot silently take
+            // the sigmoid path; the real scorer is a V4-specific one still to be written.
+            sigmoid_route: false,
+            // Homogeneous on the mixer axis: every layer is attention + MoE. The
+            // heterogeneity in V4 is the Compressor (41/43) and Indexer (21/43), which are
+            // sub-modules of attention rather than a different mixer, so `layer_kind`
+            // stays empty exactly as it does for GLM.
+            layer_kind: Vec::new(),
+            mtp_layer_kind: Vec::new(),
+            mamba_d_state: 0,
+            mamba_d_conv: 0,
+            mamba_n_heads: 0,
+            mamba_head_dim: 0,
+            mamba_n_groups: 0,
+            mamba_inter: 0,
+            mamba_chunk: 0,
+            // Experts are at model `hidden`, not in a latent bottleneck: w1 is
+            // [moe_inter, hidden] = [2048, 4096] in the checkpoint. Contrast Nemotron-H
+            // and K3, which both route through `moe_latent`.
+            moe_latent: 0,
+            mamba_dt_min: 0.0,
+            situ: false,
+            situ_beta: 0.0,
+            situ_linear_beta: 0.0,
+            mla_nope: false,
+            kda_n_heads: 0,
+            kda_head_dim: 0,
+            kda_d_conv: 0,
+            attn_res_block_size: 0,
+            // Gated SwiGLU with a clamp, not Nemotron's gateless relu^2.
+            relu2: false,
+        };
+        let _ = nlc;
+        parse_stop_ids(r, &mut c.stop_ids);
+        Ok(c)
+    }
+
     fn from_json_kimi(r: &Json, t: &Json) -> Result<Config, ConfigError> {
         let gt = |k: &str| gi_in(t, k);
         let lac = t.get("linear_attn_config");
@@ -773,6 +1049,8 @@ impl Config {
             dense_inter: gt("intermediate_size"),
             first_dense: gt("first_k_dense_replace"),
             q_lora: gt("q_lora_rank"),
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: gt("kv_lora_rank"),
             qk_nope: gt("qk_nope_head_dim"),
             qk_rope: gt("qk_rope_head_dim"),
@@ -818,6 +1096,19 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
+            n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             sigmoid_route: t.get("moe_router_activation_func").and_then(Json::as_str)
                 == Some("sigmoid"),
             layer_kind,
@@ -953,6 +1244,8 @@ impl Config {
             dense_inter: gi("moe_intermediate_size").max(1),
             first_dense: 0, // MoE layers are index-selected via layer_kind, not a prefix.
             q_lora: 0,
+            o_lora: 0,
+            o_groups: 0,
             kv_lora: 0,
             qk_nope,
             qk_rope,
@@ -992,6 +1285,19 @@ impl Config {
             swiglu_oai: false,
             swiglu_alpha: 0.0,
             swiglu_limit: 0.0,
+            // No Hyper-Connections and no V4 sliding window on this arch: `hc_mult == 0`
+            // is the "plain residual" case, and `window == 0` means "no ring buffer".
+            compress_ratios: Vec::new(),
+            compress_theta: 0.0,
+            n_hash_layers: 0,
+            dspark_block: 0,
+            dspark_noise_id: 0,
+            markov_rank: 0,
+            dspark_targets: Vec::new(),
+            hc_mult: 0,
+            hc_sinkhorn_iters: 0,
+            hc_eps: 0.0,
+            window: 0,
             // DeepSeek-style sigmoid router with an additive correction bias.
             sigmoid_route: true,
             layer_kind,

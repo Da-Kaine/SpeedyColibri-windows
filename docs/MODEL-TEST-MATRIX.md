@@ -148,6 +148,218 @@ I/O-oriented work (prefetch-ahead, eviction policy, autopin, RAM sweeps) was dev
 this model, and **those conclusions are regime-specific — re-measure before assuming they hold
 for a model whose experts fit in RAM.**
 
+## DeepSeek-V4-Flash: first sound measurements (2026-08-04)
+
+Deliberately NOT a column in the Coverage grid above — most levers are untested on V4, and
+thirty TODO cells would read as coverage rather than absence.
+
+**Every V4 figure recorded before this date was measured on `seq 1000 1199`**, a synthetic
+id range that drives the model into `[368, 85]` cycling. That is the trap in "Recurring
+traps" below, and it means the old 3.4-4.1 tok/s is from a different regime and is NOT
+comparable to anything here. V4 now carries the same English prose as the other four
+(`scripts/models.toml`, 512 ids, round-trip verified).
+
+| | value | method |
+|---|---|---|
+| decode | **4.8 tok/s** (~205 ms/tok) @ 512-token ctx, 2026-08-05 | steady-state timer, n=8 (4.67-4.93) |
+| — was | 3.5-4.0 tok/s (~253 ms/tok), 2026-08-04 | before the MXFP4 kernel work below |
+| prefill phase | **~41 s** for 512 tokens | `prefill N tok:` timer, n=8 |
+| prefill + startup | 85.6 s for 512 tokens + 8 gen — **2026-08-04, STALE** | wall, of which ~21 s expert preload |
+| attention core | 144 → **24 ms/tok** (6.0×); prefill 55.2 → 7.7 s (7.1×) | `COLI_PROFILE` difference |
+| container | 155 GB (`-v3`, with DSpark) / 144 GB (`-v2`) | from 167 GB fp8 source |
+
+**Decode composition — 2026-08-04, PREDATES the MXFP4 kernel work and no longer sums.**
+Kept because the *shares* still say where to look, not because the numbers are current:
+
+| phase | ms/tok | share |
+|---|---|---|
+| moe | 156.7 | 65.6% |
+| — expert-load | 69.5 | 29.1% |
+| — gpu-ffn | 57.3 | 24.0% |
+| attn | 80.8 | 33.8% |
+| — core | 24.2 | 10.1% |
+| — o-proj / proj | 36.8 / 16.2 | 22.2% |
+
+**It could not be refreshed, and that is itself the finding.** An NGEN 1→16 difference on the
+current binary puts `moe` at 177.5 ms/forward and `attn` at ~60 — but the step is now ~205
+ms/tok, so those sum to more than the whole step. The differences are of two large,
+prefill-dominated totals: `attn` came out **negative in 2 of 4 pairs**. At a 512-token
+context the prefill term swamps 15 decode forwards, so **per-phase decode composition is
+not recoverable by NGEN differencing here** — only `moe`/`gpu-ffn` are well enough
+determined to compare across arms. Use a much wider NGEN gap, or a decode-only counter,
+before quoting a composition again.
+
+`gpu-ffn` is **301 dispatches per decode token** = `43 layers × 6 routed + 43 shared`,
+i.e. one per expert, at 190 µs each. V4 takes `coli_cuda_expert_mlp_mxfp4` (one expert per
+call) where the NVFP4 path takes `coli_cuda_expert_group_nvfp4_relu2` (a group per call).
+
+**That framing was wrong, and grouping was built to disprove it (`fafd192`).** Dispatches
+went 301 → 43 exactly as intended, tokens were identical, and it measured **~10% slower**
+(decode 239 → 251 ms/tok). The syncs were never the cost. `coli gpubench 1 300` says why:
+4-bit tops out at ~190 GB/s where int8 does 400-556 on the same shapes, and is slower in
+absolute time while reading half the bytes — so 4-bit experts are **dequant-bound, not
+bandwidth- or launch-bound**. Cutting launches could not have helped.
+
+The lever that follows from that is reading each weight *once* and amortizing its dequant
+over rows, which is what the weight-stationary kernel does — see the MXFP4 kernel table
+below.
+
+**Precision warning for anyone re-measuring V4 decode:** decode is a small slice of total
+wall, so an NGEN difference is a difference of two large numbers. At gap 32 the extremes
+span 1.82-3.74 tok/s — nearly useless. Widen the gap before trusting a delta.
+
+### MXFP4 kernels: both NVFP4 wins had been left one format over (`97e8b86`, 2026-08-05)
+
+`nvfp4_gemv_dispatch` exists so that a read-pattern change reaches every fmt-5 call site;
+`nvfp4_wsmm` fixed the re-dequantize-once-per-16-row-m-tile problem for fmt 5. Neither had
+a fmt-6 twin, so MXFP4 — the format V4 and K3 use for **every routed expert** — kept the
+original narrow GEMV (lanes 2j and 2j+1 loading the same byte, 16 B/warp) and the WMMA
+tile. Same closed-set dispatch trap, one arm short.
+
+ABBA-interleaved, n=4 per arm, 512-token prompt, container `-v2`:
+
+| change | arm | measured | effect |
+|---|---|---|---|
+| decode GEMV (`COLI_MXFP4_GEMV` 0→2) | narrow | 4.27 / 4.30 / 4.25 / 4.22 tok/s | — |
+| | byte-per-lane | 4.49 / 4.55 / 4.59 / 4.59 tok/s | **+6.9%** |
+| prefill WSMM (`COLI_MXFP4_WSMM` 0→1) | WMMA | gpu-ffn 8030-8554 ms | — |
+| | weight-stationary | gpu-ffn 6793-7102 ms | **1.19×** |
+
+Ranges do not overlap in either arm. WSMM moves prefill *wall* only −3.0%, because gpu-ffn
+is ~19% of V4 prefill where the 1.24× NVFP4 precedent had it at 62% of M2.7's — the kernel
+win transferred; the Amdahl share did not.
+
+**These kernels sum in a different order, so cross-kernel token identity is the wrong
+gate.** Tokens are identical across all 4 runs *within* each arm (both kernels
+deterministic — the dispatcher defaults to byte-per-lane rather than the uint32 mode, whose
+per-call selection reads the weight pointer and so varies with pooled buffer addresses),
+and differ *between* arms, as they must. Correctness is `gpu::tests::
+mxfp4_expert_ffn_gpu_matches_cpu_at_every_s` against `matmul_qt`, at S = 1/4/16/32/33 and
+at two shapes — 320×160 as well as 128×64, since K=128 runs the KT tile loop exactly once
+and proves nothing about the multi-tile accumulation every real expert does.
+
+### MXFP4 is now microbenchmarkable — and it is slower than NVFP4 (`7ec0ec6`, `c6526d9`)
+
+`coli gpubench` built nvfp4 and int8 rows only, so MXFP4 — the format V4 and K3 use for
+*every* routed expert — could not be measured except through a ~7-minute model run. It
+cannot join the matmul table (fmt 6 is expert-only; there is no dense
+`coli_cuda_matmul_mxfp4`, and adding one purely to feed a benchmark would ship a path
+nothing calls), so `gpubench` now prints a **second table sweeping the fused expert triple
+for both 4-bit formats**. One format alone answers nothing; the cross-format comparison is
+what made the first table worth having.
+
+`coli gpubench 1 300`, n=3-4, tight:
+
+Its first run found a 16% MXFP4 deficit, and the second and third runs closed it. The
+whole thing was **the scale decode, called once per weight BYTE** — `e8m0f` — and the
+isolation is worth reading as a method, one variable at a time on the v4-expert triple:
+
+| `e8m0f` variant | µs/call | note |
+|---|---|---|
+| `exp2f` (original) | 119.9 | one SFU instruction |
+| shift + 2 endpoint guards (`c6526d9`) | 116.6 | guards cost ~as much as exp2f did |
+| delegating to `e4m3f` (wrong values) | 99.1 | decode arithmetic alone |
+| **branchless shift (`a408d32`, shipped)** | **101.6** | |
+| ablated to a constant — no load at all | 91.4 | floor of the scale path |
+| *nvfp4 baseline, same shape* | *97.5* | |
+
+The two comparisons against `0xFF` and `0` cost **16.6 µs, 14% of the whole triple**.
+Branch form and predicated-select form measured identically, so it is the comparisons, not
+the control flow. Final state:
+
+| shape | fmt | µs/call | MB | GB/s |
+|---|---|---|---|---|
+| v4-expert 4096×2048 | nvfp4 | 96–100 | 14.2 | 168–176 |
+| v4-expert 4096×2048 | mxfp4 | **101–102** | 13.4 | 155–157 |
+| k3-expert 3584×3072 | nvfp4 | 139–144 | 18.6 | 145–152 |
+| k3-expert 3584×3072 | mxfp4 | **133–134** | 17.5 | 149–150 |
+
+MXFP4 is now within 3% of NVFP4 on V4's shape and **faster** on K3's — which is where it
+belongs, since it reads 6% fewer bytes. Output bit-identical on both models.
+
+**Two lessons worth more than the speedup.** First: at once-per-weight-byte, *any* couple
+of extra instructions in a dequant is ~14% of the kernel — `exp2f` was never the story,
+which is what `c6526d9`'s commit message got wrong. Second: the ablation that first looked
+decisive (`e8m0f → 1.0f`) was **invalid** — replacing the decode with a constant also lets
+the compiler delete the *load* and the multiply, so it measured three things. The matched
+ablation (both formats) and the decoder swap (same load, different arithmetic) are what
+actually separated them.
+
+Removing the guards deviates from OCP at two byte values (`0xFF` → +inf not NaN, `0` → +0.0
+not subnormal 2^-127). Justified on evidence: **177M real block-scale bytes scanned across
+600 routed-expert tensors — V4 spans 119..124, K3 spans 113..123, zero occurrences of
+either endpoint** — plus b=0 puts every weight in its block below the ULP of an f32
+accumulator that has seen one normal term.
+
+**End-to-end, it is smaller than the microbenchmark and partly unresolved.** Two binaries
+from the same tree differing only in `e8m0f`, ABBA-interleaved, n=4 per arm, V4 512-token
+prompt at NGEN 16:
+
+| metric | guards | branchless | |
+|---|---|---|---|
+| `gpu-ffn` (ms, cumulative) | 7397–7699 | 6960–7159 | **−6.9%, ranges disjoint** |
+| `moe` (ms) | 17634–18191 | 16770–17517 | **−4.9%, ranges disjoint** |
+| decode tok/s | 4.67–4.85 | 4.82–4.93 | +2.1%, **ranges OVERLAP** |
+| prefill (ms) | 41324–42245 | 40227–41366 | −2.2%, overlap |
+
+So: 13% on the isolated triple → 6.9% on cumulative `gpu-ffn` → **~2% on decode, which n=4
+cannot separate from noise.** Quote the kernel number as a kernel number. All 8 runs across
+both arms emitted one identical token sequence, which is the strongest form of the
+exactness claim — old and new are byte-for-byte the same model.
+
+**Fleet safety.** Only V4 and K3 reach these kernels; the other four models are NVFP4
+(fmt 5) and untouched. K3 goes through the situ variant, which the same commit rewires, so
+it was re-run end to end (16-token prompt, 3 gen, both GEMV modes): **tokens identical
+across arms** (`[276, 7612, 318]`), 0.39 vs 0.38 tok/s, 15339 vs 15330 expert FFNs
+dispatched. K3 is SSD-bound at its ~0.4 tok/s floor, so an expert-compute kernel is
+invisible to it — correct, and no faster.
+
+### DSpark: DO NOT BUILD THE FORWARD — a fine-grained MoE cannot amortize a verify
+
+Five previous cost models for this were written and every one was contradicted by
+measurement, so this is measured. `coli gen` with `COLI_NGEN=1` on a prompt of S tokens is
+exactly **one forward of S rows**, so its profile totals *are* cost(S) — no differencing.
+MoE has no context dependence (an expert sees `[S, 4096]` wherever the tokens sit), so a
+short prompt measures the MoE term correctly. Mean of 2 reps, which agreed closely:
+
+| S | gpu-ffn | ×(S=1) | expert-load | ×(S=1) | moe | ×(S=1) |
+|---|---|---|---|---|---|---|
+| 1 | 45 ms | 1.00 | 313 ms | 1.00 | 438 ms | 1.00 |
+| 2 | 92 | 2.04 | 389 | 1.24 | 563 | 1.29 |
+| 4 | 173 | 3.83 | 567 | 1.81 | 817 | 1.87 |
+| 6 | 230 | **5.11** | 696 | 2.22 | 992 | **2.27** |
+| 8 | 299 | 6.64 | 838 | 2.68 | 1211 | 2.77 |
+
+**`gpu-ffn` is essentially linear in rows.** That is the whole answer. V4 routes top-6 of
+256, so six rows almost never share an expert: a 6-row verify does ~6× the expert weight
+reads, and expert weight reading is what `gpu-ffn` costs. The amortization that makes
+speculative decoding pay in a dense model — many rows through one weight matrix — does not
+exist here. Only `expert-load` amortizes (2.22× at 6 rows), because the *union* of experts
+grows sublinearly.
+
+With MoE at ~74% of a decode step (`moe` 177.5 ms of ~240 ms, NGEN 1→16, n=2) and
+`dspark_block_size` 5 ⇒ a 6-row verify:
+
+| attention scaling assumption | verify / decode | best case (100% accept) | break-even accept |
+|---|---|---|---|
+| free (idle GPU absorbs 6 queries) | 1.94× | 3.1× | **~49%** |
+| linear (6×) | 3.24× | 1.85× | **~74%** |
+
+Against a **~24-25% measured acceptance** (Nemotron's MTP), expected tokens per verify is
+`(1-a⁶)/(1-a)` = 1.33, giving **0.69× to 0.41× — a 31-59% loss**. And that is before the
+draft head's 11.2 GB (768 experts across 3 stages) competes for residency on a box already
+44 GiB short, which slows the base case too.
+
+Converter and loader stay (`COLI_DSPARK=1`, container `-v3`); the forward is not worth
+writing. **Revisit only if V4's acceptance is shown to be ~2× Nemotron's, or if the expert
+compute stops being per-row-linear.**
+
+*Caveat on the attention row:* it is a bound, not a measurement. Attention per decode
+forward could not be resolved here — prefill contributes ~15 s of `attn` with ~1.5 s of
+run-to-run spread, against ~1-2 s from 15 decode forwards, so two of the four NGEN
+differences came out **negative**. That is this file's own precision warning, demonstrated.
+The MoE row, which decides the verdict, is well determined (159.8 and 195.3 ms/forward).
+
 ## Cross-model transfer queue
 
 **Findings established on one model that have NOT been checked on the others.** This is the

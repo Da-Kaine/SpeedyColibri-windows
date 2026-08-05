@@ -27,6 +27,78 @@ pub struct Layer {
     pub q_a_ln: Vec<f32>,
     pub kv_a_ln: Vec<f32>,
 
+    // DeepSeek-V4 output projection: a LoRA PAIR replacing the single `o` above.
+    // `o_a` is [n_groups*o_lora_rank, n_heads*head_dim/n_groups] and `o_b` is
+    // [hidden, n_groups*o_lora_rank] (`o_groups` 8, `o_lora_rank` 1024). V3 and every
+    // other arch here have a plain `o_proj`, so these are None elsewhere and `o` is
+    // left empty on V4 — the two are mutually exclusive, never both populated.
+    pub o_a: Option<QTensor>,
+    pub o_b: Option<QTensor>,
+    /// `o_a` pre-split into its `o_groups` row-blocks. V4's O-LoRA is block-diagonal —
+    /// group `gi`'s rows read only group `gi`'s slice of the attention output — so the
+    /// operation is `g` independent matmuls, not one big one. Split once at load so each
+    /// takes the ordinary `matmul_qt` path; dequantizing `o_a` whole would be 134 MB per
+    /// layer. Empty unless the arch has an O-LoRA.
+    pub o_a_groups: Vec<QTensor>,
+    // Per-head attention sink, f32 [n_heads] (DeepSeek-V4). Empty elsewhere.
+    pub attn_sink: Vec<f32>,
+
+    // DeepSeek-V4 Hyper-Connections, one set per sublayer (attention and FFN). These are
+    // the weights of the RESIDUAL STREAM itself, not of a sublayer: `hc_pre` collapses the
+    // `hc_mult` copies into one using them, and `hc_post` expands back. All f32 in the
+    // checkpoint and small enough to stay dense:
+    //   `*_fn`    [mix_width(hc), hc*hidden]  = [24, 16384] at hc=4, hidden=4096
+    //   `*_base`  [mix_width(hc)]             = [24]
+    //   `*_scale` [3]
+    // Empty on every other arch. Without them a V4 model loads and computes garbage, so
+    // the loader treats a missing set on a V4 checkpoint as an error rather than a default.
+    // DeepSeek-V4 Compressor (41 of 43 layers). Learned gated pooling over `comp_ratio`
+    // consecutive tokens, producing the compressed KV that carries ALL context beyond the
+    // 128-token raw window — so this is not an optimisation, it is how V4 has long context
+    // at all. `comp_ratio == 0` means this layer has no compressor.
+    //
+    // Ratio 4 turns on OVERLAPPING windows, which doubles the projection width: `coff` is
+    // `1 + (ratio == 4)`, so `comp_wkv`/`comp_wgate` are [coff*head_dim, hidden] and
+    // `comp_ape` is [ratio, coff*head_dim]. The shapes therefore depend on the ratio, and
+    // getting the ratio wrong is a load error rather than a silent numeric one.
+    // DeepSeek-V4 Indexer (21 of 43 layers): picks which compressed blocks attention
+    // actually keys on. It carries its OWN Compressor — same algorithm as the main one but
+    // at `index_head_dim` (128) instead of `head_dim` (512), so `compress_prefill` /
+    // `compress_decode` serve both unchanged — plus a q projection off the SHARED q-LoRA
+    // bottleneck and a per-head weighting.
+    //
+    // Distinct from `ix_wk`/`ix_wq`/`ix_wp` above, which are GLM's DSA indexer: that one
+    // scores raw keys, this one scores compressed blocks and has no `wk` at all. V4 is
+    // excluded from the GLM arm for exactly that reason.
+    pub idx_wq_b: Option<QTensor>,
+    pub idx_wproj: Option<QTensor>,
+    pub idx_comp_wkv: Option<QTensor>,
+    pub idx_comp_wgate: Option<QTensor>,
+    pub idx_comp_ape: Vec<f32>,
+    pub idx_comp_norm: Vec<f32>,
+
+    pub comp_ratio: i32,
+    pub comp_wkv: Option<QTensor>,
+    pub comp_wgate: Option<QTensor>,
+    pub comp_ape: Vec<f32>,
+    pub comp_norm: Vec<f32>,
+    /// DeepSeek-V4 hash routing: `[vocab, topk]` flattened, expert IDs. Non-empty only on
+    /// the first `n_hash_layers` (3) layers. `u32` rather than `Vec<f32>` because these
+    /// are indices — the container stores them as exactly-representable f32 only to avoid
+    /// an integer tensor path used by one tensor, and they are converted once, at load.
+    pub tid2eid: Vec<u32>,
+
+    pub hc_attn_fn: Vec<f32>,
+    pub hc_attn_base: Vec<f32>,
+    pub hc_attn_scale: Vec<f32>,
+    pub hc_ffn_fn: Vec<f32>,
+    pub hc_ffn_base: Vec<f32>,
+    pub hc_ffn_scale: Vec<f32>,
+    // V4's per-sublayer input norms are NOT separate fields: the converter canonicalizes
+    // `attn_norm`/`ffn_norm` to `input_layernorm`/`post_attention_layernorm`, so they land
+    // in `in_ln`/`post_ln` like every other arch. The reference applies each AFTER
+    // `hc_pre` and before the sublayer, which is the only V4-specific part.
+
     // GQA (MiniMax-M3, arch == MinimaxM3): standard q/k/v projections with per-head
     // QK-norm; RoPE is partial (see Config::qk_rope). `None`/empty on GLM, which
     // uses the MLA fields above instead. `o` (above) is the shared output proj.
@@ -137,6 +209,38 @@ pub struct Layer {
     /// Kimi-K3 latent-MoE: RMSNorm applied in the `moe_latent` space, `[moe_latent]`.
     pub routed_expert_norm: Vec<f32>,
 }
+/// DeepSeek-V4's DSpark speculative head — the reference's "DSpark stages stored under the
+/// `mtp.*` checkpoint namespace", at layer indices `n_layers .. n_layers + stages.len()`.
+///
+/// A stage IS a V4 block (attention + MoE + Hyper-Connections), so each one loads through
+/// the ordinary layer loader. What makes it its own type is the extras: stage 0 projects
+/// the concatenated hidden states of `cfg.dspark_targets` down to one hidden width, and the
+/// LAST stage owns the vocabulary heads.
+///
+/// **Each stage carries its own 256-expert pool** — 10.3 GB of the head's ~11.2 GB. On a
+/// box that is already short of full residency for the main model, loading this competes
+/// with it. That is why it is opt-in.
+pub struct DsparkHead {
+    /// the stages in execution order; each a full V4 block
+    pub stages: Vec<Layer>,
+    /// stage 0: `[dim, dim * dspark_targets.len()]`, then `main_norm`
+    pub main_proj: Option<QTensor>,
+    pub main_norm: Vec<f32>,
+    /// last stage: final norm before the vocabulary head
+    pub norm: Vec<f32>,
+    /// last stage: rank-`markov_rank` token embedding and its head, a per-position logit
+    /// bias applied while sampling the drafted block
+    pub markov_w1: Option<QTensor>,
+    pub markov_w2: Option<QTensor>,
+    /// last stage: `[1, dim + markov_rank]`, scores the drafted block. Kept f32 — it is
+    /// one row, so quantising it buys nothing.
+    pub confidence: Vec<f32>,
+    /// last stage: its own Hyper-Connection head (plain sigmoid gate, no Sinkhorn)
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+}
+
 
 /// The MTP (multi-token prediction) speculative head — port of the `mtpL` /
 /// `eh_proj` / `enorm` / `hnorm` / `mtp_norm` members of the C `Model`.
@@ -219,6 +323,21 @@ pub struct KvCache {
     k_rot: Vec<Vec<f32>>,
     /// GQA full-KV width (`n_kv_heads * head_dim`); 0 on the MLA (GLM) path.
     kv_dim: usize,
+    /// DeepSeek-V4 compressed KV: per-layer `[max_blocks * head_dim]`, empty on layers
+    /// without a Compressor and on every other arch. See `comp_init`.
+    comp: Vec<Vec<f32>>,
+    comp_len: Vec<usize>,
+    comp_state: Vec<Option<crate::dsv4::CompressorState>>,
+    comp_dim: usize,
+    /// DeepSeek-V4 **Indexer** compressed KV. Same shape as `comp` but at
+    /// `index_head_dim` (128, not 512) and only on the layers whose `compress_ratio` is 4.
+    /// The Indexer owns a SEPARATE Compressor constructed with `rotate=True`, so these
+    /// rows are Hadamard-rotated and FP4-simulated — they are not a view of `comp`, and
+    /// scoring against `comp` instead would silently compare against the wrong space.
+    icomp: Vec<Vec<f32>>,
+    icomp_len: Vec<usize>,
+    icomp_state: Vec<Option<crate::dsv4::CompressorState>>,
+    icomp_dim: usize,
     /// per-layer full key buffer, each `[max_t * kv_dim]` — GQA only (else empty).
     k_full: Vec<Vec<f32>>,
     /// per-layer full value buffer, each `[max_t * kv_dim]` — GQA only (else empty).
@@ -289,6 +408,16 @@ impl KvCache {
     /// not with `max_t` — one that stops early never pays for the unused tail.
     pub fn new(n_rows: usize, kv_lora: usize, qk_rope: usize, max_t: usize) -> KvCache {
         KvCache {
+            // DeepSeek-V4 compressed KV — empty until `comp_init`; every other arch
+            // leaves them empty for the cache's lifetime.
+            comp: Vec::new(),
+            comp_len: Vec::new(),
+            comp_state: Vec::new(),
+            comp_dim: 0,
+            icomp: Vec::new(),
+            icomp_len: Vec::new(),
+            icomp_state: Vec::new(),
+            icomp_dim: 0,
             max_t,
             kv_lora,
             qk_rope,
@@ -510,7 +639,32 @@ impl KvCache {
             0
         };
         let device_shadow = if cfg!(feature = "cuda") { mla } else { 0 };
-        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4
+        Self::kv_layers(cfg) * (mla + gqa_full + device_shadow) * 4 + Self::compressed_bytes_per_token(cfg)
+    }
+
+    /// DeepSeek-V4's compressed KV, per token.
+    ///
+    /// A compressor layer emits one `qk_head`-wide row every `compress_ratio` tokens, so
+    /// it costs `qk_head / ratio` floats per token — 128 floats on a ratio-4 layer, 4 on a
+    /// ratio-128 one. Layers with an Indexer (`ratio == 4`) carry a SECOND set at
+    /// `index_hd`. Zero on every other arch, where `compress_ratios` is empty.
+    ///
+    /// This was missing entirely: the compressed rows are the only reason V4 has context
+    /// past its 128-token window, so leaving them out of the reservation under-commits by
+    /// more the longer the sequence — exactly backwards.
+    fn compressed_bytes_per_token(cfg: &Config) -> usize {
+        let n = cfg.layer_kind.len().max(cfg.n_layers as usize);
+        cfg.compress_ratios
+            .iter()
+            .take(n)
+            .filter(|&&r| r > 0)
+            .map(|&r| {
+                let r = r as usize;
+                let main = cfg.qk_head as usize / r;
+                let idx = if r == 4 { cfg.index_hd as usize / r } else { 0 };
+                (main + idx) * 4
+            })
+            .sum()
     }
 
     /// Per-sequence KV bytes that do **not** scale with context length: the recurrent
@@ -602,6 +756,109 @@ impl KvCache {
     }
     pub fn latent_row_mut(&mut self, layer: usize, pos: usize) -> &mut [f32] {
         &mut self.latent[layer][pos * self.kv_lora..(pos + 1) * self.kv_lora]
+    }
+
+    /// DeepSeek-V4 compressed-KV rows and the per-layer Compressor carry state.
+    ///
+    /// Lazily sized: only the 41 layers that HAVE a compressor get buffers, and a model
+    /// without one keeps these empty. `comp_len[layer]` is how many compressed rows exist
+    /// so far — it advances once every `compress_ratio` tokens, not once per token, which
+    /// is the whole point of the mechanism.
+    pub fn comp_init(&mut self, n_layers: usize, ratios: &[i32], head_dim: usize, max_blocks: usize) {
+        self.comp = (0..n_layers)
+            .map(|i| {
+                let r = ratios.get(i).copied().unwrap_or(0);
+                if r > 0 { vec![0f32; max_blocks * head_dim] } else { Vec::new() }
+            })
+            .collect();
+        self.comp_len = vec![0usize; n_layers];
+        self.comp_state = (0..n_layers)
+            .map(|i| {
+                let r = ratios.get(i).copied().unwrap_or(0);
+                (r > 0).then(|| crate::dsv4::CompressorState::new(r as usize, head_dim))
+            })
+            .collect();
+        self.comp_dim = head_dim;
+    }
+
+    /// Append one compressed row to `layer`. Silently drops past capacity rather than
+    /// panicking mid-generation — the caller sizes `max_blocks` from `max_t / min_ratio`.
+    pub fn comp_push(&mut self, layer: usize, row: &[f32]) {
+        let d = self.comp_dim;
+        let n = self.comp_len[layer];
+        if (n + 1) * d <= self.comp[layer].len() {
+            self.comp[layer][n * d..(n + 1) * d].copy_from_slice(row);
+            self.comp_len[layer] = n + 1;
+        }
+    }
+
+    /// The compressed rows written so far for `layer`. Empty when the Compressor is off
+    /// or the layer has none — returning a slice rather than indexing, because the caller
+    /// asks unconditionally and `comp` is only allocated when `comp_init` runs.
+    pub fn comp_rows(&self, layer: usize) -> &[f32] {
+        match self.comp.get(layer) {
+            Some(v) => &v[..self.comp_len[layer] * self.comp_dim],
+            None => &[],
+        }
+    }
+
+    /// Whether `comp_init` has run (buffers allocated).
+    pub fn comp_rows_len(&self) -> usize {
+        self.comp.len()
+    }
+
+    /// Mutable access to a layer's Compressor carry state.
+    pub fn comp_state_mut(&mut self, layer: usize) -> Option<&mut crate::dsv4::CompressorState> {
+        self.comp_state.get_mut(layer).and_then(|o| o.as_mut())
+    }
+
+    /// Allocate the Indexer's compressed KV — only on layers where `ratios[i] == want`
+    /// (V4 builds an Indexer exactly when `compress_ratio == 4`), at `index_head_dim`.
+    pub fn icomp_init(
+        &mut self,
+        n_layers: usize,
+        ratios: &[i32],
+        want: i32,
+        head_dim: usize,
+        max_blocks: usize,
+    ) {
+        let has = |i: usize| ratios.get(i).copied().unwrap_or(0) == want;
+        self.icomp = (0..n_layers)
+            .map(|i| if has(i) { vec![0f32; max_blocks * head_dim] } else { Vec::new() })
+            .collect();
+        self.icomp_len = vec![0usize; n_layers];
+        self.icomp_state = (0..n_layers)
+            .map(|i| has(i).then(|| crate::dsv4::CompressorState::new(want as usize, head_dim)))
+            .collect();
+        self.icomp_dim = head_dim;
+    }
+
+    /// Append one Indexer compressed row. Drops past capacity, like [`Self::comp_push`].
+    pub fn icomp_push(&mut self, layer: usize, row: &[f32]) {
+        let d = self.icomp_dim;
+        let n = self.icomp_len[layer];
+        if (n + 1) * d <= self.icomp[layer].len() {
+            self.icomp[layer][n * d..(n + 1) * d].copy_from_slice(row);
+            self.icomp_len[layer] = n + 1;
+        }
+    }
+
+    /// The Indexer compressed rows written so far for `layer`; empty when it has none.
+    pub fn icomp_rows(&self, layer: usize) -> &[f32] {
+        match self.icomp.get(layer) {
+            Some(v) => &v[..self.icomp_len[layer] * self.icomp_dim],
+            None => &[],
+        }
+    }
+
+    /// Whether [`Self::icomp_init`] has run.
+    pub fn icomp_ready(&self) -> bool {
+        !self.icomp.is_empty()
+    }
+
+    /// Mutable access to a layer's Indexer-Compressor carry state.
+    pub fn icomp_state_mut(&mut self, layer: usize) -> Option<&mut crate::dsv4::CompressorState> {
+        self.icomp_state.get_mut(layer).and_then(|o| o.as_mut())
     }
 
     /// Roped k_rot row for `(layer, pos)`.
@@ -734,6 +991,14 @@ pub struct Model {
     pub output_attn_res_norm: Vec<f32>,
     pub output_attn_res_proj: Vec<f32>,
 
+    /// DeepSeek-V4's model-level Hyper-Connection head: the final `[hc, hidden] -> [hidden]`
+    /// collapse before `final_norm` and the LM head. Unlike the per-layer `hc_pre` this has
+    /// **no Sinkhorn** — a plain sigmoid gate — and `hc_head_scale` is a single scalar where
+    /// the per-layer one is a 3-vector. Empty on every other arch.
+    pub hc_head_fn: Vec<f32>,
+    pub hc_head_base: Vec<f32>,
+    pub hc_head_scale: f32,
+
     /// whether the DSA lightning indexer weights are present
     pub has_dsa: bool,
     /// whether the native MTP speculative head is present and loaded
@@ -743,6 +1008,10 @@ pub struct Model {
     /// was not set. `None` on the default containers, which are converted without
     /// `--mtp`.
     pub mtp: Option<MtpHead>,
+    /// DeepSeek-V4's DSpark drafting head. `None` unless `COLI_DSPARK=1` AND the container
+    /// actually ships it — it costs ~11.2 GB, most of it three private 256-expert pools,
+    /// so it is never loaded just because the weights are there.
+    pub dspark: Option<DsparkHead>,
 }
 
 impl Layer {
@@ -762,6 +1031,33 @@ impl Layer {
             + q(&self.kv_a)
             + q(&self.kv_b)
             + q(&self.o)
+            + oq(&self.o_a)
+            + oq(&self.o_b)
+            + self.o_a_groups.iter().map(&q).sum::<u64>()
+            // Not via `v`: this is a Vec<u32>, and the field-count guard below keys on the
+            // `Vec<f32>` declarations. 3.1 MB on each of the three hash layers.
+            + (self.tid2eid.len() * 4) as u64
+            + v(&self.attn_sink)
+            // Hyper-Connections. `*_fn` is the big one: [24, 16384] f32 = 1.5 MB per
+            // sublayer, so 3.1 MB per layer and ~135 MB across V4's 43 layers — small
+            // against 145 GB, but omitting it is the exact silent over-generous budget
+            // this function's doc warns about.
+            + oq(&self.idx_wq_b)
+            + oq(&self.idx_wproj)
+            + oq(&self.idx_comp_wkv)
+            + oq(&self.idx_comp_wgate)
+            + v(&self.idx_comp_ape)
+            + v(&self.idx_comp_norm)
+            + oq(&self.comp_wkv)
+            + oq(&self.comp_wgate)
+            + v(&self.comp_ape)
+            + v(&self.comp_norm)
+            + v(&self.hc_attn_fn)
+            + v(&self.hc_attn_base)
+            + v(&self.hc_attn_scale)
+            + v(&self.hc_ffn_fn)
+            + v(&self.hc_ffn_base)
+            + v(&self.hc_ffn_scale)
             + q(&self.gate_proj)
             + q(&self.up_proj)
             + q(&self.down_proj)
@@ -839,6 +1135,21 @@ impl Model {
         n += (self.final_norm.len() * 4) as u64;
         for l in &self.layers {
             n += l.resident_bytes();
+        }
+        // DSpark's stages are Layers too, and they are NOT in `self.layers`. Omitting them
+        // is the same silent under-count this function's doc warns about: the budget comes
+        // out too generous by the head's dense weight and the expert cache overcommits.
+        if let Some(d) = &self.dspark {
+            for l in &d.stages {
+                n += l.resident_bytes();
+            }
+            n += [&d.main_norm, &d.norm, &d.confidence, &d.hc_head_fn, &d.hc_head_base]
+                .iter()
+                .map(|v| (v.len() * 4) as u64)
+                .sum::<u64>();
+            for t in [&d.main_proj, &d.markov_w1, &d.markov_w2] {
+                n += t.as_ref().map(|t| t.bytes().max(0) as u64).unwrap_or(0);
+            }
         }
         n
     }

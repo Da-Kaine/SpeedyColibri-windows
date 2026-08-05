@@ -1088,6 +1088,13 @@ fn ffn(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, out: 
             ) {
                 return;
             }
+        } else if crate::gpu::try_expert_ffn_mxfp4(gate, up, down, x, nr, out) {
+            // MXFP4 SwiGLU experts (DeepSeek-V4). Tried BEFORE `try_expert_ffn`: that path
+            // ends in `coli_cuda_expert_mlp`, which reads block scales as a per-row f32
+            // array. It used to launch anyway and take an illegal memory access, which —
+            // CUDA errors being sticky — dropped the whole process to the CPU matmul. It
+            // now declines, so the ordering is belt-and-braces rather than load-bearing.
+            return;
         } else if crate::gpu::try_expert_ffn(gate, up, down, x, nr, out) {
             return;
         }
@@ -1131,6 +1138,13 @@ fn ffn_cpu(gate: &QTensor, up: &QTensor, down: &QTensor, x: &[f32], nr: usize, o
             crate::math::situ(*g, u, a.situ_beta, a.situ_linear_beta)
         } else if a.oai {
             crate::math::swiglu_oai(*g, u, a.alpha, a.limit)
+        } else if a.limit > 0.0 {
+            // DeepSeek-V4: plain SwiGLU with the reference's ASYMMETRIC clamp — `up` on
+            // both sides, `gate` only from above (silu already bounds it below). This is
+            // NOT the oai arm above: that one multiplies by `(u + 1)` and gates with
+            // `sigmoid(alpha*g)`, which V4 does not do. The clamps happen to be identical,
+            // which is exactly why reusing `oai` here would have looked right.
+            crate::dsv4::swiglu_clamped_one(*g, u, a.limit)
         } else {
             silu(*g) * u
         };
@@ -1252,6 +1266,25 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
             crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+        } else if dsv4_group_moe() && !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 6) {
+            // MXFP4 SwiGLU (DeepSeek-V4) — MEASURED NEGATIVE, so opt-in only.
+            //
+            // V4 had no grouped arm at all and fell to the per-expert call: 301 dispatches
+            // per decode token (43 layers x 6 routed + 43 shared), each paying its own
+            // scratch mutex, staging memcpys and a full `cudaStreamSynchronize`. Grouping
+            // cuts that to 43 — one per layer, confirmed by the counter — and tokens are
+            // identical. It is still SLOWER:
+            //
+            //   gather+gpu-ffn+scatter  0.8 + 57.3 + 1.9 = 60.0 ms/tok   (per-expert)
+            //   grouped `group` block                     66.2 ms/tok   (~10% worse)
+            //   decode total            239 -> 251 ms/tok
+            //
+            // So the syncs were never the cost: 190 us/dispatch is the 13.37 MB MXFP4
+            // weight read, and grouping only adds row-staging into `x_all`/`y_all` plus the
+            // chunking and per-call tensor wrapping. **Dispatch count was the wrong
+            // target.** A real win needs fewer BYTES or a fused kernel that keeps the
+            // weights resident across experts, not fewer launches.
+            crate::gpu::try_expert_group_packed(&active, activations, d, &mut out, 6)
         } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
@@ -3301,4 +3334,139 @@ mod tests {
             }
         }
     }
+}
+
+/// DeepSeek-V4's MoE sublayer: `sqrtsoftplus` + `noaux_tc` routing over 256 experts
+/// (top-6) at model `hidden` — NOT in a latent bottleneck like Nemotron-H or K3 — plus one
+/// shared expert.
+///
+/// ⚠️ **KNOWN GAP: the expert activation is the standard SwiGLU, not V4's clamped one.**
+/// V4 sets `swiglu_limit` 10.0 and the reference clamps the product asymmetrically (`up`
+/// both sides, `gate` only from above, because silu already bounds it below);
+/// [`crate::dsv4::swiglu_clamped`] implements that and is verified, but the shared
+/// `compute_experts_partial` path applies the activation internally. Wiring it through is
+/// a change to that shared path, so it is called out here rather than left to look
+/// correct. Outputs will differ from the reference wherever the product exceeds ±10.
+#[allow(clippy::too_many_arguments)]
+/// Route DeepSeek-V4's MXFP4 experts through the grouped kernel (`COLI_DSV4_GROUP_MOE=1`).
+///
+/// Default OFF because it MEASURED SLOWER — see the call site. Kept because the code is
+/// correct (tokens identical, 301 -> 43 dispatches) and is the starting point for a fused
+/// weight-stationary attempt, which is the version that could actually pay.
+fn dsv4_group_moe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSV4_GROUP_MOE").ok().as_deref() == Some("1"))
+}
+
+
+pub fn dsv4_moe<P: ExpertProvider>(
+    cfg: &Config,
+    l: &Layer,
+    layer: usize,
+    x: &[f32],
+    s_len: usize,
+    ids: &[i32],
+    out: &mut [f32],
+    provider: &P,
+) -> io::Result<()> {
+    let d = cfg.hidden as usize;
+    let e_n = cfg.n_experts as usize;
+    let k = (cfg.topk as usize).min(e_n);
+
+    let mut logits = vec![0f32; s_len * e_n];
+    let _rt = std::time::Instant::now();
+    router_matmul(&mut logits, x, &l.router, s_len, d, e_n);
+    if crate::forward::profile_on() {
+        crate::forward::ROUTER_US
+            .fetch_add(_rt.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // `route_topk` applies sqrt(softplus(z)) for the WEIGHTS and adds the bias only for
+    // SELECTION (noaux_tc).
+    //
+    // The first `n_hash_layers` layers replace SELECTION with `tid2eid[token_id]` and keep
+    // the same weights — see `route_hash`. `tid2eid` is empty on every other layer and on
+    // containers converted before it was kept, so this falls back to score routing rather
+    // than failing; that fallback is what those 3 layers did unconditionally before.
+    let hash = !l.tid2eid.is_empty() && ids.len() == s_len;
+    debug_assert!(
+        l.tid2eid.is_empty() || ids.len() == s_len,
+        "hash layer {layer} got {} ids for {s_len} rows",
+        ids.len()
+    );
+    let mut idxs = vec![0usize; s_len * k];
+    let mut ws = vec![0f32; s_len * k];
+    let mut picked: Vec<(u32, f32)> = Vec::with_capacity(k);
+    for si in 0..s_len {
+        let row = &logits[si * e_n..(si + 1) * e_n];
+        if hash {
+            let t = ids[si].max(0) as usize;
+            let base = t * k;
+            let eids = l.tid2eid.get(base..base + k).unwrap_or(&[]);
+            crate::dsv4::route_hash(row, eids, cfg.routed_scale, &mut picked);
+        } else {
+            crate::dsv4::route_topk(row, &l.router_bias, k, cfg.routed_scale, &mut picked);
+        }
+        for (j, &(e, w)) in picked.iter().enumerate() {
+            idxs[si * k + j] = e as usize;
+            ws[si * k + j] = w;
+        }
+        // A hash row can yield FEWER than k entries when the table repeats an expert
+        // (merged by `route_hash`). Pad the tail with the first pick at weight 0 so the
+        // fixed-stride union sees no stale index from a previous row.
+        for j in picked.len()..k {
+            idxs[si * k + j] = picked.first().map(|&(e, _)| e as usize).unwrap_or(0);
+            ws[si * k + j] = 0.0;
+        }
+    }
+    log_routing(layer, s_len, k, &idxs);
+
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+    let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
+    let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
+
+    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
+    for (o, p) in out.iter_mut().zip(partial.iter()) {
+        *o += *p;
+    }
+
+    // Shared expert (weight 1.0, every position), same SwiGLU triple as the routed ones.
+    //
+    // MEASURED NEGATIVE — do not "overlap" this with the routed experts. It is the one
+    // concurrency in a V4 step that needs no prediction (it reads only `x`, nothing from
+    // the router), which makes it perpetually tempting: `compute_experts_partial` opens
+    // with a disk→RAM prefetch that holds no GPU state, so running the shared expert on
+    // its own thread beside it looks free. Tried 2026-08-05 (512-token prompt, NGEN 16):
+    //
+    //   - it works, completely: `shared 3552 ms | unhidden 3 ms` — 100% hidden.
+    //   - it is still a 15x LOSS: 4.16 -> 0.27 tok/s. Concurrent GPU work from a second
+    //     thread takes an illegal memory access, and a CUDA context error is sticky, so
+    //     the process re-inits the backend in a loop ("[CUDA] stream creation: an illegal
+    //     memory access was encountered") and every expert silently falls back to the CPU.
+    //     `scratch_mu` serializes the expert ENTRY points; something outside them is not
+    //     thread-safe, and this is the same family as the CUDA suite needing
+    //     `--test-threads=1`.
+    //   - and the prize is bounded: an NGEN 1-vs-16 difference puts `shared` at **19.4 ms
+    //     per decode forward**, ~8% of a ~220 ms decode token (and 1.8% of a whole run,
+    //     which is mostly prefill — quote whichever you mean). That is the CEILING, since
+    //     the overlap can hide at most all of it.
+    //
+    // ~8% of decode is not worth making the device-context path thread-safe for all five
+    // models, given the failure mode is a sticky context error that silently drops every
+    // expert to the CPU.
+    if cfg.n_shared > 0 {
+        let _st = std::time::Instant::now();
+        let mut sh = vec![0f32; s_len * d];
+        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
+        for (o, &v) in out.iter_mut().zip(sh.iter()) {
+            *o += v;
+        }
+        if crate::forward::profile_on() {
+            crate::forward::SHARED_US
+                .fetch_add(_st.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    Ok(())
 }

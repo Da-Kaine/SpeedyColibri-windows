@@ -359,6 +359,68 @@ fn nemotron_layer_forward<P: ExpertProvider>(
     Ok(())
 }
 
+/// Run the DeepSeek-V4 Compressor (`COLI_DSV4_COMPRESS=1`, default ON).
+///
+/// The Compressor is how V4 has context past `sliding_window`; without it the model is
+/// exact to 128 tokens and wrong beyond. The knob exists to A/B its cost, not because
+/// running it is optional for correctness.
+fn dsv4_compress_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSV4_COMPRESS").ok().as_deref() != Some("0"))
+}
+
+/// Run the DeepSeek-V4 Indexer (`COLI_DSV4_INDEXER=0` to disable, default ON).
+///
+/// Selects which compressed rows a query attends to on the 21 `compress_ratio == 4`
+/// layers. Disabling it falls back to attending to ALL closed compressed rows, which is
+/// what the ratio-128 layers do anyway — so the two arms are IDENTICAL below 2048 tokens
+/// of context and diverge only past it. That makes the knob a real A/B rather than a
+/// correctness switch, and it is the cheap way to attribute a long-context change.
+fn dsv4_indexer_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_DSV4_INDEXER").ok().as_deref() != Some("0"))
+}
+
+/// How much the Indexer actually pruned: queries that reached the SCORING path, candidate
+/// rows they considered, and rows they kept.
+///
+/// This exists because the obvious end-to-end A/B cannot tell success from a no-op. The
+/// Indexer is designed to drop the LEAST relevant rows, so "tokens unchanged" is the
+/// expected result when it works — and also exactly what a silently-skipped Indexer
+/// produces. Counting the pruning distinguishes them; nothing else observable does.
+static IDX_SCORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static IDX_SKIP_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(queries scored, candidate rows seen, rows kept)`. All zero means the scoring path
+/// never ran — either the context is too short to prune, or it is not wired up.
+pub fn dsv4_indexer_stats() -> (u64, u64, u64) {
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    (IDX_SCORED.load(rel), IDX_SEEN.load(rel), IDX_KEPT.load(rel))
+}
+
+/// `(queries that took the keep-everything shortcut, the largest candidate count among
+/// them)`. If that maximum ever exceeds `index_topk`, the shortcut fired when it should
+/// have scored — which is the difference between "nothing to prune" and "did not prune".
+pub fn dsv4_indexer_skips() -> (u64, u64) {
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    (IDX_SKIPPED.load(rel), IDX_SKIP_MAX.load(rel))
+}
+
+/// How many compressed rows the Indexer keeps per query. `index_topk` (512) unless
+/// `COLI_DSV4_INDEX_TOPK` overrides it — a TEST knob: at 512 the selection cannot bite
+/// until 2048 tokens of context, so verifying it end-to-end costs a ten-minute prefill.
+/// Lowering it makes the same code path reachable in seconds.
+fn dsv4_index_topk(cfg: &colibri_core::Config) -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let ov = *OVERRIDE.get_or_init(|| {
+        std::env::var("COLI_DSV4_INDEX_TOPK").ok().and_then(|v| v.parse::<usize>().ok())
+    });
+    ov.unwrap_or_else(|| cfg.index_topk.max(0) as usize)
+}
+
 /// Skip convolving the conv1d history rows whose outputs the caller discards (default on).
 /// `COLI_CONV_HIST=1` computes them anyway, which is the pre-2026-08-03 behaviour.
 fn conv_skip_hist() -> bool {
@@ -1001,6 +1063,14 @@ pub fn forward<P: ExpertProvider>(
     // gemv over its prefill would only cost speed for a case that cannot arise.
     if cfg.arch == Arch::KimiK3 {
         return kimi_forward(model, kv, provider, ids, pos_base, hidden_out);
+    }
+
+    // DeepSeek-V4 likewise owns its loop: Hyper-Connections make the residual stream
+    // `[s, hc_mult, hidden]`, so there is no single hidden vector for the shared loop to
+    // carry. Gated on `hc_mult` rather than on the arch tag so a V4 variant that ships
+    // without HC would take the ordinary path instead of indexing copies it does not have.
+    if cfg.arch == Arch::DeepseekV4 && cfg.hc_mult > 0 {
+        return dsv4_forward(model, kv, provider, ids, pos_base, hidden_out);
     }
 
     // Small multi-token forwards (the MTP verify / replay) run the routed NVFP4 experts on
@@ -2072,4 +2142,691 @@ mod tests {
             "93 layers / block 12 -> boundaries at 0,12,..,84"
         );
     }
+}
+
+// ===================== DeepSeek-V4-Flash =====================
+//
+// V4 owns its layer loop for a stronger reason than Kimi-K3 does: its residual stream is
+// `[s, hc_mult, hidden]`, not `[s, hidden]`. Hyper-Connections keep `hc_mult` copies and
+// mix them with learned weights at every sublayer boundary, so there is no single hidden
+// vector to hand to the shared loop.
+//
+// Block order, transcribed from `Block.forward` in the reference `inference/model.py`:
+//
+//     residual = x
+//     x, post, comb = hc_pre(x, hc_attn_*)   # [hc,d] -> [d]
+//     x = attn_norm(x)                       # in_ln
+//     x = attn(x)
+//     x = hc_post(x, residual, post, comb)   # [d] -> [hc,d]
+//     residual = x                           # RE-TAKEN: the POST-ATTENTION stream
+//     x, post, comb = hc_pre(x, hc_ffn_*)
+//     x = ffn_norm(x)                        # post_ln
+//     x = ffn(x)
+//     x = hc_post(x, residual, post, comb)
+//
+// The second `residual = x` is load-bearing. Reusing the block input would typecheck and
+// still produce plausible activations.
+
+/// `cos`/`sin` rows for one absolute position.
+#[inline]
+fn v4_rope_rows<'a>(cos: &'a [f32], sin: &'a [f32], pos: usize, half: usize) -> (&'a [f32], &'a [f32]) {
+    (&cos[pos * half..(pos + 1) * half], &sin[pos * half..(pos + 1) * half])
+}
+
+/// One DeepSeek-V4 attention sublayer over `xn[s, hidden]` (already `hc_pre`'d and normed)
+/// into `out[s, hidden]`.
+#[allow(clippy::too_many_arguments)]
+/// Which compressed rows each query attends to.
+///
+/// Two regimes, and the reference picks between them per layer:
+/// - `compress_ratio == 128` (and any layer without an Indexer): **all** rows whose window
+///   has closed, `t < (p+1)/ratio` — `get_compress_topk_idxs`.
+/// - `compress_ratio == 4`: the **Indexer** scores every closed row and keeps the best
+///   `index_topk` (512).
+///
+/// Below 2048 tokens of context the two agree by construction: `end_pos/4 <= 512` means
+/// top-k keeps everything, and attention is a set operation so the reordering is
+/// invisible. The Indexer only starts DROPPING rows past that, which is exactly the
+/// regime it exists for — and a useful gate, since turning it on must not perturb a short
+/// generation at all.
+#[allow(clippy::too_many_arguments)]
+fn dsv4_compress_select(
+    cfg: &colibri_core::Config,
+    l: &Layer,
+    li: usize,
+    kv: &mut KvCache,
+    xn: &[f32],
+    q_lat: &[f32],
+    s: usize,
+    pos_base: usize,
+    ccos: &[f32],
+    csin: &[f32],
+    comp_avail: &dyn Fn(usize) -> usize,
+) -> Vec<Vec<usize>> {
+    let all = |kv: &KvCache| -> Vec<Vec<usize>> {
+        let _ = kv;
+        (0..s).map(|i| (0..comp_avail(pos_base + i)).collect()).collect()
+    };
+    // Say ONCE, out loud, why the Indexer is not selecting. Its success case is "tokens
+    // unchanged" — it drops the rows that scored lowest — so a structural skip is
+    // invisible in the output and indistinguishable from it working. That is not
+    // hypothetical: an end-to-end A/B at 2400 tokens came back byte-identical because the
+    // scoring path never ran at all.
+    let ratio = l.comp_ratio as usize;
+    // An Indexer exists ONLY where `compress_ratio == 4`. A ratio-128 layer attending to
+    // every closed row is `get_compress_topk_idxs`, i.e. correct — so it must not be
+    // reported as a fault. Reporting it was worse than saying nothing: it fired first,
+    // and a one-shot warning then hid the real reason on the layers that do have one.
+    let expected = ratio == 4;
+    let inactive = |why: &str| {
+        if !expected {
+            return;
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("[dsv4] indexer INACTIVE on a ratio-4 layer: {why}"));
+    };
+    if !dsv4_indexer_enabled() || ratio == 0 {
+        return all(kv);
+    }
+    let (Some(wq_b), Some(wproj)) = (l.idx_wq_b.as_ref(), l.idx_wproj.as_ref()) else {
+        inactive("no indexer.wq_b / weights_proj weights on the layer");
+        return all(kv);
+    };
+    let (Some(cwkv), Some(cwgate)) = (l.idx_comp_wkv.as_ref(), l.idx_comp_wgate.as_ref()) else {
+        inactive("indexer weights present but its compressor wkv/wgate are missing");
+        return all(kv);
+    };
+    if !kv.icomp_ready() {
+        inactive("icomp_init never ran — the indexer has nowhere to put its compressed KV");
+        return all(kv);
+    }
+
+    let nh = cfg.index_nh as usize;
+    let ihd = cfg.index_hd as usize;
+    let rd = cfg.qk_rope as usize;
+    let half = rd / 2;
+
+    // ---- the Indexer's OWN Compressor (rotate = true) ---------------------
+    // Same pooling as the main one, but at `index_head_dim` and finished with a Hadamard
+    // rotation + FP4 simulation instead of the FP8 sim on the non-rope dims. Scoring the
+    // query against the MAIN compressed rows instead would be silent and wrong: right
+    // shapes, different space.
+    let cw = cwkv.o as usize;
+    let mut ckv = vec![0f32; s * cw];
+    let mut csc = vec![0f32; s * cw];
+    matmul_qt(&mut ckv, xn, cwkv, s);
+    matmul_qt(&mut csc, xn, cwgate, s);
+    let mut rows: Vec<Vec<f32>> = Vec::new();
+    if let Some(st) = kv.icomp_state_mut(li) {
+        if pos_base == 0 {
+            rows = crate::dsv4::compress_prefill(&ckv, &csc, &l.idx_comp_ape, s, ratio, ihd, st)
+                .chunks_exact(ihd)
+                .map(|r| r.to_vec())
+                .collect();
+        } else {
+            for i in 0..s {
+                if let Some(r) = crate::dsv4::compress_decode(
+                    &ckv[i * cw..(i + 1) * cw],
+                    &csc[i * cw..(i + 1) * cw],
+                    &l.idx_comp_ape,
+                    pos_base + i,
+                    st,
+                ) {
+                    rows.push(r);
+                }
+            }
+        }
+    }
+    // Snapshot before pushing — see the identical note on the main Compressor above.
+    let ibase = kv.icomp_rows(li).len() / ihd;
+    for (bi, r) in rows.into_iter().enumerate() {
+        let mut nr = vec![0f32; ihd];
+        rmsnorm(&mut nr, &r, &l.idx_comp_norm, cfg.eps);
+        let b = ibase + bi;
+        let p = b * ratio;
+        if (p + 1) * half <= ccos.len() {
+            let (c, sn) = v4_rope_rows(ccos, csin, p, half);
+            crate::dsv4::rope_interleaved(&mut nr, c, sn, rd, false);
+        }
+        crate::dsv4::hadamard_rotate(&mut nr, ihd);
+        crate::dsv4::fp4_act_quant_sim(&mut nr, 32);
+        kv.icomp_push(li, &nr);
+    }
+
+    let n_ic = kv.icomp_rows(li).len() / ihd;
+    if n_ic == 0 {
+        inactive("the indexer's compressor has emitted no rows yet");
+        return all(kv);
+    }
+
+    // ---- query: wq_b on the SHARED q-LoRA bottleneck ----------------------
+    // `qr` is `q_norm(wq_a(x))`, the same tensor the main q path consumes — the Indexer
+    // re-projects it rather than owning a second LoRA. Note there is NO per-head RMS here:
+    // that belongs to the main query only.
+    let mut q = vec![0f32; s * nh * ihd];
+    matmul_qt(&mut q, q_lat, wq_b, s);
+    for i in 0..s {
+        let (c, sn) = v4_rope_rows(ccos, csin, pos_base + i, half);
+        for hh in 0..nh {
+            let b = (i * nh + hh) * ihd;
+            crate::dsv4::rope_interleaved(&mut q[b..b + ihd], c, sn, rd, false);
+            crate::dsv4::hadamard_rotate(&mut q[b..b + ihd], ihd);
+            crate::dsv4::fp4_act_quant_sim(&mut q[b..b + ihd], 32);
+        }
+    }
+
+    // ---- per-head weights, then score -------------------------------------
+    let mut w = vec![0f32; s * nh];
+    matmul_qt(&mut w, xn, wproj, s);
+    let wscale = (ihd as f32).powf(-0.5) * (nh as f32).powf(-0.5);
+    for v in w.iter_mut() {
+        *v *= wscale;
+    }
+
+    let ikv = kv.icomp_rows(li);
+    // `COLI_DSV4_INDEX_TOPK` lowers the cap so selection engages at a context short enough
+    // to iterate on. At the real 512 it takes >2048 tokens — a ~10 minute prefill — to
+    // exercise the scoring path at all, which is far too slow a loop to debug against.
+    let topk = dsv4_index_topk(cfg);
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(s);
+    let mut score: Vec<f32> = Vec::new();
+    for i in 0..s {
+        let avail = comp_avail(pos_base + i).min(n_ic);
+        if avail == 0 {
+            out.push(Vec::new());
+            continue;
+        }
+        // Everything fits: skip the scoring entirely. This is the common case (context
+        // under 2048) and it keeps the Indexer from costing anything where it cannot
+        // change the answer.
+        if topk == 0 || avail <= topk {
+            let rel = std::sync::atomic::Ordering::Relaxed;
+            IDX_SKIPPED.fetch_add(1, rel);
+            IDX_SKIP_MAX.fetch_max(avail as u64, rel);
+            out.push((0..avail).collect());
+            continue;
+        }
+        score.clear();
+        for t in 0..avail {
+            let kr = &ikv[t * ihd..(t + 1) * ihd];
+            let mut acc = 0f32;
+            for hh in 0..nh {
+                let qv = &q[(i * nh + hh) * ihd..(i * nh + hh) * ihd + ihd];
+                let mut d = 0f32;
+                for (a, b) in qv.iter().zip(kr) {
+                    d += a * b;
+                }
+                // relu FIRST, then the per-head weight, then sum over heads.
+                acc += d.max(0.0) * w[i * nh + hh];
+            }
+            score.push(acc);
+        }
+        let mut order: Vec<usize> = (0..avail).collect();
+        order.sort_unstable_by(|&a, &b| {
+            score[b].partial_cmp(&score[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+        });
+        order.truncate(topk);
+        let rel = std::sync::atomic::Ordering::Relaxed;
+        IDX_SCORED.fetch_add(1, rel);
+        IDX_SEEN.fetch_add(avail as u64, rel);
+        IDX_KEPT.fetch_add(order.len() as u64, rel);
+        // Attention is order-invariant, but sorting keeps the index list deterministic
+        // and makes an A/B against the all-rows arm diffable.
+        order.sort_unstable();
+        out.push(order);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dsv4_attention(
+    cfg: &colibri_core::Config,
+    l: &Layer,
+    li: usize,
+    kv: &mut KvCache,
+    xn: &[f32],
+    s: usize,
+    pos_base: usize,
+    cos: &[f32],
+    sin: &[f32],
+    ccos: &[f32],
+    csin: &[f32],
+    out: &mut [f32],
+) {
+    let h = cfg.n_heads as usize;
+    let hd = cfg.qk_head as usize; // 512 — V4's head_dim; K and V are the same latent
+    let rd = cfg.qk_rope as usize; // 64
+    let ql = cfg.q_lora as usize;
+    let half = rd / 2;
+    let prof = crate::forward::profile_on();
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    let t_proj = std::time::Instant::now();
+
+    // ---- q: wq_a -> q_norm -> wq_b -> per-head RMS -> rope -----------------
+    let mut q_lat = vec![0f32; s * ql];
+    matmul_qt(&mut q_lat, xn, &l.q_a, s);
+    let mut row = vec![0f32; ql.max(hd)];
+    for i in 0..s {
+        rmsnorm(&mut row[..ql], &q_lat[i * ql..(i + 1) * ql], &l.q_a_ln, cfg.eps);
+        q_lat[i * ql..(i + 1) * ql].copy_from_slice(&row[..ql]);
+    }
+    let mut q = vec![0f32; s * h * hd];
+    matmul_qt(&mut q, &q_lat, &l.q_b, s);
+    // Parameter-free, and NOT the same normalisation as `q_a_ln` above.
+    crate::dsv4::per_head_rms(&mut q, hd, cfg.eps);
+    for i in 0..s {
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        for hh in 0..h {
+            let b = (i * h + hh) * hd;
+            crate::dsv4::rope_interleaved(&mut q[b..b + hd], c, sn, rd, false);
+        }
+    }
+
+    // ---- kv: wkv -> kv_norm -> rope, then into the latent cache ------------
+    // ONE `head_dim`-wide latent is both K and V. There is no `kv_b` and no separate value
+    // projection, which is exactly why the MLA path cannot be reused here (it asserts a
+    // `kv_lora + qk_rope` width that V4 does not have).
+    let mut kvt = vec![0f32; s * hd];
+    matmul_qt(&mut kvt, xn, &l.kv_a, s);
+    for i in 0..s {
+        rmsnorm(&mut row[..hd], &kvt[i * hd..(i + 1) * hd], &l.kv_a_ln, cfg.eps);
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        crate::dsv4::rope_interleaved(&mut row[..hd], c, sn, rd, false);
+        // QAT match: the reference FP8-simulates the NON-rope dims and deliberately leaves
+        // the rope dims alone — `act_quant(kv[..., :-rd], 64, ..., True)` — so the two
+        // halves carry different precision by design. Quantising the whole row (or none of
+        // it) is the natural simplification and loses that distinction; the rope dims are
+        // left in full precision because position is where it matters most.
+        crate::dsv4::act_quant_sim(&mut row[..hd - rd], 64);
+        kv.latent_row_mut(li, pos_base + i).copy_from_slice(&row[..hd]);
+    }
+
+    if prof {
+        ATTN_PROJ_US.fetch_add(t_proj.elapsed().as_micros() as u64, rel);
+    }
+
+    // ---- Compressor: pool this step's tokens into compressed KV blocks ----
+    //
+    // These blocks carry ALL context older than the sliding window. Emitted once every
+    // `comp_ratio` tokens, normed, and roped with the Compressor's OWN base
+    // (`compress_theta` 160000) at the position where each window ENDS.
+    if dsv4_compress_enabled() && l.comp_ratio > 0 {
+        if let (Some(wkv), Some(wgate)) = (l.comp_wkv.as_ref(), l.comp_wgate.as_ref()) {
+            let cw = wkv.o as usize;
+            let ratio = l.comp_ratio as usize;
+            let mut ckv = vec![0f32; s * cw];
+            let mut csc = vec![0f32; s * cw];
+            matmul_qt(&mut ckv, xn, wkv, s);
+            matmul_qt(&mut csc, xn, wgate, s);
+            let mut rows: Vec<Vec<f32>> = Vec::new();
+            if let Some(st) = kv.comp_state_mut(li) {
+                if pos_base == 0 {
+                    rows = crate::dsv4::compress_prefill(&ckv, &csc, &l.comp_ape, s, ratio, hd, st)
+                        .chunks_exact(hd)
+                        .map(|r| r.to_vec())
+                        .collect();
+                } else {
+                    for i in 0..s {
+                        if let Some(r) = crate::dsv4::compress_decode(
+                            &ckv[i * cw..(i + 1) * cw],
+                            &csc[i * cw..(i + 1) * cw],
+                            &l.comp_ape,
+                            pos_base + i,
+                            st,
+                        ) {
+                            rows.push(r);
+                        }
+                    }
+                }
+            }
+            // Snapshot the block count BEFORE pushing: `comp_rows` grows by one each
+            // iteration, so reading it inside the loop gave `base + 2*bi` and roped every
+            // block after the first at twice its spacing. Only reachable when one call
+            // emits several blocks — i.e. prefill, which used to panic before it got here.
+            let base = kv.comp_rows(li).len() / hd;
+            for (bi, row) in rows.into_iter().enumerate() {
+                let mut nr = vec![0f32; hd];
+                rmsnorm(&mut nr, &row, &l.comp_norm, cfg.eps);
+                // Block `b` covers tokens [b*ratio, (b+1)*ratio); the reference ropes it at
+                // the window's END, i.e. `start_pos + 1 - ratio` for the decode emission.
+                let b = base + bi;
+                let p = b * ratio;
+                if (p + 1) * half <= ccos.len() {
+                    let (c, sn) = v4_rope_rows(ccos, csin, p, half);
+                    crate::dsv4::rope_interleaved(&mut nr, c, sn, rd, false);
+                }
+                kv.comp_push(li, &nr);
+            }
+        }
+    }
+
+    // ---- attention over the causal span, with the per-head sink -----------
+    //
+    // The keys are the raw sliding window PLUS the compressed blocks. Compressed rows are
+    // prepended: they stand for older positions, and `attention_dsv4` treats the leading
+    // rows as the earliest context. Without them attention sees only what fits in the
+    // window, which is why context was capped at 128.
+    let t_core = std::time::Instant::now();
+    let total = pos_base + s;
+    let win = if cfg.window > 0 { cfg.window as usize } else { total };
+    // The earliest raw position any query in THIS call can reach: query 0 sits at
+    // `pos_base` and its window opens `win-1` earlier. For decode that is exactly `win`
+    // rows; for a from-scratch prefill it is the whole span, which is what the reference
+    // passes (`kv` = all `seqlen` rows at `start_pos == 0`, the ring buffer only after).
+    //
+    // The previous code sliced from `total - win` for every call, so on a prefill longer
+    // than the window the early queries' rows were simply not in the cache, and the causal
+    // offset `pos_base - raw_from` underflowed on `usize`. That is the panic: any prompt
+    // over 128 tokens walked off the end of the cache.
+    let raw_lo = (pos_base + 1) - win.min(pos_base + 1);
+    let n_raw = total - raw_lo;
+    let ratio = if dsv4_compress_enabled() { l.comp_ratio as usize } else { 0 };
+    let n_comp = if ratio > 0 { kv.comp_rows(li).len() / hd } else { 0 };
+
+    // Key space: raw rows first, then compressed — the reference's layout, where the
+    // compressed indices are offset by the raw count.
+    let mut cache = Vec::with_capacity((n_raw + n_comp) * hd);
+    cache.extend_from_slice(kv.latent_rows(li, raw_lo, total));
+    cache.extend_from_slice(&kv.comp_rows(li)[..n_comp * hd]);
+
+    // A compressed row is visible to position `p` once its window has CLOSED:
+    // `t < (p+1)/ratio`. These deliberately OVERLAP the raw window — the reference lets a
+    // recent token be attended both raw and compressed rather than excluding either, and
+    // the old code excluded them ("would double-count"), which is not what V4 does.
+    let comp_avail = |p: usize| if ratio > 0 { ((p + 1) / ratio).min(n_comp) } else { 0 };
+    let sel = dsv4_compress_select(cfg, l, li, kv, xn, &q_lat, s, pos_base, ccos, csin, &comp_avail);
+    let (idxs, topk) = crate::dsv4::key_indices(win, total, pos_base, s, raw_lo, n_raw, &sel);
+
+    let mut o = vec![0f32; s * h * hd];
+    // Reference: `softmax_scale = head_dim ** -0.5`. No YaRN mscale, despite YaRN rope —
+    // checked, because DeepSeek's other models DO apply one.
+    let scale = (hd as f32).powf(-0.5);
+    // GPU first. This core measured 48% of V4 decode as a scalar CPU loop, and `coli gen`
+    // reported `0 attention cores` — it had never run on the GPU. The CPU path stays as
+    // the fallback and as the exact-arithmetic reference (`COLI_DSV4_GPU_ATTN=0`).
+    #[cfg(feature = "cuda")]
+    let on_gpu =
+        crate::gpu::try_dsv4_sparse_attn(&mut o, &q, &cache, &l.attn_sink, &idxs, s, h, hd, topk);
+    #[cfg(not(feature = "cuda"))]
+    let on_gpu = false;
+    if !on_gpu {
+        crate::dsv4::attention_dsv4_sparse(&q, &cache, &l.attn_sink, s, h, hd, &idxs, topk, scale, &mut o);
+    }
+
+    if prof {
+        ATTN_CORE_US.fetch_add(t_core.elapsed().as_micros() as u64, rel);
+    }
+
+    // ---- INVERSE rope on the output ---------------------------------------
+    // V is the same latent as K and already carries the forward rotation, so the context
+    // inherits it and must be de-rotated. Omitting this leaves every output rotated by its
+    // own position: right magnitudes, wrong model.
+    for i in 0..s {
+        let (c, sn) = v4_rope_rows(cos, sin, pos_base + i, half);
+        for hh in 0..h {
+            let b = (i * h + hh) * hd;
+            crate::dsv4::rope_interleaved(&mut o[b..b + hd], c, sn, rd, true);
+        }
+    }
+
+    // ---- grouped O-LoRA: block-diagonal `o_a`, then a dense `o_b` ----------
+    let t_o = std::time::Instant::now();
+    let g = cfg.o_groups.max(1) as usize;
+    let rank = cfg.o_lora as usize;
+    let dg = h * hd / g;
+    let mut mid = vec![0f32; s * g * rank];
+    for (gi, wg) in l.o_a_groups.iter().enumerate() {
+        // Gather this group's slice of every row, so the group's matmul sees `[s, dg]`.
+        let mut xg = vec![0f32; s * dg];
+        for i in 0..s {
+            xg[i * dg..(i + 1) * dg].copy_from_slice(&o[i * h * hd + gi * dg..i * h * hd + (gi + 1) * dg]);
+        }
+        let mut yg = vec![0f32; s * rank];
+        matmul_qt(&mut yg, &xg, wg, s);
+        for i in 0..s {
+            mid[i * g * rank + gi * rank..i * g * rank + (gi + 1) * rank]
+                .copy_from_slice(&yg[i * rank..(i + 1) * rank]);
+        }
+    }
+    matmul_qt(out, &mid, l.o_b.as_ref().expect("V4 layer missing o_b"), s);
+    if prof {
+        ATTN_OPROJ_US.fetch_add(t_o.elapsed().as_micros() as u64, rel);
+    }
+}
+
+/// One DeepSeek-V4 block: two Hyper-Connection sublayers (attention, then MoE).
+#[allow(clippy::too_many_arguments)]
+fn dsv4_layer_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    l: &Layer,
+    li: usize,
+    x: &mut [f32], // [s, hc, d] — the Hyper-Connection stream, in place
+    s: usize,
+    // Token ids for these rows — needed ONLY by the `n_hash_layers` MoE layers, which
+    // select experts from `tid2eid[token_id]` rather than from the router scores.
+    ids: &[i32],
+    pos_base: usize,
+    cos: &[f32],
+    sin: &[f32],
+    ccos: &[f32],
+    csin: &[f32],
+    sc: &mut Dsv4Scratch,
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult as usize;
+    let iters = cfg.hc_sinkhorn_iters as usize;
+
+    // Two passes with identical shape; only the weights and the sublayer differ.
+    for pass in 0..2 {
+        let (hc_fn, hc_scale, hc_base, norm) = if pass == 0 {
+            (&l.hc_attn_fn, &l.hc_attn_scale, &l.hc_attn_base, &l.in_ln)
+        } else {
+            (&l.hc_ffn_fn, &l.hc_ffn_scale, &l.hc_ffn_base, &l.post_ln)
+        };
+        // `residual` is re-read from `x` on BOTH passes — the FFN's residual is the
+        // post-attention stream, not the block input.
+        sc.residual[..s * hc * d].copy_from_slice(&x[..s * hc * d]);
+
+        for i in 0..s {
+            crate::hc::hc_pre(
+                &sc.residual[i * hc * d..(i + 1) * hc * d],
+                hc_fn,
+                hc_scale,
+                hc_base,
+                hc,
+                d,
+                cfg.eps,     // norm_eps: the rsqrt inside hc_pre
+                cfg.hc_eps,  // hc_eps: floors the Sinkhorn weights — a DIFFERENT epsilon
+                iters,
+                &mut sc.mixed[i * d..(i + 1) * d],
+                &mut sc.post[i],
+                &mut sc.comb[i],
+            );
+        }
+        for i in 0..s {
+            rmsnorm(
+                &mut sc.normed[i * d..(i + 1) * d],
+                &sc.mixed[i * d..(i + 1) * d],
+                norm,
+                cfg.eps,
+            );
+        }
+
+        if pass == 0 {
+            timed(&ATTN_US, || {
+                dsv4_attention(cfg, l, li, kv, &sc.normed[..s * d], s, pos_base, cos, sin, ccos, csin, &mut sc.sub[..s * d]);
+            });
+        } else {
+            timed(&MOE_US, || {
+                crate::moe::dsv4_moe(cfg, l, li, &sc.normed[..s * d], s, ids, &mut sc.sub[..s * d], provider)
+            })?;
+        }
+
+        for i in 0..s {
+            crate::hc::hc_post(
+                &sc.sub[i * d..(i + 1) * d],
+                &sc.residual[i * hc * d..(i + 1) * hc * d],
+                &sc.post[i],
+                &sc.comb[i],
+                hc,
+                d,
+                &mut x[i * hc * d..(i + 1) * hc * d],
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Buffers reused across V4 layers. Allocating these per layer costs more than the
+/// arithmetic at `s = 1`, and the Hyper-Connection stream makes them `hc_mult` times the
+/// usual size, so the churn is 4x what it would be on a plain residual.
+struct Dsv4Scratch {
+    residual: Vec<f32>,
+    mixed: Vec<f32>,
+    normed: Vec<f32>,
+    sub: Vec<f32>,
+    post: Vec<[f32; crate::hc::MAX_HC]>,
+    comb: Vec<[[f32; crate::hc::MAX_HC]; crate::hc::MAX_HC]>,
+}
+
+impl Dsv4Scratch {
+    fn new(s: usize, hc: usize, d: usize) -> Self {
+        Dsv4Scratch {
+            residual: vec![0f32; s * hc * d],
+            mixed: vec![0f32; s * d],
+            normed: vec![0f32; s * d],
+            sub: vec![0f32; s * d],
+            post: vec![[0f32; crate::hc::MAX_HC]; s],
+            comb: vec![[[0f32; crate::hc::MAX_HC]; crate::hc::MAX_HC]; s],
+        }
+    }
+}
+
+/// DeepSeek-V4 forward. Owns its layer loop because the residual stream is
+/// `[s, hc_mult, hidden]`.
+///
+/// **Context limit.** V4's raw KV cache is a ring buffer of `sliding_window` (128) rows;
+/// everything older is reachable only through the Compressor, which is not implemented.
+/// This path keeps the full history and attends densely over it, which is EXACTLY what the
+/// reference computes while the span fits in the window, and diverges past it. That is a
+/// hard edge, so it is reported once rather than left to look like ordinary drift.
+fn dsv4_forward<P: ExpertProvider>(
+    model: &Model,
+    kv: &mut KvCache,
+    provider: &P,
+    ids: &[i32],
+    pos_base: usize,
+    hidden_out: &mut [f32],
+) -> io::Result<()> {
+    let cfg = &model.cfg;
+    let d = cfg.hidden as usize;
+    let hc = cfg.hc_mult as usize;
+    let s = ids.len();
+    let total = pos_base + s;
+
+    // Only a concern when the Compressor is OFF: with it on, context past the window is
+    // carried by the compressed blocks, which is the whole point of the mechanism.
+    if cfg.window > 0 && total > cfg.window as usize && !dsv4_compress_enabled() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "[dsv4] context {total} exceeds sliding_window {} with the Compressor \
+                 DISABLED — everything past {} tokens is missing from attention. \
+                 Unset COLI_DSV4_COMPRESS=0 to carry it in compressed blocks.",
+                cfg.window, cfg.window
+            );
+        });
+    }
+
+    // TWO rope tables, and which one a layer uses depends on whether it has a Compressor.
+    //
+    // From `Attention.__init__`: a layer with `compress_ratio != 0` builds its `freqs_cis`
+    // with `compress_rope_theta` (160000) AND YaRN enabled; a layer without one uses
+    // `rope_theta` (10000) with YaRN **disabled** (`original_seq_len = 0`). That single
+    // buffer then ropes the layer's q, its kv, its Compressor blocks and its Indexer alike.
+    //
+    // This was previously one YaRN table at `theta` for all main attention, with the
+    // compress table used only for compressed blocks — wrong on BOTH classes, and wrong on
+    // 41 of 43 layers in the direction that matters, since the compress layers are the
+    // ones carrying long-range context.
+    let (ccos, csin) = crate::dsv4::yarn_rope_tables(
+        cfg.qk_rope as usize, total.max(1), cfg.compress_theta, 16.0, 65536, 32.0, 1.0,
+    );
+    // YaRN off: `original_seq_len = 0` short-circuits the interpolation entirely.
+    let (ncos, nsin) = crate::dsv4::yarn_rope_tables(
+        cfg.qk_rope as usize, total.max(1), cfg.theta, 16.0, 0, 32.0, 1.0,
+    );
+    if dsv4_compress_enabled() && kv.comp_rows_len() == 0 {
+        let min_ratio = cfg
+            .compress_ratios
+            .iter()
+            .copied()
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(4)
+            .max(1) as usize;
+        kv.comp_init(
+            model.layers.len(),
+            &cfg.compress_ratios,
+            cfg.qk_head as usize,
+            cfg.max_ctx as usize / min_ratio + 2,
+        );
+        // The Indexer's own compressed rows, on the ratio-4 layers only — that is the
+        // exact condition under which the reference constructs an `Indexer`.
+        if dsv4_indexer_enabled() && cfg.index_hd > 0 {
+            kv.icomp_init(
+                model.layers.len(),
+                &cfg.compress_ratios,
+                4,
+                cfg.index_hd as usize,
+                cfg.max_ctx as usize / 4 + 2,
+            );
+        }
+    }
+
+    // Embed, then REPEAT into all `hc_mult` copies — the reference's
+    // `h.unsqueeze(2).repeat(1, 1, hc_mult, 1)`. Seeding only copy 0 would leave the other
+    // three at zero and the Sinkhorn mixing would quietly propagate that.
+    let mut x = vec![0f32; s * hc * d];
+    timed(&EMBED_US, || {
+        let mut e = vec![0f32; d];
+        for (i, &tok) in ids.iter().enumerate() {
+            embed_row(&model.embed, tok as usize, &mut e);
+            for k in 0..hc {
+                x[(i * hc + k) * d..(i * hc + k) * d + d].copy_from_slice(&e);
+            }
+        }
+    });
+
+    let mut sc = Dsv4Scratch::new(s, hc, d);
+    for (li, l) in model.layers.iter().enumerate() {
+        // A layer WITH a Compressor ropes everything — q, kv, its blocks, its Indexer —
+        // with the compress-theta YaRN table; a layer without one uses the plain base
+        // table and no YaRN. Read from the config, not from `l.comp_ratio`, so the choice
+        // does not silently follow the `COLI_DSV4_COMPRESS` knob: the weights were trained
+        // with one table per layer regardless of whether we run the pooling.
+        let compressed = cfg.compress_ratios.get(li).copied().unwrap_or(0) > 0;
+        let (mcos, msin) = if compressed { (&ccos, &csin) } else { (&ncos, &nsin) };
+        dsv4_layer_forward(model, kv, provider, l, li, &mut x, s, ids, pos_base, mcos, msin, &ccos, &csin, &mut sc)?;
+    }
+
+    // Collapse `[hc, d] -> [d]` with the model-level head: a plain sigmoid gate, NO
+    // Sinkhorn, and a scalar scale where the per-layer one takes a 3-vector.
+    for i in 0..s {
+        crate::hc::hc_head(
+            &x[i * hc * d..(i + 1) * hc * d],
+            &model.hc_head_fn,
+            model.hc_head_scale,
+            &model.hc_head_base,
+            hc,
+            d,
+            cfg.eps,
+            cfg.hc_eps,
+            &mut hidden_out[i * d..(i + 1) * d],
+        );
+    }
+    Ok(())
 }

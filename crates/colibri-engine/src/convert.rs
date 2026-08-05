@@ -109,6 +109,12 @@ pub struct ConvertOpts {
     /// Its routed experts are already MXFP4 and pass through unquantized — see
     /// [`kimi_container_name`].
     pub kimi: bool,
+    /// source is DeepSeek-V4-Flash (`deepseek_v4`): MoE on every layer, latent attention
+    /// with an O-LoRA, and Hyper-Connections in place of the residual. Its compact naming
+    /// (`layers.N.attn.wq_a`, bare `embed`/`head`/`norm`) needs a full rewrite — see
+    /// [`deepseek_v4_container_name`]. Routed experts are MXFP4 and pass through
+    /// unquantised, as K3's do.
+    pub deepseek_v4: bool,
     /// How many container layer indices the MTP speculative head occupies, starting at
     /// `n_layers` — `Config::mtp_head_layers()`. **1** for GLM/M3 (one sparse block) and
     /// **2** for Nemotron-H (`mtp_hybrid_override_pattern == "*E"`: an attention sublayer
@@ -130,6 +136,7 @@ impl Default for ConvertOpts {
             gemma_norm: false,
             nemotron: false,
             kimi: false,
+            deepseek_v4: false,
             mtp_layers: 1,
         }
     }
@@ -269,6 +276,96 @@ fn m3_container_name(name: &str) -> Option<String> {
 /// * **Attention residuals.** `self_attention_res_{norm,proj}`, `mlp_res_{norm,proj}` and the
 ///   model-level `output_attn_res_{norm,proj}` pass through; they have no analogue in any
 ///   other arch but are plain small tensors.
+/// DeepSeek-V4-Flash source name -> colibrì container name, or `None` to drop the tensor.
+///
+/// V4 uses a compact naming scheme unlike every other checkpoint this converter reads:
+/// `layers.N.attn.wq_a`, `layers.N.ffn.experts.E.w1`, and bare `embed`/`head`/`norm` — no
+/// `model.` prefix, no `self_attn`/`mlp`. So this is a full rewrite rather than the usual
+/// handful of substitutions.
+///
+/// DROPPED, and each for a reason worth stating:
+/// - `mtp.*` — the multi-token-prediction head. V4's is not a plain extra layer: it carries
+///   its own experts, a Markov head and a confidence head. Converting it half-way would
+///   produce a container that looks MTP-capable and is not, so it is dropped wholesale
+///   until the MTP path is actually built (cf. the K3/Nemotron MTP work).
+/// - `hc_*` is NOT dropped — it is load-bearing (see [`Arch::DeepseekV4`]), and a container
+///   without it cannot reproduce the model at all.
+fn deepseek_v4_container_name(name: &str, n_layers: usize) -> Option<String> {
+    // DSpark / MTP subtree. The reference calls these "DSpark stages stored under the
+    // `mtp.*` checkpoint namespace" — `stage_id = layer_id - n_layers` — so they are
+    // remapped onto `model.layers.{n_layers .. n_layers+n_mtp_layers}` exactly as
+    // Nemotron's head is. That puts them in range of `classify_head`'s MTP window, so the
+    // expert rules (and the MXFP4 passthrough) apply to their 256-expert pools for free.
+    //
+    // Checked FIRST because `mtp.0.ffn.experts.…` would otherwise be rewritten by the
+    // expert rules below and land in the container as if it were a real layer.
+    if let Some(rest) = name.strip_prefix("mtp.") {
+        let (stage, tail) = rest.split_once('.')?;
+        let stage: usize = stage.parse().ok()?;
+        return Some(format!("model.layers.{}.{}", n_layers + stage, v4_tail(tail)));
+    }
+    // `ffn.gate.tid2eid` is an I64 [vocab, top_k] token-id -> expert-id table on the three
+    // hash-routing layers (`num_hash_layers`). It is now KEPT, and stored as F32: the
+    // values are expert IDs (< 256), every integer below 2^24 is exact in f32, and that
+    // avoids giving the container an integer tensor path used by exactly one tensor.
+    // 129280 x 6 x 4 B = 3.1 MB per layer, 9.3 MB total.
+    //
+    // It was dropped until the routing path existed, which left 3 of 43 layers selecting
+    // experts by score when the model selects them by table.
+    let n = name.to_string();
+    // Top-level tensors. V4 calls them `embed`/`head`/`norm`; the container (and every
+    // loader path) expects the HF-ish long names.
+    if n == "embed.weight" {
+        return Some("model.embed_tokens.weight".into());
+    }
+    if n == "head.weight" {
+        return Some("lm_head.weight".into());
+    }
+    if n == "norm.weight" {
+        return Some("model.norm.weight".into());
+    }
+    // The three global Hyper-Connection head tensors (hc_head_fn/base/scale) sit at the
+    // top level and have no per-layer analogue; keep them verbatim under `model.`.
+    if let Some(rest) = n.strip_prefix("hc_head_") {
+        return Some(format!("model.hc_head_{rest}"));
+    }
+    let rest = n.strip_prefix("layers.")?;
+    let (layer, tail) = rest.split_once('.')?;
+    layer.parse::<u32>().ok()?;
+    Some(format!("model.layers.{layer}.{}", v4_tail(tail)))
+}
+
+/// The per-layer tail rewrite, shared by the main layers and the DSpark stages — they are
+/// the same block shape, so a rule that applied to one and not the other would be a bug.
+/// DSpark's extra tensors (`main_proj`, `main_norm`, `markov_head.*`, `confidence_head.*`,
+/// `norm`, `hc_head_*`) match nothing here and pass through unchanged, which is what the
+/// loader expects.
+fn v4_tail(tail: &str) -> String {
+    tail
+        // Attention. `wq_a`/`wq_b` are the Q LoRA pair, `wo_a`/`wo_b` the O LoRA pair that
+        // V3 had no equivalent for, and `wkv` the single latent that serves as both K and V.
+        .replace("attn.wq_a.", "self_attn.q_a_proj.")
+        .replace("attn.wq_b.", "self_attn.q_b_proj.")
+        .replace("attn.wkv.", "self_attn.kv_a_proj.")
+        .replace("attn.wo_a.", "self_attn.o_a_proj.")
+        .replace("attn.wo_b.", "self_attn.o_b_proj.")
+        .replace("attn.q_norm.", "self_attn.q_a_layernorm.")
+        .replace("attn.kv_norm.", "self_attn.kv_a_layernorm.")
+        // Sub-modules with no analogue elsewhere keep their own names under `self_attn`.
+        .replace("attn.attn_sink", "self_attn.attn_sink")
+        .replace("attn.compressor.", "self_attn.compressor.")
+        .replace("attn.indexer.", "self_attn.indexer.")
+        .replace("attn_norm.", "input_layernorm.")
+        .replace("ffn_norm.", "post_attention_layernorm.")
+        // MoE. `w1`/`w3`/`w2` are gate/up/down, matching the K3 convention.
+        .replace("ffn.experts.", "mlp.experts.")
+        .replace("ffn.shared_experts.", "mlp.shared_experts.")
+        .replace("ffn.gate.", "mlp.gate.")
+        .replace(".w1.", ".gate_proj.")
+        .replace(".w3.", ".up_proj.")
+        .replace(".w2.", ".down_proj.")
+}
+
 fn kimi_container_name(name: &str) -> Option<String> {
     for drop in [
         "vision_tower",
@@ -364,6 +461,20 @@ fn classify_head(
     {
         return Kind::Skip;
     }
+    // DeepSeek-V4 spells the same sidecar `<stem>.scale`. Without this arm every scale is
+    // ALSO emitted as a standalone tensor — and, having no quantised form of its own, as
+    // F32: a second copy of data already inside the MXFP4 blob, at 4 bytes per E8M0 byte.
+    // Measured: the container came out 189.4 GB from a 167 GB source, with f32=34031
+    // tensors (~33k expert scales) instead of the handful of norms it should be. A 4-bit
+    // container must never be larger than its own fp8 source; that inequality is the
+    // cheapest check that this rule is working.
+    //
+    // Safe as a blanket rule: `.scale` sidecars are consumed by their parent weight on
+    // both paths — MXFP4 folds them into the blob, and the fp8 path reads them as block
+    // scales — so there is no case where one should be emitted on its own.
+    if name.ends_with(".scale") {
+        return Kind::Skip;
+    }
     let li = layer_idx(name);
     let is_mtp = li >= 0 && (li as usize) >= n_layers && (li as usize) < n_layers + mtp_layers;
     // The MTP speculative head occupies layer indices `n_layers .. n_layers+mtp_layers`
@@ -426,6 +537,16 @@ fn classify_head(
     }
     if name.ends_with("mlp.gate.weight") {
         return Kind::F32; // router (NOT gate_proj)
+    }
+    // DeepSeek-V4's token-id -> expert-id table. F32 because its values are small exact
+    // integers; see the mapper for why it is not given an integer tensor path.
+    if name.ends_with("mlp.gate.tid2eid") {
+        return Kind::F32;
+    }
+    // DSpark's confidence head is `[1, dim + markov_rank]` — a single row. Quantising it
+    // buys nothing and costs a scale per row of one.
+    if name.ends_with("confidence_head.proj.weight") {
+        return Kind::F32;
     }
     if name.ends_with("norm.weight") || name == "model.norm.weight" {
         return Kind::F32;
@@ -531,16 +652,31 @@ fn dequant(shards: &Shards, name: &str) -> io::Result<(Vec<f32>, Vec<i64>)> {
             // Both MULTIPLY: W[o,i] = fp8(o,i) · scale(block of (o,i)). The scale
             // sidecar is the weight name with `_scale_inv` appended.
             let (o, i) = two_dims(&t.shape, name)?;
-            let sname = format!("{name}_scale_inv");
-            let st = shards.find(&sname).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "FP8 weight {name} has neither {sname} (block scales) \
-                         nor {name}_scale (per-tensor scale)"
-                    ),
-                )
-            })?;
+            // Sidecar spelling differs by publisher for the SAME 128x128 block layout:
+            // DeepSeek-V3/GLM/MiniMax write `<weight>_scale_inv`; DeepSeek-V4 replaces the
+            // `.weight` suffix with `.scale`. Try the historical name first so nothing
+            // changes for existing checkpoints, then V4's.
+            let alt = name
+                .strip_suffix(".weight")
+                .map(|stem| format!("{stem}.scale"));
+            let (sname, st) = match shards.find(&format!("{name}_scale_inv")) {
+                Some(st) => (format!("{name}_scale_inv"), st),
+                None => {
+                    let a = alt.clone().unwrap_or_default();
+                    match shards.find(&a) {
+                        Some(st) => (a, st),
+                        None => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "FP8 weight {name} has no block-scale sidecar: tried \
+                                     {name}_scale_inv, {a}"
+                                ),
+                            ))
+                        }
+                    }
+                }
+            };
             let (nbo, nbi) = two_dims(&st.shape, &sname)?;
 
             // fp8 codes → f32 (byte-per-element), then scale by block.
@@ -795,7 +931,12 @@ fn quantize_e4m3(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, OutTe
 /// Nearest e2m1 code (0..15, bit 3 = sign) for `t`. Mirrors [`e2m1_round`] but returns
 /// the packed nibble instead of the value; ties resolve to the first (even) magnitude,
 /// matching `e2m1_round`/the CUDA LUT decode.
-fn e2m1_code(t: f32) -> u8 {
+///
+/// `pub(crate)` for `gpubench::quantize_mxfp4`, which must not encode nibbles in a way the
+/// CUDA kernels do not decode — the benchmark would then be timing a kernel on data no
+/// real container can contain. Same reason `mxfp4_scale_name` is shared by the MXFP4
+/// detector and emitter: the two halves of a format must not be able to disagree.
+pub(crate) fn e2m1_code(t: f32) -> u8 {
     let a = t.abs();
     let mut best = 0usize;
     let mut bd = f32::INFINITY;
@@ -1201,9 +1342,33 @@ fn quantize_nvfp4_out(name: &str, w: &[f32], o: usize, i: usize) -> (OutTensor, 
 ///
 /// Structural rather than keyed on `opts.kimi`: any MXFP4 checkpoint should pass through,
 /// and a K3 checkpoint that ever ships a differently-blocked tensor should NOT.
+/// The MXFP4 scale sidecar for a packed-weight tensor, plus its stem.
+///
+/// Two publishers, two spellings of the SAME layout:
+///   compressed-tensors (Kimi-K3): `<stem>.weight_packed` + `<stem>.weight_scale`
+///   DeepSeek-V4:                  `<stem>.weight`        + `<stem>.scale`
+///
+/// This exists as ONE function because the detector and the emitter both need it and they
+/// were resolving it independently — `mxfp4_source` accepted V4's spelling while
+/// `mxfp4_passthrough_out` still appended `.weight_scale`, so a V4 expert was recognised as
+/// MXFP4 and then failed to load its own scale (`...w1.weight.weight_scale`). Detection and
+/// emission must not be able to disagree about where a tensor's scale lives.
+fn mxfp4_scale_name(name: &str) -> Option<(&str, String)> {
+    if let Some(stem) = name.strip_suffix(".weight_packed") {
+        return Some((stem, format!("{stem}.weight_scale")));
+    }
+    let stem = name.strip_suffix(".weight")?;
+    Some((stem, format!("{stem}.scale")))
+}
+
 fn mxfp4_source(shards: &Shards, name: &str) -> Option<(usize, usize)> {
-    let stem = name.strip_suffix(".weight_packed")?;
-    let sname = format!("{stem}.weight_scale");
+    // Two naming conventions for the same layout:
+    //   compressed-tensors (Kimi-K3): `<stem>.weight_packed` + `<stem>.weight_scale`
+    //   DeepSeek-V4:                  `<stem>.weight`        + `<stem>.scale`
+    // The structural test below is what actually decides MXFP4 — the names only say where
+    // to look. Accepting V4's spelling here is what keeps its experts on the bit-exact
+    // passthrough instead of a 6.40% rel-RMS requantisation.
+    let (_stem, sname) = mxfp4_scale_name(name)?;
     let (w, s) = (shards.find(name)?, shards.find(&sname)?);
     if w.dtype != DType::U8 || s.dtype != DType::U8 {
         return None;
@@ -1242,9 +1407,14 @@ fn mxfp4_passthrough_out(
         shards.read_raw(n, &mut b)?;
         Ok(b)
     };
-    let stem = src.strip_suffix(".weight_packed").unwrap_or(src);
+    let (_stem, sname) = mxfp4_scale_name(src).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not an MXFP4 packed-weight name: {src}"),
+        )
+    })?;
     let mut blob = read(src)?;
-    blob.extend_from_slice(&read(&format!("{stem}.weight_scale"))?);
+    blob.extend_from_slice(&read(&sname)?);
     Ok((
         OutTensor {
             name: out_name.to_string(),
@@ -1615,6 +1785,20 @@ fn process_one(name: &str, shards: &Shards, opts: &ConvertOpts) -> io::Result<Te
             Some(n) if layer_idx(&n) < 0 || (layer_idx(&n) as usize) < opts.n_layers => n,
             _ => return Ok(TensorOut::Skip),
         }
+    } else if opts.deepseek_v4 {
+        // The DSpark/MTP stages are KEPT and remapped into
+        // `model.layers.{n_layers..n_layers+mtp_layers}`, so the ceiling has to include
+        // them or the head is silently discarded — the same trap the Nemotron branch
+        // documents below.
+        match deepseek_v4_container_name(name, opts.n_layers) {
+            Some(n)
+                if layer_idx(&n) < 0
+                    || (layer_idx(&n) as usize) < opts.n_layers + opts.mtp_layers =>
+            {
+                n
+            }
+            _ => return Ok(TensorOut::Skip),
+        }
     } else if opts.kimi {
         // Kimi-K3: M3-shaped names plus the latent-MoE projections. `num_nextn_predict_layers`
         // is 0 in this checkpoint, so there is no head to keep and the plain `n_layers`
@@ -1770,6 +1954,36 @@ pub fn convert_snapshot(
 
     let shards = Shards::open(indir)?;
     let nfiles = shards.num_files();
+
+    // DeepSeek-V4: PROBE the number of DSpark stages instead of believing the config.
+    //
+    // The released `config.json` says `num_nextn_predict_layers = 1` and
+    // `mtp_num_hidden_layers = 1`, but the checkpoint ships THREE stages (`mtp.0/1/2`,
+    // 768 = 3 x 256 experts) and the reference's own `inference/config.json` says
+    // `n_mtp_layers: 3`. Deriving the count from the config drops two stages of three,
+    // silently — the container still converts, still loads, and is simply missing most of
+    // the head. Counting the `mtp.<n>.` prefixes that actually exist cannot be wrong.
+    let mut opts = opts;
+    if opts.deepseek_v4 {
+        let stages = shards
+            .tensors()
+            .iter()
+            .filter_map(|t| t.name.strip_prefix("mtp."))
+            .filter_map(|r| r.split_once('.'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if stages > 0 && stages != opts.mtp_layers {
+            eprintln!(
+                "[convert] DSpark: checkpoint has {stages} stages, config implied {} — \
+                 using {stages}",
+                opts.mtp_layers
+            );
+            opts.mtp_layers = stages;
+        }
+    }
+    let opts = opts;
 
     // Group tensor names by their source shard so we stream one input file at a
     // time (bounds peak RAM to roughly one shard's worth of output).
@@ -3075,6 +3289,89 @@ mod tests {
     /// K3's own are the two latent projections and the fact that both mixers pass through
     /// untouched under `self_attn.*`.
     #[test]
+    /// DeepSeek-V4 name mapping, checked against names taken verbatim from the released
+    /// `model.safetensors.index.json`.
+    ///
+    /// The full inventory (72,317 tensors) was replayed through this mapper offline:
+    /// 4,705 MTP tensors dropped, 67,612 mapped, **0 unmapped and 0 collisions**. A
+    /// collision is the dangerous outcome — two source tensors landing on one container
+    /// name silently keeps whichever is written last — so it is asserted here too.
+    #[test]
+    fn deepseek_v4_name_mapping() {
+        let m = |s: &str| deepseek_v4_container_name(s, 43);
+        // Top-level renames.
+        assert_eq!(m("embed.weight").as_deref(), Some("model.embed_tokens.weight"));
+        assert_eq!(m("head.weight").as_deref(), Some("lm_head.weight"));
+        assert_eq!(m("norm.weight").as_deref(), Some("model.norm.weight"));
+        assert_eq!(m("hc_head_fn").as_deref(), Some("model.hc_head_fn"));
+        // Attention, including the O-LoRA pair that V3 had no equivalent for.
+        assert_eq!(m("layers.0.attn.wq_a.weight").as_deref(),
+                   Some("model.layers.0.self_attn.q_a_proj.weight"));
+        assert_eq!(m("layers.7.attn.wo_b.scale").as_deref(),
+                   Some("model.layers.7.self_attn.o_b_proj.scale"));
+        assert_eq!(m("layers.3.attn.wkv.weight").as_deref(),
+                   Some("model.layers.3.self_attn.kv_a_proj.weight"));
+        assert_eq!(m("layers.3.attn.attn_sink").as_deref(),
+                   Some("model.layers.3.self_attn.attn_sink"));
+        // Experts: w1/w3/w2 -> gate/up/down.
+        assert_eq!(m("layers.2.ffn.experts.255.w1.weight").as_deref(),
+                   Some("model.layers.2.mlp.experts.255.gate_proj.weight"));
+        assert_eq!(m("layers.2.ffn.experts.0.w2.scale").as_deref(),
+                   Some("model.layers.2.mlp.experts.0.down_proj.scale"));
+        assert_eq!(m("layers.2.ffn.shared_experts.w3.weight").as_deref(),
+                   Some("model.layers.2.mlp.shared_experts.up_proj.weight"));
+        // Hyper-Connections are load-bearing and must survive.
+        assert_eq!(m("layers.5.hc_attn_fn").as_deref(), Some("model.layers.5.hc_attn_fn"));
+        // Sub-modules that only exist on some layers keep their own subtree.
+        assert_eq!(m("layers.2.attn.compressor.wkv.weight").as_deref(),
+                   Some("model.layers.2.self_attn.compressor.wkv.weight"));
+        assert_eq!(m("layers.2.attn.indexer.weights_proj.weight").as_deref(),
+                   Some("model.layers.2.self_attn.indexer.weights_proj.weight"));
+        // DSpark stages land at layers n_layers.. — `stage_id = layer_id - n_layers` in
+        // the reference — and share the main block's tail rules, so their 256-expert pools
+        // pick up the MXFP4 passthrough for free.
+        assert_eq!(m("mtp.0.attn.wq_a.weight").as_deref(),
+                   Some("model.layers.43.self_attn.q_a_proj.weight"));
+        assert_eq!(m("mtp.1.ffn.experts.5.w1.weight").as_deref(),
+                   Some("model.layers.44.mlp.experts.5.gate_proj.weight"));
+        assert_eq!(m("mtp.2.ffn_norm.weight").as_deref(),
+                   Some("model.layers.45.post_attention_layernorm.weight"));
+        // DSpark's own tensors have no analogue in a main layer and pass through unchanged.
+        assert_eq!(m("mtp.2.markov_head.markov_w1.weight").as_deref(),
+                   Some("model.layers.45.markov_head.markov_w1.weight"));
+        assert_eq!(m("mtp.0.main_proj.weight").as_deref(),
+                   Some("model.layers.43.main_proj.weight"));
+        assert_eq!(m("mtp.2.confidence_head.proj.weight").as_deref(),
+                   Some("model.layers.45.confidence_head.proj.weight"));
+        // The confidence head is a single row; quantising it would be silly.
+        assert_eq!(classify_head("model.layers.45.confidence_head.proj.weight", 43, false, false, 3),
+                   Kind::F32);
+        // The I64 index table is KEPT, mapped like any other gate tensor and stored as
+        // F32 (its values are expert IDs, exact in f32). It is what the three hash-routing
+        // layers select with; dropping it left them choosing experts by score instead.
+        assert_eq!(m("layers.0.ffn.gate.tid2eid").as_deref(),
+                   Some("model.layers.0.mlp.gate.tid2eid"));
+        assert_eq!(classify("model.layers.0.mlp.gate.tid2eid", 43, false, false), Kind::F32);
+        // ...but the ordinary gate weights still map.
+        assert_eq!(m("layers.0.ffn.gate.weight").as_deref(),
+                   Some("model.layers.0.mlp.gate.weight"));
+
+        // No two distinct sources may collide on one container name.
+        let mut seen = std::collections::HashSet::new();
+        for l in [0usize, 1, 42] {
+            for t in ["attn.wq_a.weight", "attn.wq_b.weight", "attn.wkv.weight",
+                      "attn.wo_a.weight", "attn.wo_b.weight", "attn.q_norm.weight",
+                      "attn.kv_norm.weight", "attn_norm.weight", "ffn_norm.weight",
+                      "hc_attn_fn", "hc_ffn_fn", "ffn.gate.weight",
+                      "ffn.experts.0.w1.weight", "ffn.experts.0.w2.weight",
+                      "ffn.experts.0.w3.weight", "ffn.shared_experts.w1.weight"] {
+                let src = format!("layers.{l}.{t}");
+                let got = m(&src).unwrap_or_else(|| panic!("unmapped: {src}"));
+                assert!(seen.insert(got.clone()), "collision on {got} (from {src})");
+            }
+        }
+    }
+
     fn kimi_k3_name_mapping() {
         let m = |s: &str| kimi_container_name(s);
         assert_eq!(

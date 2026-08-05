@@ -79,6 +79,14 @@ extern "C" {
         o: c_int,
         device: c_int,
     ) -> c_int;
+    fn coli_cuda_expert_mlp_mxfp4(
+        gate: *mut ColiCudaTensor,
+        up: *mut ColiCudaTensor,
+        down: *mut ColiCudaTensor,
+        y: *mut f32,
+        x: *const f32,
+        s: c_int,
+    ) -> c_int;
     fn coli_cuda_expert_mlp_mxfp4_situ(
         gate: *mut ColiCudaTensor,
         up: *mut ColiCudaTensor,
@@ -189,6 +197,17 @@ extern "C" {
         y: *mut f32,
         x: *const f32,
     ) -> c_int;
+    // Grouped MXFP4 SwiGLU (DeepSeek-V4). Same shape as the NVFP4 group; exists because
+    // V4 had no fmt-6 arm and paid a full stream sync PER EXPERT (301 per decode token).
+    fn coli_cuda_expert_group_mxfp4(
+        gates: *const *mut ColiCudaTensor,
+        ups: *const *mut ColiCudaTensor,
+        downs: *const *mut ColiCudaTensor,
+        rows: *const c_int,
+        count: c_int,
+        y: *mut f32,
+        x: *const f32,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn coli_cuda_attention_absorb_batch(
         kv_b: *mut ColiCudaTensor,
@@ -268,6 +287,21 @@ extern "C" {
         t: c_int,
         pos_base: c_int,
         device: c_int,
+    ) -> c_int;
+    // DeepSeek-V4 sparse attention core: `idxs` is [S,K] into `kv`, -1 = masked,
+    // duplicates meaningful, sink in the denominator only.
+    fn coli_cuda_dsv4_sparse_attn(
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const c_int,
+        s: c_int,
+        h: c_int,
+        d: c_int,
+        k: c_int,
+        rows: c_int,
+        scale: f32,
+        out: *mut f32,
     ) -> c_int;
     // DSA sparse prefill absorb: each query attends only to its indexer selection.
     fn coli_cuda_attention_absorb_sparse(
@@ -845,6 +879,33 @@ pub unsafe fn expert_seg_nvfp4_relu2_raw(
 /// Grouped NVFP4 **SwiGLU** experts (M2.7 / M3 / GLM-5.2): the three-tensor twin of
 /// [`expert_group_nvfp4_relu2_raw`]. These models previously had no grouped path at all and
 /// fell through to one `expert_mlp_nvfp4` call per expert — ~15872 round trips per prefill.
+pub unsafe fn expert_group_mxfp4_raw(
+    gates: &[*mut ColiCudaTensor],
+    ups: &[*mut ColiCudaTensor],
+    downs: &[*mut ColiCudaTensor],
+    rows: &[i32],
+    y: *mut f32,
+    x: *const f32,
+) -> bool {
+    let count = gates.len();
+    if count == 0 || ups.len() != count || downs.len() != count || rows.len() != count {
+        return false;
+    }
+    coli_cuda_expert_group_mxfp4(
+        gates.as_ptr(),
+        ups.as_ptr(),
+        downs.as_ptr(),
+        rows.as_ptr(),
+        count as c_int,
+        y,
+        x,
+    ) != 0
+}
+
+/// Grouped MXFP4 SwiGLU experts — one upload/sync for the whole group.
+///
+/// # Safety
+/// `gates`/`ups`/`downs` are resident fmt-6 tensors; `x`/`y` hold `sum(rows)*D` floats.
 pub unsafe fn expert_group_nvfp4_raw(
     gates: &[*mut ColiCudaTensor],
     ups: &[*mut ColiCudaTensor],
@@ -1028,6 +1089,27 @@ pub unsafe fn dsa_indexer_scores_raw(
     coli_cuda_dsa_indexer_scores(scores, qi, hw, keys, nsp, s0, nh, hd, t, pos_base, device) != 0
 }
 
+/// DeepSeek-V4 sparse attention core (48% of V4 decode as a scalar CPU loop).
+///
+/// # Safety
+/// `q` has `s*h*d` floats, `kv` `rows*d`, `sink` `h`, `idxs` `s*k` ints, `out` `s*h*d`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn dsv4_sparse_attn_raw(
+    q: *const f32,
+    kv: *const f32,
+    sink: *const f32,
+    idxs: *const i32,
+    s: i32,
+    h: i32,
+    d: i32,
+    k: i32,
+    rows: i32,
+    scale: f32,
+    out: *mut f32,
+) -> bool {
+    coli_cuda_dsv4_sparse_attn(q, kv, sink, idxs, s, h, d, k, rows, scale, out) != 0
+}
+
 pub unsafe fn attention_absorb_sparse_raw(
     kv_b: *mut ColiCudaTensor,
     ctx: *mut f32,
@@ -1140,6 +1222,23 @@ impl Backend for CudaBackend {
     }
 }
 
+/// MXFP4 experts with the engine's configured SwiGLU (DeepSeek-V4). The `_situ` twin
+/// applies K3's activation instead; the two differ only in that step.
+///
+/// # Safety
+/// `gate`/`up`/`down` must stay live across the call (it is synchronous, including the
+/// download); `x`/`y` hold `S*gate.I` / `S*down.O` floats.
+pub unsafe fn expert_mlp_mxfp4_raw(
+    gate: *mut ColiCudaTensor,
+    up: *mut ColiCudaTensor,
+    down: *mut ColiCudaTensor,
+    y: *mut f32,
+    x: *const f32,
+    s: i32,
+) -> bool {
+    coli_cuda_expert_mlp_mxfp4(gate, up, down, y, x, s as c_int) != 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1169,3 +1268,4 @@ mod tests {
         shutdown();
     }
 }
+

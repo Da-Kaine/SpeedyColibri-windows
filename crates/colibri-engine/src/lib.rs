@@ -15,11 +15,13 @@ pub mod cache;
 pub mod chunk;
 pub mod convert;
 pub mod dsa;
+pub mod dsv4;
 pub mod forward;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 #[cfg(feature = "cuda")]
 pub mod gpubench;
+pub mod hc;
 pub mod kda;
 pub mod linear;
 pub mod loader;
@@ -50,9 +52,9 @@ pub use forward::{
     kimi_forward, layer_forward, layer_forward_kind, logits, mamba2_mixer, DecodeStats,
 };
 pub use linear::{embed_row, matmul_f32, matmul_qt};
-pub use loader::{ld, qt_load};
+pub use loader::{ld, qt_load, two_dims_of};
 pub use math::{layernorm, rmsnorm, rope_interleave, sigmoid, silu, softmax};
-pub use model::{KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
+pub use model::{DsparkHead, KvCache, Layer, Model, MtpBlock, MtpHead, KV_UNSET};
 pub use moe::{
     cluster_ctx, compute_experts_partial, dense_mlp, kimi_moe, moe, moe_sharded, nemotron_moe,
     route, set_activation, set_cluster, ClusterCtx, Expert, ExpertLayout, ExpertProvider,
@@ -155,14 +157,170 @@ fn load_layer(
     let mut l = Layer::default();
     l.in_ln = ld(shards, &p("input_layernorm.weight"))?;
     l.post_ln = ld(shards, &p("post_attention_layernorm.weight"))?;
-    // Output projection is shared by both attention flavours (`[hidden, n_heads*head_dim]`).
-    l.o = qt_load(
-        shards,
-        &p("self_attn.o_proj.weight"),
-        d,
-        h * cfg.v_head as usize,
-        dbits,
-    )?;
+    // Output projection. Every arch here except DeepSeek-V4 has a single
+    // `[hidden, n_heads*head_dim]` o_proj shared by both attention flavours; V4 replaces
+    // it with a LoRA pair (`o_a` then `o_b`) and ships no `o_proj` at all, so asking for
+    // one there fails the load with "missing tensor" — which is exactly how this was found.
+    if cfg.arch == colibri_core::Arch::DeepseekV4 {
+        // o_a: [g*rank, n_heads*head_dim/g]   -> [8192, 4096] on the released checkpoint
+        // o_b: [hidden,  g*rank]               -> [4096, 8192]
+        //
+        // Dims come from Config, NOT from the tensor: the container stores quantised
+        // weights as flat blobs, so `o_a` arrives as [33554432] and 8192x4096 is only one
+        // of its factorisations. Reading the shape back would be guessing.
+        let g = cfg.o_groups.max(1) as usize;
+        let rank = cfg.o_lora as usize;
+        let (oa_o, oa_i) = (g * rank, h * cfg.qk_head as usize / g);
+        let (ob_o, ob_i) = (d, g * rank);
+        l.o_a = Some(qt_load(shards, &p("self_attn.o_a_proj.weight"), oa_o, oa_i, dbits)?);
+        l.o_b = Some(qt_load(shards, &p("self_attn.o_b_proj.weight"), ob_o, ob_i, dbits)?);
+        // Split `o_a` into its row-blocks now; the forward path never uses it whole.
+        // A format whose rows are not independently addressable declines here rather than
+        // producing a silently mis-strided split.
+        l.o_a_groups = crate::quantize::split_row_blocks(l.o_a.as_ref().unwrap(), g)
+            .ok_or_else(|| std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{}: cannot split into {g} O-LoRA groups (fmt {})",
+                        p("self_attn.o_a_proj.weight"),
+                        l.o_a.as_ref().unwrap().fmt_code),
+            ))?;
+        // Per-head sink, one f32 per attention head.
+        l.attn_sink = ld(shards, &p("self_attn.attn_sink"))?;
+        // Hyper-Connection weights for this layer's two sublayers, plus their input norms.
+        // These are the residual stream's own parameters — without them the stream is not
+        // merely unoptimised, it is undefined — so a missing tensor is an error, not a
+        // default. Shapes are checked against Config here rather than trusted, because a
+        // silently short `*_fn` would make `chunks_exact` yield fewer mixes and quietly
+        // drop the tail of the mixing matrix.
+        let hc = cfg.hc_mult as usize;
+        let mw = crate::hc::mix_width(hc);
+        let n = hc * d;
+        let mut hcv = |name: &str, want: usize| -> std::io::Result<Vec<f32>> {
+            let v = ld(shards, &p(name))?;
+            if v.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{}: expected {want} f32, got {} — Config says hc_mult={hc}, hidden={d}",
+                            p(name), v.len()),
+                ));
+            }
+            Ok(v)
+        };
+        // Compressor, on the 41 layers that have one. `compress_ratios` is indexed by
+        // layer and is what decides both presence and shape.
+        l.comp_ratio = cfg.compress_ratios.get(i).copied().unwrap_or(0);
+        if l.comp_ratio > 0 {
+            let hd = cfg.qk_head as usize;
+            let coff = if l.comp_ratio == 4 { 2 } else { 1 };
+            let w = coff * hd;
+            l.comp_wkv =
+                Some(qt_load(shards, &p("self_attn.compressor.wkv.weight"), w, d, dbits)?);
+            l.comp_wgate =
+                Some(qt_load(shards, &p("self_attn.compressor.wgate.weight"), w, d, dbits)?);
+            l.comp_ape = ld(shards, &p("self_attn.compressor.ape"))?;
+            l.comp_norm = ld(shards, &p("self_attn.compressor.norm.weight"))?;
+            let want = l.comp_ratio as usize * w;
+            if l.comp_ape.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: expected {want} f32 (ratio {} x {w}), got {} — compress_ratios[{i}] disagrees with the checkpoint",
+                        p("self_attn.compressor.ape"), l.comp_ratio, l.comp_ape.len()
+                    ),
+                )
+                .into());
+            }
+        }
+        // Indexer, on the 21 layers that have one. Presence is probed rather than derived:
+        // `compress_ratios` says which layers have a COMPRESSOR (41), and the indexer set
+        // (21) is a subset of those — deriving one from the other would silently ask 20
+        // layers for tensors they do not ship.
+        if shards.has(&p("self_attn.indexer.wq_b.weight")) {
+            let inh = cfg.index_nh as usize;
+            let ihd = cfg.index_hd as usize;
+            let ql = cfg.q_lora as usize;
+            let icoff = if l.comp_ratio == 4 { 2 } else { 1 };
+            let iw = icoff * ihd;
+            l.idx_wq_b =
+                Some(qt_load(shards, &p("self_attn.indexer.wq_b.weight"), inh * ihd, ql, dbits)?);
+            l.idx_wproj =
+                Some(qt_load(shards, &p("self_attn.indexer.weights_proj.weight"), inh, d, dbits)?);
+            l.idx_comp_wkv =
+                Some(qt_load(shards, &p("self_attn.indexer.compressor.wkv.weight"), iw, d, dbits)?);
+            l.idx_comp_wgate =
+                Some(qt_load(shards, &p("self_attn.indexer.compressor.wgate.weight"), iw, d, dbits)?);
+            l.idx_comp_ape = ld(shards, &p("self_attn.indexer.compressor.ape"))?;
+            l.idx_comp_norm = ld(shards, &p("self_attn.indexer.compressor.norm.weight"))?;
+        }
+        // Hash routing (`num_hash_layers`, the first 3 layers). Stored as F32 because its
+        // values are expert IDs and every integer below 2^24 is exact in f32; converted to
+        // indices once, here, rather than casting per token in the router.
+        //
+        // Probed rather than derived from `n_hash_layers`: an older container converted
+        // before the table was kept simply has no such tensor, and asking for it would
+        // fail the whole load instead of falling back to score routing.
+        // A container converted before the table was kept has none, and those layers fall
+        // back to score routing — which loads, generates, and is wrong. Say so once.
+        if cfg.arch == colibri_core::Arch::DeepseekV4
+            && (i as i32) < cfg.n_hash_layers
+            && !shards.has(&p("mlp.gate.tid2eid"))
+        {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "[dsv4] this container has no `mlp.gate.tid2eid`, so the first {} \
+                     layers will select experts by SCORE instead of by the hash table. \
+                     Reconvert (with COLI_KEEP_INDEXER=1) to fix.",
+                    cfg.n_hash_layers
+                );
+            });
+        }
+        if cfg.arch == colibri_core::Arch::DeepseekV4 && shards.has(&p("mlp.gate.tid2eid")) {
+            let raw = ld(shards, &p("mlp.gate.tid2eid"))?;
+            let want = cfg.vocab as usize * cfg.topk as usize;
+            if raw.len() != want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: expected {want} entries (vocab {} x topk {}), got {}",
+                        p("mlp.gate.tid2eid"), cfg.vocab, cfg.topk, raw.len()
+                    ),
+                )
+                .into());
+            }
+            let n_exp = cfg.n_experts as i64;
+            l.tid2eid = raw
+                .iter()
+                .map(|&v| {
+                    let e = v as i64;
+                    if e < 0 || e >= n_exp {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("{}: expert id {e} outside 0..{n_exp}", p("mlp.gate.tid2eid")),
+                        ));
+                    }
+                    Ok(e as u32)
+                })
+                .collect::<std::io::Result<Vec<u32>>>()?;
+        }
+        l.hc_attn_fn = hcv("hc_attn_fn", mw * n)?;
+        l.hc_attn_base = hcv("hc_attn_base", mw)?;
+        l.hc_attn_scale = hcv("hc_attn_scale", 3)?;
+        l.hc_ffn_fn = hcv("hc_ffn_fn", mw * n)?;
+        l.hc_ffn_base = hcv("hc_ffn_base", mw)?;
+        l.hc_ffn_scale = hcv("hc_ffn_scale", 3)?;
+        // V4's `attn_norm`/`ffn_norm` are canonicalized by the converter to
+        // `input_layernorm`/`post_attention_layernorm`, which `in_ln`/`post_ln` already
+        // hold — loaded above for every arch. No separate fields.
+    } else {
+        l.o = qt_load(
+            shards,
+            &p("self_attn.o_proj.weight"),
+            d,
+            h * cfg.v_head as usize,
+            dbits,
+        )?;
+    }
 
     if cfg.arch.is_gqa() {
         // GQA attention (MiniMax M3/M2): q/k/v projections + QK-norm. `qk_head` is the
@@ -247,27 +405,53 @@ fn load_layer(
             cfg.q_lora as usize,
             dbits,
         )?;
-        l.kv_a = qt_load(
-            shards,
-            &p("self_attn.kv_a_proj_with_mqa.weight"),
-            (cfg.kv_lora + cfg.qk_rope) as usize,
-            d,
-            dbits,
-        )?;
-        l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
-        l.kv_b = qt_load(
-            shards,
-            &p("self_attn.kv_b_proj.weight"),
-            h * (cfg.qk_nope + cfg.v_head) as usize,
-            cfg.kv_lora as usize,
-            dbits,
-        )?;
+        if cfg.arch == colibri_core::Arch::DeepseekV4 {
+            // V4's KV path is NOT V3's. `wkv` projects hidden -> head_dim and that latent
+            // is used directly as both K and V after `kv_norm` — there is no kv_b, and no
+            // `_with_mqa` suffix on the name. Loading it through the V3 arm would ask for
+            // two tensors this checkpoint does not contain.
+            l.kv_a = qt_load(
+                shards,
+                &p("self_attn.kv_a_proj.weight"),
+                cfg.kv_lora as usize,
+                d,
+                dbits,
+            )?;
+            l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+        } else {
+            l.kv_a = qt_load(
+                shards,
+                &p("self_attn.kv_a_proj_with_mqa.weight"),
+                (cfg.kv_lora + cfg.qk_rope) as usize,
+                d,
+                dbits,
+            )?;
+            l.kv_a_ln = ld(shards, &p("self_attn.kv_a_layernorm.weight"))?;
+            l.kv_b = qt_load(
+                shards,
+                &p("self_attn.kv_b_proj.weight"),
+                h * (cfg.qk_nope + cfg.v_head) as usize,
+                cfg.kv_lora as usize,
+                dbits,
+            )?;
+        }
 
         // DSA lightning indexer — present only when the checkpoint was converted with the
         // indexer weights (`--indexer`). Load per layer that carries them; a model without
         // these tensors leaves the fields `None` and attention runs dense. Names/dims match
         // the C loader (`self_attn.indexer.{wq_b,wk,weights_proj,k_norm}`).
-        if cfg.index_hd > 0 && cfg.index_nh > 0 && shards.has(&p("self_attn.indexer.wq_b.weight")) {
+        // DeepSeek-V4 also carries an `indexer.*` subtree and sets index_hd/index_nh, but
+        // its indexer is a DIFFERENT structure: compressor-based
+        // (`indexer.compressor.{ape,norm,wgate,wkv}` + `weights_proj` + `wq_b`) with no
+        // `wk` at all. Letting it open the GLM arm gets two tensors in before failing on
+        // `indexer.wk.weight`. Until the V4 indexer forward path exists, V4 runs DENSE
+        // attention — correct but not sparse, and skipping the load is what makes that
+        // explicit rather than half-loading a sparse path that cannot run (#59).
+        if cfg.arch != colibri_core::Arch::DeepseekV4
+            && cfg.index_hd > 0
+            && cfg.index_nh > 0
+            && shards.has(&p("self_attn.indexer.wq_b.weight"))
+        {
             let (nh, hd) = (cfg.index_nh as usize, cfg.index_hd as usize);
             l.ix_wq = Some(qt_load(
                 shards,
@@ -308,8 +492,22 @@ fn load_layer(
         // The router selection bias sits under `.gate.` on GLM but directly under the
         // MoE block on MiniMax-M3 (`block_sparse_moe.e_score_correction_bias` →
         // `mlp.e_score_correction_bias`); accept either.
+        // DeepSeek-V4 spells it `mlp.gate.bias`, and its three hash-routing layers
+        // (`num_hash_layers`) carry NO bias at all — they route by the `tid2eid` table
+        // instead, which is not converted yet (#59). Falling back to zeros there keeps the
+        // other 40 layers loadable; a zero bias is exactly "no selection preference", so it
+        // is the honest neutral value rather than a fudge. Those 3 layers will still route
+        // wrongly until tid2eid lands — they are wrong by omission, not by this default.
         l.router_bias = ld(shards, &p("mlp.gate.e_score_correction_bias"))
-            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))?;
+            .or_else(|_| ld(shards, &p("mlp.e_score_correction_bias")))
+            .or_else(|_| ld(shards, &p("mlp.gate.bias")))
+            .or_else(|e| {
+                if cfg.arch == colibri_core::Arch::DeepseekV4 {
+                    Ok(vec![0f32; cfg.n_experts as usize])
+                } else {
+                    Err(e)
+                }
+            })?;
         // Shared expert — GLM/M3 have one; MiniMax-M2 has none (n_shared 0). Only load
         // (and later compute) it when present, else the tensors are absent from the
         // container and the fields stay at their empty default.
@@ -881,6 +1079,42 @@ fn mark_gpu_eligible(l: &mut Layer) {
     ] {
         t.gpu_eligible = true;
     }
+    // DeepSeek-V4's O-LoRA. `o_a_groups` is the one the forward path actually calls —
+    // `o_a` is only its source — and the split happens in the LOADER, before this pass
+    // runs, so the blocks inherited `gpu_eligible = false` and every one of them took the
+    // single-threaded CPU matmul. Measured cost of that omission: the O-LoRA was
+    // **305 ms/token, 58% of V4 decode**, at ~0.89 ms per group matmul against 21.8 us
+    // for the same shape in `coli gpubench` — 40x off, because it was not on the GPU at
+    // all. Counting dispatches is what identified it: 4 GPU matmuls per layer where 13
+    // were expected. Exactly the omission the M3 note below records, with the same shape
+    // of consequence.
+    for t in [&mut l.o_a, &mut l.o_b] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
+    for t in l.o_a_groups.iter_mut() {
+        t.gpu_eligible = true;
+    }
+    // DeepSeek-V4's Compressor and Indexer projections.
+    //
+    // `comp_wkv`/`comp_wgate` run on EVERY token of 41 layers — they are how V4 has any
+    // context past its 128-token window — and were unmarked from the day the Compressor
+    // shipped, i.e. two `[4096 -> 1024]` matmuls per layer per token on a single core.
+    // The four `idx_*` are the same story for the Indexer's 21 layers, including its own
+    // Compressor. Nothing fails when these are missing; the work just moves off the GPU.
+    for t in [
+        &mut l.comp_wkv,
+        &mut l.comp_wgate,
+        &mut l.idx_wq_b,
+        &mut l.idx_wproj,
+        &mut l.idx_comp_wkv,
+        &mut l.idx_comp_wgate,
+    ] {
+        if let Some(t) = t {
+            t.gpu_eligible = true;
+        }
+    }
     // DSA indexer projections: batched in `indexer_forward`, so they want the GPU.
     // `matmul_qt`'s CPU path is single-threaded — a batched call on one core is
     // *slower* than the old per-query GEMVs spread across the indexer's worker
@@ -1038,6 +1272,24 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
         (Vec::new(), Vec::new())
     };
 
+    // DeepSeek-V4's model-level Hyper-Connection head. Same reasoning as K3's block above:
+    // loaded unconditionally when the config declares HC rather than probed, because a V4
+    // container without it cannot produce logits — the `[hc, hidden]` stream would reach
+    // the LM head unconverted. `hc_head_scale` is a 1-element tensor, not a vector.
+    let (hc_head_fn, hc_head_base, hc_head_scale) = if cfg.hc_mult > 0 {
+        let scale = ld(&shards, "model.hc_head_scale")?;
+        let s = *scale.first().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "model.hc_head_scale is empty")
+        })?;
+        (
+            ld(&shards, "model.hc_head_fn")?,
+            ld(&shards, "model.hc_head_base")?,
+            s,
+        )
+    } else {
+        (Vec::new(), Vec::new(), 0.0)
+    };
+
     let mut layers = Vec::with_capacity(cfg.n_layers as usize);
     for i in 0..cfg.n_layers as usize {
         let sparse = i as i32 >= cfg.first_dense;
@@ -1050,6 +1302,75 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
     let has_dsa = (0..cfg.n_layers as usize)
         .any(|i| shards.has(&format!("model.layers.{i}.self_attn.indexer.wq_b.weight")));
 
+    // DSpark, opt-in. The stage COUNT is probed, never derived: the released config.json
+    // says `num_nextn_predict_layers = 1` while the checkpoint ships three stages, and
+    // believing it loads one third of the head without complaining. Same probe the
+    // converter does.
+    let dspark = if std::env::var("COLI_DSPARK").ok().as_deref() == Some("1")
+        && cfg.arch == colibri_core::Arch::DeepseekV4
+    {
+        let n = cfg.n_layers as usize;
+        let stages: Vec<usize> = (0..8)
+            .take_while(|i| shards.has(&format!("model.layers.{}.self_attn.q_a_proj.weight", n + i)))
+            .collect();
+        if stages.is_empty() {
+            eprintln!(
+                "[dsv4] COLI_DSPARK=1 but this container has no DSpark stages — reconvert \
+                 (the head is dropped by containers built before it was kept)."
+            );
+            None
+        } else {
+            let last = n + stages.len() - 1;
+            let optq = |nm: String, o: usize, i: usize| -> Result<Option<QTensor>, EngineError> {
+                Ok(if shards.has(&nm) { Some(qt_load(&shards, &nm, o, i, dbits)?) } else { None })
+            };
+            let optv = |nm: String| -> Result<Vec<f32>, EngineError> {
+                Ok(if shards.has(&nm) { ld(&shards, &nm)? } else { Vec::new() })
+            };
+            let d = cfg.hidden as usize;
+            let head = DsparkHead {
+                stages: stages
+                    .iter()
+                    // A DSpark stage is a full V4 block, and V4 is all-MoE — `sparse: true`.
+                    // Loading it dense asks for `mlp.gate_proj.weight`, which no V4 layer has.
+                    .map(|i| load_layer(&shards, &cfg, n + i, dbits, true))
+                    .collect::<Result<Vec<_>, EngineError>>()?,
+                main_proj: optq(
+                    format!("model.layers.{n}.main_proj.weight"),
+                    d,
+                    d * cfg.dspark_targets.len().max(1),
+                )?,
+                main_norm: optv(format!("model.layers.{n}.main_norm.weight"))?,
+                norm: optv(format!("model.layers.{last}.norm.weight"))?,
+                markov_w1: optq(
+                    format!("model.layers.{last}.markov_head.markov_w1.weight"),
+                    cfg.vocab as usize,
+                    cfg.markov_rank as usize,
+                )?,
+                markov_w2: optq(
+                    format!("model.layers.{last}.markov_head.markov_w2.weight"),
+                    cfg.vocab as usize,
+                    cfg.markov_rank as usize,
+                )?,
+                confidence: optv(format!("model.layers.{last}.confidence_head.proj.weight"))?,
+                hc_head_fn: optv(format!("model.layers.{last}.hc_head_fn"))?,
+                hc_head_base: optv(format!("model.layers.{last}.hc_head_base"))?,
+                hc_head_scale: optv(format!("model.layers.{last}.hc_head_scale"))?
+                    .first()
+                    .copied()
+                    .unwrap_or(0.0),
+            };
+            eprintln!(
+                "[dsv4] DSpark: {} stages at layers {n}..={last}, block {}, markov rank {}, \
+                 targets {:?}",
+                head.stages.len(), cfg.dspark_block, cfg.markov_rank, cfg.dspark_targets
+            );
+            Some(head)
+        }
+    } else {
+        None
+    };
+
     let mut model = Model {
         cfg,
         shards,
@@ -1061,9 +1382,13 @@ pub fn load_model_with(snap: impl AsRef<Path>, opts: LoadOptions) -> Result<Mode
         layers,
         output_attn_res_norm,
         output_attn_res_proj,
+        hc_head_fn,
+        hc_head_base,
+        hc_head_scale,
         has_dsa,
         has_mtp: mtp.is_some(),
         mtp,
+        dspark,
     };
     // Dense weights are resident for the model's lifetime → GPU-cacheable.
     //
@@ -1197,10 +1522,18 @@ mod gpu_eligible_tests {
             ix_wk: q(),
             ix_wq: q(),
             ix_wp: q(),
+            o_a: q(),
+            o_b: q(),
+            comp_wkv: q(),
+            comp_wgate: q(),
+            idx_wq_b: q(),
+            idx_wproj: q(),
+            idx_comp_wkv: q(),
+            idx_comp_wgate: q(),
             ..Default::default()
         };
         mark_gpu_eligible(&mut l);
-        let opts: [(&str, &Option<colibri_core::QTensor>); 17] = [
+        let opts: [(&str, &Option<colibri_core::QTensor>); 25] = [
             ("q_proj", &l.q_proj),
             ("k_proj", &l.k_proj),
             ("v_proj", &l.v_proj),
@@ -1218,6 +1551,14 @@ mod gpu_eligible_tests {
             ("ix_wk", &l.ix_wk),
             ("ix_wq", &l.ix_wq),
             ("ix_wp", &l.ix_wp),
+            ("o_a", &l.o_a),
+            ("o_b", &l.o_b),
+            ("comp_wkv", &l.comp_wkv),
+            ("comp_wgate", &l.comp_wgate),
+            ("idx_wq_b", &l.idx_wq_b),
+            ("idx_wproj", &l.idx_wproj),
+            ("idx_comp_wkv", &l.idx_comp_wkv),
+            ("idx_comp_wgate", &l.idx_comp_wgate),
         ];
         for (name, t) in opts {
             assert!(
@@ -1225,6 +1566,23 @@ mod gpu_eligible_tests {
                 "{name} is missing from mark_gpu_eligible"
             );
         }
+
+        // The list above is ALSO hand-maintained, which is the very trap this test exists
+        // to catch — it passed for as long as `comp_wkv`/`comp_wgate` were missing, simply
+        // because nobody added them here either. Count the struct's fields from source and
+        // require the list to match, so a new `Option<QTensor>` cannot be added without
+        // this failing. Same technique as `Layer::resident_bytes`'s guard.
+        let src = include_str!("model.rs");
+        let start = src.find("pub struct Layer {").expect("Layer struct");
+        let body = &src[start..start + src[start..].find("\n}").expect("struct end")];
+        let n_fields = body.matches(": Option<QTensor>").count();
+        assert_eq!(
+            opts.len(),
+            n_fields,
+            "Layer has {n_fields} Option<QTensor> fields but this test checks {} — add the \
+             new one here AND to mark_gpu_eligible",
+            opts.len()
+        );
     }
 }
 

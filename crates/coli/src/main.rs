@@ -507,8 +507,12 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         .as_ref()
         .map(|c| c.arch == colibri_core::Arch::KimiK3)
         .unwrap_or(false);
+    let deepseek_v4 = src_cfg
+        .as_ref()
+        .map(|c| c.arch == colibri_core::Arch::DeepseekV4)
+        .unwrap_or(false);
     let gemma_norm = src_cfg.as_ref().map(|c| c.gemma_norm).unwrap_or(false);
-    let n_layers = if minimax || nemotron || kimi {
+    let n_layers = if minimax || nemotron || kimi || deepseek_v4 {
         src_cfg.as_ref().map(|c| c.n_layers as usize).unwrap_or(60)
     } else {
         env_u32("COLI_NLAYERS", 78) as usize
@@ -530,6 +534,7 @@ fn cmd_convert(args: &[String]) -> ExitCode {
         // Drop the resulting shard into an existing container (Shards::open indexes
         // every *.safetensors in the dir) to enable drafting without re-converting.
         mtp_only: env_u32("COLI_MTP_ONLY", 0) != 0,
+        deepseek_v4,
         // MiniMax-M3 name/norm handling (auto-detected above).
         minimax,
         gemma_norm,
@@ -816,6 +821,25 @@ fn cmd_gen(args: &[String]) -> ExitCode {
                 s.misses,
                 s.evictions
             );
+            // DeepSeek-V4 Indexer pruning. Not CUDA-gated: it is a model mechanism, and
+            // its success case is "tokens unchanged", so without this line a skipped
+            // Indexer and a working one look identical from the outside.
+            {
+                let (scored, seen, kept) = colibri_engine::forward::dsv4_indexer_stats();
+                let (skipped, skip_max) = colibri_engine::forward::dsv4_indexer_skips();
+                if scored > 0 {
+                    println!(
+                        "indexer: {scored} queries scored, {seen} candidate rows -> {kept} kept \
+                         ({:.1}% pruned)",
+                        100.0 * (seen - kept) as f64 / seen as f64
+                    );
+                }
+                if skipped > 0 {
+                    println!(
+                        "indexer: {skipped} queries kept everything (largest candidate set {skip_max})"
+                    );
+                }
+            }
             #[cfg(feature = "cuda")]
             {
                 let (n, bytes, evict, budget) = colibri_engine::gpu::ffn_cache_stats();
@@ -1366,6 +1390,19 @@ fn finish_gen(
                 seq.len() - prompt.len(),
                 &seq[prompt.len()..]
             );
+            // DeepSeek-V4 Indexer pruning. Printed whenever it actually scored, because
+            // "tokens unchanged" is the SUCCESS case for a mechanism that drops the least
+            // relevant rows — and is indistinguishable from it never having run.
+            {
+                let (scored, seen, kept) = colibri_engine::forward::dsv4_indexer_stats();
+                if scored > 0 {
+                    println!(
+                        "indexer: {scored} queries scored, {seen} candidate rows -> {kept} kept \
+                         ({:.1}% pruned)",
+                        100.0 * (seen - kept) as f64 / seen as f64
+                    );
+                }
+            }
             #[cfg(feature = "cuda")]
             {
                 println!(
@@ -1921,6 +1958,10 @@ fn cmd_repack(args: &[String]) -> ExitCode {
 /// blocking HtoD copy, a launch, a DtoH copy and a stream sync. The sweep includes a
 /// deliberately tiny shape whose arithmetic is negligible, so its time IS the fixed
 /// per-call floor and every real shape can be reported against it.
+///
+/// Prints two tables. The second sweeps the fused routed-expert FFN for nvfp4 AND mxfp4,
+/// which is the only way to measure MXFP4 at all — fmt 6 is expert-only, so it has no
+/// dense matmul the first table could call.
 #[cfg(feature = "cuda")]
 fn cmd_gpubench(args: &[String]) -> ExitCode {
     let s: usize = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(1);
@@ -1930,6 +1971,7 @@ fn cmd_gpubench(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     colibri_engine::gpubench::report(s, reps);
+    colibri_engine::gpubench::report_experts(s, reps);
     ExitCode::SUCCESS
 }
 
@@ -3312,10 +3354,26 @@ fn preload_all_experts<P>(
     P: colibri_engine::ExpertProvider + Send + Sync + 'static,
 {
     use colibri_engine::ExpertProvider as _;
+    // `max_residency` means "the expert set fits", which is the safe auto-on condition.
+    // DeepSeek-V4 does NOT fit — 137 GiB of experts against a ~90 GiB budget, 66% coverage
+    // — and preloading it evicts as it goes, yet it is still a clear win. Measured on
+    // gx10-42b2, page cache dropped between arms (without that, a preload run leaves ~98 GB
+    // warm and the NEXT lazy run reads 4.66 — pure carry-over, which is how this nearly got
+    // recorded as noise):
+    //
+    //     preload off   3.12 / 3.16 tok/s        preload on   4.08 / 4.12   -> 1.31x
+    //
+    // The hit rate gets WORSE (90% -> 73%) and 5306 evictions happen; it wins anyway,
+    // because preload converts thousands of scattered decode-time reads into one sequential
+    // 20 s bulk read. That mechanism does not depend on fitting.
+    //
+    // Enabled for V4 specifically rather than fleet-wide: the argument generalises but the
+    // MEASUREMENT does not, and GLM/K3/M3 sit in different coverage regimes that were not
+    // tested here. Widen it only with numbers for those.
     let want = match std::env::var("COLI_PRELOAD_EXPERTS").ok().as_deref() {
         Some("0") => false,
         Some("1") => true,
-        _ => max_residency,
+        _ => max_residency || cfg.arch == colibri_core::Arch::DeepseekV4,
     };
     if !want {
         return;
