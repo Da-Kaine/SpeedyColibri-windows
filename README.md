@@ -144,12 +144,22 @@ Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
 | `MiniMax-M2.7-speedy-colibri-nvfp4` | 15 | complete |
 | `Nemotron-3-Super-120B-speedy-colibri-nvfp4` | 18 | complete |
 | `Kimi-K3-speedy-colibri-mxfp4` | 94 | complete |
-| `DeepSeek-V4-Flash-0731-speedy-colibri-mxfp4` | 45 | **uploading, ETA 2026-08-06** — build with `scripts/convert.sh deepseek-v4-flash` until then |
+| `DeepSeek-V4-Flash-0731-speedy-colibri-mxfp4` | 45 | complete |
 
 The box's upstream is **~41 Mbps**, and that is the ceiling rather than the tooling: NIC
 `tx_bytes` measured 5.15 MB/s at the Xet default vs 5.08 MB/s with
-`HF_XET_HIGH_PERFORMANCE=1`, two real configurations at the same rate. A 145 GiB container
-is therefore ~9 hours. Don't go looking for a faster uploader.
+`HF_XET_HIGH_PERFORMANCE=1` — two real configurations at the same rate.
+
+**But do not size an upload from the container's disk footprint.** The Hub's Xet transfer is
+content-addressed and dedupes *globally*, so a container whose experts pass through convert
+**bit-exact** barely transfers them — their chunks are already on the Hub inside the source
+repo. DeepSeek-V4 is 145 GiB on disk and moved **17.0 GB in 53 minutes**: ~89% deduped, and
+the 17 GB that did move went at 5.3 MB/s, i.e. exactly the link ceiling. The predicted
+~9 hours was wrong by an order of magnitude for that reason.
+
+That only applies to the **MXFP4 passthrough** models (DeepSeek-V4, Kimi-K3). The four NVFP4
+containers are *requantized* from fp8 sources, so their bytes are new and dedupe cannot help
+— size those from disk.
 
 **Which one loads** is chosen by the container you point `serve` at — one model per
 process. With Docker, set `COLI_MODEL_REPO` (and `COLI_MODEL_DIR` for a local snapshot);
