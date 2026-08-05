@@ -6,8 +6,9 @@
 #   docker/run-dgx.sh -h hf_xxxxxxxxxxxxxxxxxxxx -p 8080 -m m2.7
 #     -h <token>   Hugging Face token (first download only; also HF_TOKEN env)
 #     -p <port>    port to serve on                    (default 8080)
-#     -m <model>   nemotron | m2.7 | m3 | glm          (or any org/repo)
-#                  (default glm)
+#     -m <model>   nemotron | m2.7 | m3 | glm | k3 | v4  (or any org/repo)
+#                  (default glm). Names come from scripts/models.toml, and each
+#                  resolves to a PREBUILT container — no conversion on a fresh host.
 #   With flags and no subcommand it runs `serve`.
 #
 # Advanced / positional form (any coli subcommand):
@@ -33,17 +34,42 @@ IMAGE=${COLI_IMAGE:-speedycolibri:latest}
 
 # ---- friendly flags: -h <hf_token>  -p <port>  -m <model> ----------------------
 # `docker/run-dgx.sh -h hf_xxx -p 8080 -m m2.7` → download (+convert) + serve, one line.
-# Short model names resolve to their HF checkpoint; a full `org/repo` also works.
+# Short model names resolve to their HF repo; a full `org/repo` also works.
+#
+# THE REGISTRY IS `scripts/models.toml`, NOT A MAP IN THIS FILE. There used to be a
+# hardcoded case block here, and it drifted exactly as a second hand-maintained copy of a
+# closed set always does: it never gained `kimi-k3` or `deepseek-v4-flash` (so `-m v4` was
+# silently "unknown model"), and its four entries still pointed at the nvidia/unsloth
+# SOURCE checkpoints months after prebuilt containers existed — so every fresh host paid a
+# multi-hour conversion for a container it could have downloaded ready-made.
+#
+# `hf_repo` in the registry is the CONTAINER. Handing one to the entrypoint is safe and is
+# the fast path: `ensure_container` probes with `coli probe` and passes a container straight
+# through, converting only a source checkpoint.
+#
+# Aliases stay here because they are a UI concern, not registry data.
+model_canon() {
+  case "$1" in
+    nemotron|nemotron-h|nemotron3)  echo "nemotron-3-super" ;;
+    m2.7|m2|minimax-m2)             echo "minimax-m2.7" ;;
+    m3)                             echo "minimax-m3" ;;
+    glm|glm5.2|glm52)               echo "glm-5.2" ;;
+    k3|kimi|kimi-k3)                echo "kimi-k3" ;;
+    v4|deepseek|deepseek-v4|deepseek-v4-flash) echo "deepseek-v4-flash" ;;
+    *)                              echo "$1" ;;
+  esac
+}
 model_repo() {
   case "$1" in
-    nemotron|nemotron-h|nemotron-3-super|nemotron3)
-      echo "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4" ;;
-    m2.7|m2|minimax-m2.7|minimax-m2)     echo "nvidia/MiniMax-M2.7-NVFP4" ;;
-    m3|minimax-m3)                       echo "nvidia/MiniMax-M3-NVFP4" ;;
-    glm|glm-5.2|glm5.2|glm52)            echo "nvidia/GLM-5.2-NVFP4" ;;
-    */*)                                 echo "$1" ;;   # already a full org/repo or URL
-    *)                                   echo "" ;;     # unknown short name
+    */*) echo "$1"; return ;;   # already a full org/repo or URL — pass through
   esac
+  local py name repo
+  py=$(command -v python3) || { echo ""; return; }
+  name=$(model_canon "$1")
+  # `2>/dev/null` so an unknown name yields "" (the caller's error path) rather than a
+  # traceback; `|| true` keeps `set -e` from killing the script on that expected failure.
+  repo=$("$py" "$here/../scripts/model.py" get "$name" hf_repo 2>/dev/null) || true
+  echo "$repo"
 }
 used_flags=0
 while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "${1:-}" == --model ]]; do
@@ -51,24 +77,27 @@ while [[ "${1:-}" == -[hpm] || "${1:-}" == --hf-token || "${1:-}" == --port || "
     -h|--hf-token) export HF_TOKEN="${2:?-h needs a token}"; shift 2 ;;
     -p|--port)     export COLI_PORT="${2:?-p needs a port}"; shift 2 ;;
     -m|--model)
-      # Kimi-K3 deliberately has no short name: it cannot use the download-then-convert
-      # path this script drives. The source is 1561 GB and `coli convert` needs the source
-      # AND the container on disk at once (~2.96 TB), which does not fit on a Spark's 3.6 TB
-      # root beside any other model. `scripts/k3_fetch_convert.sh` exists for exactly this —
-      # it fetches and converts ONE SHARD AT A TIME so the two never coexist in full.
-      # Say so instead of resolving to the raw repo and letting the user discover it after
-      # a 1.5 TB download.
-      case "${2:-}" in
-        k3|kimi|kimi-k3|Kimi-K3)
-          echo "[run-dgx] kimi-k3 cannot be converted through this path: the source is 1561 GB and" >&2
-          echo "[run-dgx] conversion needs source + container on disk together (~2.96 TB)." >&2
-          echo "[run-dgx] Use one of:" >&2
-          echo "[run-dgx]   scripts/k3_fetch_convert.sh        # streams shard-by-shard, no 3 TB peak" >&2
-          echo "[run-dgx]   -m Kanposer/Kimi-K3-speedy-colibri-mxfp4   # prebuilt container (see its card for status)" >&2
-          exit 2 ;;
-      esac
+      # `-m k3` used to be REFUSED here, because the only route was download-then-convert:
+      # a 1561 GB source plus its container on disk at once (~2.96 TB) does not fit on a
+      # Spark's 3.6 TB root. That refusal is now obsolete — the registry resolves k3 to the
+      # prebuilt CONTAINER (which the refusal itself already suggested as the workaround),
+      # and `ensure_container` passes a container through without converting, so the 3 TB
+      # peak never happens. What remains is a big download, which is a warning, not a wall.
       repo="$(model_repo "${2:?-m needs a model}")"
-      [[ -n "$repo" ]] || { echo "[run-dgx] unknown model '$2' — try: nemotron, m2.7, m3, glm, or an org/repo (kimi-k3: see scripts/k3_fetch_convert.sh)" >&2; exit 2; }
+      if [[ -z "$repo" ]]; then
+        echo "[run-dgx] unknown model '$2'. Registered names:" >&2
+        if command -v python3 >/dev/null; then
+          python3 "$here/../scripts/model.py" list 2>/dev/null | awk '{printf "[run-dgx]   %s\n", $1}' >&2
+        fi
+        echo "[run-dgx] short forms: nemotron, m2.7, m3, glm, k3, v4 — or any org/repo" >&2
+        exit 2
+      fi
+      case "$(model_canon "$2")" in
+        kimi-k3)
+          echo "[run-dgx] note: kimi-k3's container is ~1.4 TB. It downloads ready-to-run (no" >&2
+          echo "[run-dgx] conversion), but budget the disk. To build it locally instead, without" >&2
+          echo "[run-dgx] the download, use scripts/k3_fetch_convert.sh (shard-at-a-time)." >&2 ;;
+      esac
       export COLI_MODEL_REPO="$repo"; shift 2 ;;
   esac
   used_flags=1

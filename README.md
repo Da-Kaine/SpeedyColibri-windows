@@ -134,8 +134,12 @@ Registered in [`scripts/models.toml`](scripts/models.toml) — serve any by name
 | **`kimi-k3`** | 1.5T | **hybrid**: 93 layers = 69 KDA (delta-rule linear attn) + 24 gated MLA (NoPE + output gate) | 896, top-16 (latent, 3584-wide) | **MXFP4** | no ordinary residual — attention residuals thread `prefix_sum`/`block_residual` through the stack (`forward::kimi_forward`). 2 shared experts fused as one 6144-wide MLP, `situ` activation. **Run with `COLI_O_DIRECT=1`** (1.09× prefill / 1.13× decode expert-load, tokens identical — off by default because it *loses* on GLM and the mechanism is unexplained). 1561 GB source; ~1.4 TB container |
 
 **Prebuilt containers.** Every model above is published as a ready-to-run container under
-[`Kanposer`](https://huggingface.co/Kanposer), so `serve` can be fed a download instead of a
-3-hour conversion. `scripts/models.toml` carries the repo per model in `hf_repo`:
+[`Kanposer`](https://huggingface.co/Kanposer), so a fresh host downloads one instead of
+paying a multi-hour conversion. `docker/run-dgx.sh -m <name>` resolves to it automatically —
+`-m nemotron | m2.7 | m3 | glm | k3 | v4`, or any `org/repo` — and the entrypoint's
+`coli probe` recognises a container and skips conversion. `scripts/models.toml` holds the
+repo per model in `hf_repo`, and that file is the only registry; `run-dgx.sh` reads it rather
+than keeping its own copy:
 
 | container repo | shards | state |
 |---|---|---|
