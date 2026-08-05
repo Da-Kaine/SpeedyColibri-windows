@@ -140,6 +140,28 @@ path). See [Switching models](#switching-models). Adding a new model is an `Arch
 variant + a convert mapping + one registry block — the checklist is in
 [scripts/README.md](scripts/README.md).
 
+### Test suite status
+
+`cargo test --workspace` (CPU) is **370 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests and, as of **2026-08-05 on `c1e559d`**, **3 fail**. All three
+are pre-existing — each reproduces on `e4e3f7f`, before the DeepSeek-V4 work — and each is
+tracked rather than tolerated silently:
+
+| test | symptom | note |
+|---|---|---|
+| `moe::…::shards_provider_loads_gateless_nemotron_expert` | 4.5354114 vs 4.5365667 (2.5e-4) | Nemotron NVFP4 expert reconstruction |
+| `kimi_stack_runs_end_to_end` | "K3 forward must be deterministic" — two identical `forward()` calls differ ~1e-3 | K3, and the tiny model makes it far cheaper to debug than the same symptom on Nemotron decode |
+| `kimi_prefill_matches_incremental_decode` | decode −0.017763836 vs prefill −0.018794997 | K3; may be a *consequence* of the row above — fix determinism first, then re-check |
+
+**Run CUDA tests with `-- --test-threads=1`.** The CUDA device context is process-global and
+its scratch is not thread-safe, so a parallel run fails with `invalid resource handle` for
+reasons unrelated to the code under test.
+
+Two traps worth knowing if you are checking this yourself: cargo **stops at the first failing
+test binary** unless you pass `--no-fail-fast`, so a naive run reports 1 failure and hides the
+other 2; and piping through `head` truncates the per-binary summaries that would have shown
+them.
+
 ## Quick start (DGX Spark)
 
 An **OpenAI-compatible inference server** in two steps. `docker/run-dgx.sh` handles
