@@ -174,8 +174,8 @@ variant + a convert mapping + one registry block — the checklist is in
 
 ### Test suite status
 
-`cargo test --workspace` (CPU) is **385 passing, 0 failing**. Adding `--features cuda` on a
-GB10 brings up the kernel tests: **389 passing, 1 failing** as of **2026-08-05 on `3956dd2`**.
+`cargo test --workspace` (CPU) is **389 passing, 0 failing**. Adding `--features cuda` on a
+GB10 brings up the kernel tests: **393 passing, 1 failing** as of **2026-08-05 on `0f7dffb`**.
 The one failure is pre-existing — it reproduces on `e4e3f7f`, before the DeepSeek-V4 work —
 and is tracked rather than tolerated silently:
 
@@ -536,14 +536,43 @@ add no rows at all. Measured on the box, 43 layers at `kv_lora` 512 + `qk_rope` 
 The engine prints the sizing once, so a run that is silently *not* ringed is visible rather
 than merely indistinguishable: `[kv] raw ring 0 -> 512 rows x 43 layers (48.4 MB)`.
 
-**The ~84k ceiling above is still an all-prompt worst case, and that is not an oversight.**
-It is the reading serve's admission and `context_in_kv_budget` need, since a request that is
-*all prompt* really does pay per token. (It doubled from ~40k only because of the accounting
-fix above — the ring did not move it.) The ring is sized to the prompt because
-prefill is the one call that reads every row it wrote, so the full 1M story needs **chunked
-prefill** on top of this, which would bound the ring by the chunk instead. That is the
-remaining piece, and it is a larger change: V4's per-layer Compressor carries state across
-calls, and a chunk boundary that mis-advances its block index is silent.
+**Long prompts are chunked, but only when the KV actually demands it.** The ring alone was
+sized to the prompt, because prefill is the one call that reads every row it wrote. Running
+the prompt through in slices bounds it at `window + chunk - 1` rows however long the
+context — but chunking is **not free**, and the cost is not the one a byte count suggests:
+
+| 2048-token prompt | raw rows | raw KV | prefill |
+|---|---|---|---|
+| one call | 2048 | 193.5 MB | 119.6 s |
+| chunked at 512 | 639 | 60.4 MB | 168.7 s — **1.41× slower** |
+
+Smaller `S` amortises the routed-expert streaming over less work, the same effect recorded
+for MoE pipelining. At 2048 tokens that trade is plainly bad: 133 MB saved out of a 107 GB
+process, for 41% of prefill. So the rule is **do not chunk until the retained KV would
+exceed `COLI_DSV4_KV_BUDGET_MB` (default 1024), then chunk exactly as coarsely as that
+allows.** A 2048-token prompt runs in one call, byte-for-byte as before (measured: 123.9 s,
+one ring sizing, 2048 rows). A 1M-token prompt — which would otherwise retain ~95 GiB of raw
+rows and simply not fit — chunks at ~10.8k and retains 1 GiB.
+
+**The chunking itself is bit-exact.** On the tiny V4 fixture every chunk of 2 or more
+reproduces the single call *to the bit*, on the CPU build and the CUDA build alike — the
+Compressor's cross-call carry, the ring's `pos % R` mapping and the causal span arithmetic
+all compose exactly. (Chunk 1 differs on CUDA only, because `S == 1` dispatches the decode
+kernel family; that arm compares prefill kernels against decode kernels, not two chunkings.)
+
+What is *not* bit-exact on the real model is **kernel selection**: at 43 layers, `S = 128`
+and `S = 512` cross tiling thresholds and pick different kernels, whose accumulation orders
+differ. `COLI_DEBUG_ACT=1` on the V4 driver measures that rather than leaving it to
+argument — at the last prefill position the divergence starts at 8.7e-6 after layer 0 and
+**plateaus around 5e-3 by layer 14**, flat for the remaining 28 layers. A plateau is bounded
+FP noise in an RMSNorm'd stack; a structural error would keep growing or jump. On a
+512-token prompt it changed 1 of 16 generated tokens; at 2048 tokens, 4 of 4 matched. The
+tiny fixture cannot see this — 3 layers at hidden 8 never reach the tiled kernels — which is
+why the claim is split in two here rather than blurred into one tolerance.
+
+The **~84k ceiling** above is unaffected by any of this, and that is not an oversight: it is
+an all-prompt worst case, the reading serve's admission and `context_in_kv_budget` need. (It
+doubled from ~40k because of the accounting fix, not the ring.)
 
 One caveat remains: everything above 2,400 tokens on V4 is still allocator arithmetic — that is
 the longest context actually exercised end to end.
