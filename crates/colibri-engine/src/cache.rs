@@ -138,6 +138,28 @@ struct State {
     session_usage: HashMap<(usize, usize), u64>,
 }
 
+/// Where time goes inside [`ExpertCache::fetch`], split three ways because the whole
+/// call was invisible: `compute_experts_partial` annotated it "cache hit (prefetched);
+/// not timed here" and it measured **5209 ms** of a MiniMax-M3 512-token prefill.
+///
+/// The miss *count* is not the problem — July 2026 and today issue the same ~6.4k misses
+/// — but the per-miss cost went from ≤0.09 ms to ~0.8 ms while resident entries doubled
+/// (1367 → 2772). These three separate the candidates: waiting for the lock, the inner
+/// provider's load, and the insert+evict bookkeeping that scales with entry count.
+static FETCH_LOCK_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FETCH_LOAD_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FETCH_INSERT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `(lock_wait_us, inner_load_us, insert_evict_us)` — see the statics above.
+pub fn fetch_profile() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        FETCH_LOCK_US.load(Relaxed),
+        FETCH_LOAD_US.load(Relaxed),
+        FETCH_INSERT_US.load(Relaxed),
+    )
+}
+
 /// Cache statistics snapshot.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CacheStats {
@@ -309,18 +331,40 @@ impl State {
     /// every decode load enters at `heat = 1`, so a frequency-primary rank evicts
     /// decode's live working set in favour of prefill leftovers that will never be
     /// read again. Measured 5.8% vs 44.8% decode hit rate.
-    fn evict_to(&mut self, budget: u64) {
-        self.evict_to_protecting(budget, &HashSet::new());
+    /// Returns the evicted entries **undropped** — see [`State::evict_to_protecting`].
+    #[must_use = "drop the freed entries AFTER releasing the cache lock, or the \
+                  deallocation blocks every concurrent expert() — that was 5.3 s on M3"]
+    fn evict_to(&mut self, budget: u64) -> Vec<Entry> {
+        self.evict_to_protecting(budget, &HashSet::new())
     }
 
     /// Like [`State::evict_to`] but never evicts a key in `protect` — used when
     /// bulk-inserting a layer's freshly-loaded batch, so the just-loaded experts
     /// (heat = 1, so "cold" to LFRU) survive to the compute loop instead of being
     /// evicted by their own batch and reloaded.
-    fn evict_to_protecting(&mut self, budget: u64, protect: &HashSet<(usize, usize)>) {
+    /// Returns the evicted entries **without dropping them**, so the caller can free them
+    /// after releasing the cache lock.
+    ///
+    /// Freeing is not incidental: an expert is ~21 MB, and a MiniMax-M3 512-token prefill
+    /// evicts ~3600 of them. Measured under the lock that was **5300 ms of `free` against
+    /// 7 ms of `select`** — the ranking this function was once rewritten to optimise is
+    /// noise, and the deallocation is everything. Worse, it is *contended*: the compute
+    /// loop's `expert()` calls took **5136 ms of lock-wait** in the same run, matching the
+    /// free almost exactly, because `munmap`/`free` of the evicted buffers ran while the
+    /// caller still held `state.lock()`.
+    ///
+    /// Handing the vector back changes no policy — same victims, same order, same budget —
+    /// only *where* the pages are returned to the OS.
+    #[must_use = "drop the freed entries AFTER releasing the cache lock, or the \
+                  deallocation blocks every concurrent expert() — that was 5.3 s on M3"]
+    fn evict_to_protecting(
+        &mut self,
+        budget: u64,
+        protect: &HashSet<(usize, usize)>,
+    ) -> Vec<Entry> {
         if self.bytes <= budget {
             self.publish_ram();
-            return;
+            return Vec::new();
         }
         // Rank once, then evict down the list — rather than re-scanning every entry to
         // find each successive victim.
@@ -379,11 +423,15 @@ impl State {
                 freed.push(e);
             }
         }
-        drop(freed);
+        // `EVICT_DROP_US` now measures only unlinking the victims from the map. The
+        // deallocation it used to include moved out to the callers, past the lock — so
+        // after this change a large `free` in the profile means the *caller* is dropping
+        // under the lock, which is the bug returning.
         if let Some(t) = t_drop {
             EVICT_DROP_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.publish_ram();
+        return freed;
         // Falling off the end means everything left is pinned or protected — the same
         // outcome the old `None => break` arm produced.
     }
@@ -411,9 +459,15 @@ impl<P: ExpertProvider> ExpertCache<P> {
     /// session usage (true for real MoE routing, false for warm-up/pin loads).
     fn fetch(&self, layer: usize, eid: usize, record: bool) -> io::Result<Arc<Expert>> {
         let key = (layer, eid);
+        let prof = crate::forward::profile_on();
+        let rel = Ordering::Relaxed;
         // Fast path: resident hit.
         {
+            let t_lock = std::time::Instant::now();
             let mut s = self.state.lock().unwrap();
+            if prof {
+                FETCH_LOCK_US.fetch_add(t_lock.elapsed().as_micros() as u64, rel);
+            }
             s.clock = s.clock.wrapping_add(1);
             let clock = s.clock;
             if record {
@@ -429,8 +483,13 @@ impl<P: ExpertProvider> ExpertCache<P> {
             s.misses += 1;
         }
         // Miss: load outside the lock (disk I/O), then insert + evict.
+        let t_load = std::time::Instant::now();
         let ex = self.inner.expert(layer, eid)?;
+        if prof {
+            FETCH_LOAD_US.fetch_add(t_load.elapsed().as_micros() as u64, rel);
+        }
         let bytes = ex.bytes();
+        let t_ins = std::time::Instant::now();
         let mut s = self.state.lock().unwrap();
         // Another thread may have inserted it while we loaded.
         if let Some(e) = s.entries.get(&key) {
@@ -448,7 +507,12 @@ impl<P: ExpertProvider> ExpertCache<P> {
         );
         s.bytes += bytes;
         let budget = self.budget.load(Ordering::Relaxed);
-        s.evict_to(budget);
+        let freed = s.evict_to(budget);
+        if prof {
+            FETCH_INSERT_US.fetch_add(t_ins.elapsed().as_micros() as u64, rel);
+        }
+        drop(s); // release the lock BEFORE returning ~21 MB/victim to the OS
+        drop(freed);
         Ok(ex)
     }
 }
@@ -652,10 +716,12 @@ impl<P: ExpertProvider + Sync> ExpertCache<P> {
         }
         let t = std::time::Instant::now();
         let budget = self.budget.load(Ordering::Relaxed);
-        s.evict_to_protecting(budget, &batch);
+        let freed = s.evict_to_protecting(budget, &batch);
         if prof {
             CACHE_EVICT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        drop(s); // release the lock BEFORE returning ~21 MB/victim to the OS
+        drop(freed);
         Ok(())
     }
 }
@@ -860,7 +926,8 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                             .min(cache.budget.load(Ordering::Relaxed))
                             .max(FLOOR_MIN);
                         cache.budget.store(new_budget, Ordering::Relaxed);
-                        cache.state.lock().unwrap().evict_to(new_budget);
+                        let freed = cache.state.lock().unwrap().evict_to(new_budget);
+                        drop(freed); // guard already dropped by the temporary above
                         low_ticks = 0;
                         continue;
                     }
@@ -878,11 +945,12 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                     let reclaim = (floor_now - avail).saturating_add(HARD_SLACK);
                     let new_budget = resident.saturating_sub(reclaim).max(FLOOR_MIN);
                     cache.budget.store(new_budget, Ordering::Relaxed);
-                    let after = {
+                    let (after, freed) = {
                         let mut s = cache.state.lock().unwrap();
-                        s.evict_to(new_budget);
-                        s.bytes
+                        let freed = s.evict_to(new_budget);
+                        (s.bytes, freed)
                     };
+                    drop(freed); // outside the lock
                     if trace {
                         eprintln!(
                             "[guard] FIRE avail={:.2} floor={:.2} (base {:.2} + brake {:.2}) \
@@ -948,7 +1016,8 @@ impl<P: ExpertProvider + Send + Sync + 'static> ExpertCache<P> {
                 };
                 cache.budget.store(new_budget, Ordering::Relaxed);
                 if new_budget < resident {
-                    cache.state.lock().unwrap().evict_to(new_budget);
+                    let freed = cache.state.lock().unwrap().evict_to(new_budget);
+                    drop(freed); // guard already dropped by the temporary above
                 }
             }
         });
@@ -1014,10 +1083,11 @@ impl<P: ExpertProvider> ExpertCache<P> {
                 after = s.bytes;
                 break; // already at the floor — evicting more is not possible
             }
-            s.evict_to(target);
+            let freed = s.evict_to(target);
             self.budget.store(target, Ordering::Relaxed);
             after = s.bytes;
             drop(s);
+            drop(freed); // outside the lock
             passes += 1;
         }
         // Decide on a FRESH reading, not the one sampled at the top of the last pass — if the
@@ -1089,9 +1159,46 @@ pub mod capacity {
 
     /// Resident bytes of one routed expert (gate + up + down) for a model with
     /// the given `hidden`/`moe_inter`, at `bits`.
+    ///
+    /// **Raw-dimension form — prefer [`bytes_per_expert_of`] when a `Config` is in hand.**
+    /// This assumes a *gated SwiGLU expert living at `hidden`*, which is true of GLM and the
+    /// MiniMax models and false of both latent-MoE archs. Callers that pass `cfg.hidden`
+    /// blind over-count Nemotron-H by ~10× (see the wrapper).
     pub fn bytes_per_expert(hidden: u64, moe_inter: u64, bits: u32) -> u64 {
         // gate [moe_inter, hidden], up [moe_inter, hidden], down [hidden, moe_inter]
         2 * qt_bytes(moe_inter, hidden, bits) + qt_bytes(hidden, moe_inter, bits)
+    }
+
+    /// Resident bytes of one routed expert, sized from the model's own shape.
+    ///
+    /// Two things vary across the fleet and both were being ignored, which is how
+    /// `coli capacity` came to report Nemotron-H's routed experts as **695 GB inside a
+    /// 69 GB container**:
+    ///
+    /// - **Where the expert lives.** [`Arch::routed_experts_are_latent`] models
+    ///   (Nemotron-H, Kimi-K3) bottleneck the MoE block, so their expert tensors are
+    ///   `[moe_inter, moe_latent]`, not `[moe_inter, hidden]`. Nemotron's latent is far
+    ///   narrower than its hidden, so using `hidden` inflates every expert.
+    /// - **How many tensors.** A `relu2` expert is *gateless* — `down(relu(up·x)²)`, two
+    ///   matrices. Charging a third for a `gate` that the container does not ship adds 50%.
+    ///
+    /// Both are named predicates that already exist precisely because they must agree in
+    /// several places; this makes the capacity estimate a third place that asks rather than
+    /// assumes. Cross-checked against the real thing: the sharded-cache path probes a live
+    /// expert and recorded Nemotron at **3.1 MB**, against 15.79 MB from the blind estimate.
+    pub fn bytes_per_expert_of(cfg: &colibri_core::Config, bits: u32) -> u64 {
+        let outer = if cfg.arch.routed_experts_are_latent() && cfg.moe_latent > 0 {
+            cfg.moe_latent as u64
+        } else {
+            cfg.hidden as u64
+        };
+        let inter = cfg.moe_inter as u64;
+        let up_down = qt_bytes(inter, outer, bits) + qt_bytes(outer, inter, bits);
+        if cfg.relu2 {
+            up_down // gateless: up + down only
+        } else {
+            up_down + qt_bytes(inter, outer, bits) // + gate
+        }
     }
 
     /// How many experts of `bytes_per_expert` fit in `budget_bytes`.
@@ -1505,7 +1612,7 @@ mod tests {
                 evictions: 0,
                 session_usage: HashMap::new(),
             };
-            s.evict_to_protecting(budget, &protect);
+            drop(s.evict_to_protecting(budget, &protect));
 
             // Guard against a vacuous pass: if nothing is ever evicted, every assertion
             // below holds trivially and the test proves nothing about the rewrite.
@@ -1834,5 +1941,69 @@ mod tests {
         // ~110 GB budget (a Spark after dense+overhead) -> a few thousand experts.
         let n = capacity::experts_in_budget(110 * (1 << 30), bpe);
         assert!((5_000..7_000).contains(&n), "experts in 110GB = {n}");
+    }
+
+    /// `bytes_per_expert_of` must read the expert's ACTUAL shape off the config, not
+    /// assume GLM's. Getting this wrong is what made `coli capacity` report Nemotron-H's
+    /// routed experts as 695 GB inside a 69 GB container.
+    ///
+    /// Asserted as *relationships* rather than magic byte counts, so the test says why it
+    /// cares and survives a change to the quantized layout.
+    #[test]
+    fn expert_size_follows_the_arch_not_glms_shape() {
+        // Real parse path, not a hand-built struct — the shape under test comes off the
+        // same JSON a container ships. `hidden` is deliberately much wider than
+        // `moe_latent_size`, which is the whole point on Nemotron-H.
+        let cfg = colibri_core::Config::from_json(
+            &colibri_json::Json::parse(
+                r#"{"model_type":"nemotron_h","hidden_size":512,"num_hidden_layers":4,
+                    "num_attention_heads":4,"num_key_value_heads":2,"head_dim":4,"vocab_size":8,
+                    "hybrid_override_pattern":"ME*M","n_routed_experts":4,"num_experts_per_tok":2,
+                    "moe_intermediate_size":64,"moe_latent_size":32,
+                    "moe_shared_expert_intermediate_size":6,"norm_topk_prob":false,
+                    "routed_scaling_factor":1.0,"mlp_hidden_act":"relu2","ssm_state_size":2,
+                    "conv_kernel":2,"mamba_num_heads":2,"mamba_head_dim":2,"n_groups":1,
+                    "chunk_size":2,"layer_norm_epsilon":1e-5}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(cfg.relu2 && cfg.moe_latent == 32 && cfg.hidden == 512);
+
+        // Latent + gateless: charged at `moe_latent` with no gate tensor. The blind form
+        // charges `hidden` AND a gate — that combination is what reported Nemotron-H's
+        // routed experts as 695 GB inside a 69 GB container.
+        let real = capacity::bytes_per_expert_of(&cfg, 4);
+        let blind = capacity::bytes_per_expert(cfg.hidden as u64, cfg.moe_inter as u64, 4);
+        assert!(
+            real * 4 < blind,
+            "a latent gateless expert must be several times smaller than the blind \
+             hidden-width gated estimate: {real} vs {blind}"
+        );
+
+        // Each axis on its own, so an edit that fixes one and drops the other still fails.
+        let mut gated = cfg.clone();
+        gated.relu2 = false;
+        assert!(
+            capacity::bytes_per_expert_of(&gated, 4) > real,
+            "the gate tensor must be charged when the arch actually ships one"
+        );
+        let mut no_latent = cfg.clone();
+        no_latent.moe_latent = 0;
+        assert!(
+            capacity::bytes_per_expert_of(&no_latent, 4) > real,
+            "with no latent bottleneck the expert must be sized at `hidden`"
+        );
+
+        // The gated-at-hidden models (GLM / MiniMax) must be untouched by all of this.
+        let mut swiglu = cfg.clone();
+        swiglu.arch = colibri_core::Arch::MinimaxM2;
+        swiglu.relu2 = false;
+        swiglu.moe_latent = 0;
+        assert_eq!(
+            capacity::bytes_per_expert_of(&swiglu, 4),
+            blind,
+            "GLM/MiniMax-shaped experts must match the raw-dimension form exactly"
+        );
     }
 }

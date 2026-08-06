@@ -1219,6 +1219,30 @@ fn union_and_weights(
 /// `moe_sharded()` runs it over the node's own experts; and the transport server
 /// runs it as the handler for a peer's [`ExpertRequest`]. Zero-weight (token,
 /// expert) pairs are skipped, so a token only touches the experts it routes to.
+/// Per-thread gather/result scratch for the per-expert loop in
+/// [`compute_experts_partial`] — see the comment at its use site for why pooling these
+/// two specifically matters under this binary's `mallopt` settings.
+#[derive(Default)]
+struct ExpertScratch {
+    xg: Vec<f32>,
+    hh: Vec<f32>,
+}
+
+thread_local! {
+    static EXPERT_SCRATCH: std::cell::Cell<ExpertScratch> = const {
+        std::cell::Cell::new(ExpertScratch {
+            xg: Vec::new(),
+            hh: Vec::new(),
+        })
+    };
+}
+
+/// Owning form: allocates the `[n_tokens, hidden]` result and returns it.
+///
+/// Kept for the callers that genuinely need ownership — expert parallelism collects one
+/// `partial` per node before combining them, and the two latent-MoE paths hand the result
+/// to `fc2`. Callers that already have a destination should use
+/// [`compute_experts_partial_into`], which avoids this allocation entirely.
 pub fn compute_experts_partial<P: ExpertProvider>(
     provider: &P,
     layer: usize,
@@ -1228,11 +1252,52 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     n_tokens: usize,
     hidden: usize,
 ) -> io::Result<Vec<f32>> {
+    let mut out = vec![0f32; n_tokens * hidden];
+    compute_experts_partial_into(
+        provider,
+        layer,
+        experts,
+        weights,
+        activations,
+        n_tokens,
+        hidden,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// Routed-expert FFN, **accumulating** the weighted result into `out`.
+///
+/// `out` is `[n_tokens, hidden]` and is added to, never cleared — every write on both the
+/// grouped and per-expert paths is `out[t*d+dd] += weight * y[..]`. The caller owns the
+/// initial state, which is what lets `moe()` pass the layer's own output buffer straight
+/// through instead of allocating a second one and adding it back.
+///
+/// **Why this exists.** The owning form allocated `[n_tokens, hidden]` per call — ~8 MB per
+/// layer on a MiniMax-M3 512-token prefill, ~500 MB per prefill across 60 layers. Under this
+/// binary's `mallopt` (`M_MMAP_THRESHOLD` pinned to 2 MiB, deliberately) that is a fresh
+/// `mmap` faulted in on first touch, and the faults land on whoever writes first — the
+/// scatter, which measured **2160 ms against a July baseline's 173 ms** on byte-identical
+/// code. Passing a reused buffer removes the mapping and the fault, and also removes a full
+/// `out += partial` pass over 2 M floats per layer.
+///
+/// See `ExpertScratch` at the per-expert loop for the same fix applied to `xg`/`hh`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_experts_partial_into<P: ExpertProvider>(
+    provider: &P,
+    layer: usize,
+    experts: &[u32],
+    weights: &[f32],
+    activations: &[f32],
+    n_tokens: usize,
+    hidden: usize,
+    out: &mut [f32],
+) -> io::Result<()> {
     let d = hidden;
     let ne = experts.len();
-    let mut out = vec![0f32; n_tokens * d];
+    debug_assert_eq!(out.len(), n_tokens * d, "out must be [n_tokens, hidden]");
     if ne == 0 {
-        return Ok(out);
+        return Ok(());
     }
     let eids: Vec<usize> = experts.iter().map(|&e| e as usize).collect();
 
@@ -1250,6 +1315,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
     }
 
     // Per-expert row lists: the tokens routing to each expert, with their weights.
+    // O(experts × tokens) over a stride-`ne` read of `weights`, and it was untimed.
+    let t_prep = std::time::Instant::now();
     let mut per_expert: Vec<(usize, Vec<usize>, Vec<f32>)> = Vec::new();
     for (ei, &e) in eids.iter().enumerate() {
         let mut rows = Vec::new();
@@ -1264,6 +1331,12 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         if !rows.is_empty() {
             per_expert.push((e, rows, rw));
         }
+    }
+    if crate::forward::profile_on() {
+        crate::forward::MOE_PREP_US.fetch_add(
+            t_prep.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     // Batched grouped path (`COLI_EXPERT_GROUP`): one H2D/D2H per ≤64-expert chunk
@@ -1289,7 +1362,7 @@ pub fn compute_experts_partial<P: ExpertProvider>(
         // Gateless ReLU² (Nemotron-H) has its own grouped kernel — the fp8 one is SwiGLU
         // and would read a gate tensor these experts don't ship.
         let grouped = if activation().relu2 {
-            crate::gpu::try_expert_group_relu2(&active, activations, d, &mut out)
+            crate::gpu::try_expert_group_relu2(&active, activations, d, out)
         } else if dsv4_group_moe() && !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 6) {
             // MXFP4 SwiGLU (DeepSeek-V4) — MEASURED NEGATIVE, so opt-in only.
             //
@@ -1308,14 +1381,29 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             // chunking and per-call tensor wrapping. **Dispatch count was the wrong
             // target.** A real win needs fewer BYTES or a fused kernel that keeps the
             // weights resident across experts, not fewer launches.
-            crate::gpu::try_expert_group_packed(&active, activations, d, &mut out, 6)
-        } else if !active.is_empty() && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5) {
+            crate::gpu::try_expert_group_packed(&active, activations, d, out, 6)
+        } else if nvfp4_group_moe()
+            && !active.is_empty()
+            && active.iter().all(|(ex, _, _)| ex.up.fmt_code == 5)
+            && active.iter().map(|(_, r, _)| r.len()).sum::<usize>() / active.len()
+                <= nvfp4_group_rows_max()
+        {
             // NVFP4 SwiGLU (M2.7 / M3 / GLM-5.2). Until this arm existed these models were
             // offered the fp8 group, which declines on fmt 5, so every one of them fell
             // through to a per-expert call — the path that pays per-expert weight staging.
-            crate::gpu::try_expert_group_nvfp4(&active, activations, d, &mut out)
+            //
+            // `COLI_NVFP4_GROUP=0` restores that per-expert arm. This is a MEASUREMENT
+            // CONTROL, not a tuning knob, and it exists because making this path
+            // unconditional deleted the only in-binary comparison against the path it
+            // replaced — the commit that did so says as much, and offered chunk=1 as a
+            // "nearest stand-in", which it is not: chunk=1 is still the grouped call, so it
+            // varies transfer size while holding the staging design fixed. The two arms
+            // differ in the thing that actually changed: grouped staging through a pinned
+            // host buffer + device arena (~0.74 GB/s measured) versus per-expert ZERO-COPY,
+            // which the RAM work elsewhere records as load-bearing to the tune of 22.7x.
+            crate::gpu::try_expert_group_nvfp4(&active, activations, d, out)
         } else if crate::gpu::expert_group_enabled() {
-            crate::gpu::try_expert_group(&active, activations, d, &mut out)
+            crate::gpu::try_expert_group(&active, activations, d, out)
         } else {
             false
         };
@@ -1326,15 +1414,55 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             );
         }
         if grouped {
-            return Ok(out);
+            return Ok(());
         }
     }
 
     let prof = crate::forward::profile_on();
+    let rel = std::sync::atomic::Ordering::Relaxed;
+    // Reuse the per-expert gather/result buffers instead of allocating two fresh ones per
+    // expert per layer. Same contract as `GroupScratch`/`MambaScratch`: single-threaded
+    // forward, grow-only, callers slice to the live length.
+    //
+    // This is not general allocator hygiene, it is specific to what `mallopt` does here.
+    // `M_MMAP_THRESHOLD` is pinned to 2 MiB (main.rs), deliberately, so expert-sized
+    // allocations go straight to `mmap` and every free is a `munmap` — that is load-bearing
+    // for eviction actually returning memory (removing it costs nemotron serve 2.4x). The
+    // cost lands on anything that allocates per call: a fresh mapping is faulted in on
+    // FIRST TOUCH, so the page faults are billed to whoever writes first. On a MiniMax-M3
+    // 512-token prefill that showed up as `gather` 143 -> 1131 ms (7.9x) and `scatter`
+    // 174 -> 2267 ms (12.6x) against byte-identical code, plus 478 ms of raw `alloc`.
+    // Pooled buffers are faulted in once and stay warm.
+    //
+    // Safe to reuse dirty: the gather rewrites all `nr * d` of `xg` before it is read, and
+    // `matmul_qt` asserts `y.len() == s * o` and assigns (never accumulates) every element
+    // of `hh`. Both are sliced to exactly the live length, so the assert also catches any
+    // future drift.
+    let mut sc = EXPERT_SCRATCH.with(|c| c.take());
     for (e, rows, rw) in &per_expert {
         let nr = rows.len();
-        let ex = provider.expert(layer, *e)?; // cache hit (prefetched); not timed here
-        let mut xg = vec![0f32; nr * d];
+        // Both of these used to sit outside every timer, in the residual. `expert()` was
+        // annotated "cache hit (prefetched); not timed here" — a claim worth checking
+        // rather than trusting — and `xg`/`hh` are a fresh heap allocation per expert per
+        // layer, which is the shape of a fault-under-pressure cost this repo has hit before.
+        let te = std::time::Instant::now();
+        let ex = provider.expert(layer, *e)?;
+        if prof {
+            crate::forward::MOE_EXPGET_US.fetch_add(te.elapsed().as_micros() as u64, rel);
+        }
+        let ta = std::time::Instant::now();
+        if sc.xg.len() < nr * d {
+            sc.xg.resize(nr * d, 0.0);
+        }
+        if sc.hh.len() < nr * d {
+            sc.hh.resize(nr * d, 0.0);
+        }
+        let ExpertScratch { xg, hh } = &mut sc;
+        let xg = &mut xg[..nr * d];
+        let hh = &mut hh[..nr * d];
+        if prof {
+            crate::forward::MOE_ALLOC_US.fetch_add(ta.elapsed().as_micros() as u64, rel);
+        }
         let t0 = std::time::Instant::now();
         for (r, &t) in rows.iter().enumerate() {
             xg[r * d..(r + 1) * d].copy_from_slice(&activations[t * d..(t + 1) * d]);
@@ -1345,9 +1473,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        let mut hh = vec![0f32; nr * d];
         let t1 = std::time::Instant::now();
-        ffn(&ex.gate, &ex.up, &ex.down, &xg, nr, &mut hh);
+        ffn(&ex.gate, &ex.up, &ex.down, xg, nr, hh);
         if prof {
             crate::forward::GPUFFN_US.fetch_add(
                 t1.elapsed().as_micros() as u64,
@@ -1368,7 +1495,8 @@ pub fn compute_experts_partial<P: ExpertProvider>(
             );
         }
     }
-    Ok(out)
+    EXPERT_SCRATCH.with(|c| c.set(sc));
+    Ok(())
 }
 
 /// Sub-column a `[S, n_uniq]` weight matrix down to the experts in `cols` (their
@@ -1581,10 +1709,21 @@ pub fn moe_sharded<P: ExpertProvider, T: Transport + ?Sized>(
     }
 
     if with_shared {
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &s) in out.iter_mut().zip(sh.iter()) {
-            *o += s;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &s) in out.iter_mut().zip(sh.iter()) {
+                *o += s;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
     }
     Ok(())
@@ -1654,18 +1793,31 @@ pub fn moe<P: ExpertProvider>(
     // ---- routed experts (all local on a single node) ----------------------
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
-    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
-    for (o, p) in out.iter_mut().zip(partial.iter()) {
-        *o += *p;
-    }
+    // Straight into the layer's own buffer, which was zeroed just above. The routed path
+    // only ever accumulates (`out[t*d+dd] += w * y[..]` on both the grouped and per-expert
+    // arms), so this is the same arithmetic as allocating a `partial` and adding it back —
+    // minus an ~8 MB/layer allocation (a fresh `mmap` under this binary's mallopt, faulted
+    // in during the scatter) and minus a full add pass over `s_len * d`.
+    compute_experts_partial_into(provider, layer, &uniq_u32, &w_mat, x, s_len, d, out)?;
 
     // ---- shared expert (weight 1.0, all positions) ------------------------
     if with_shared {
         let _st = std::time::Instant::now();
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &s) in out.iter_mut().zip(sh.iter()) {
-            *o += s;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &s) in out.iter_mut().zip(sh.iter()) {
+                *o += s;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
         if crate::forward::profile_on() {
             crate::forward::SHARED_US.fetch_add(
@@ -3396,6 +3548,74 @@ fn dsv4_group_moe() -> bool {
     *ON.get_or_init(|| std::env::var("COLI_DSV4_GROUP_MOE").ok().as_deref() == Some("1"))
 }
 
+/// The NVFP4 SwiGLU grouped expert path (M2.7 / M3 / GLM-5.2). Default **ON**, matching
+/// shipped behaviour — `COLI_NVFP4_GROUP=0` falls back to the per-expert path it replaced.
+///
+/// This is a measurement control, not a tuning knob. The change that made the grouped path
+/// unconditional removed the only same-binary comparison against the per-expert arm, and
+/// said so; without a way back there is no way to attribute a prefill delta to it. The
+/// difference is not cosmetic — grouped stages every routed expert through a pinned host
+/// buffer and a device arena (measured ~0.74 GB/s), where per-expert runs zero-copy, and
+/// zero-copy is recorded elsewhere in this repo as worth 22.7x.
+fn nvfp4_group_moe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("COLI_NVFP4_GROUP").ok().as_deref() != Some("0"))
+}
+
+/// Mean rows-per-expert at or below which the NVFP4 SwiGLU **grouped** path is used;
+/// above it, the per-expert path. `COLI_NVFP4_GROUP_ROWS` overrides.
+///
+/// **The two regimes want opposite paths, measured on all three NVFP4 models** (ABBA,
+/// tokens identical, one binary):
+///
+/// | | prefill 512 tok | decode (S=1) |
+/// |---|---|---|
+/// | glm-5.2 | per-expert **1.28×** (90.0 → 70.4 s) | grouped **1.19×** (1.05 vs 0.88 tok/s) |
+/// | minimax-m3 | per-expert **1.12×** (38.3 → 34.2 s) | tied (2.50 vs 2.57) |
+/// | minimax-m2.7 | per-expert 1.04× (28.2 → 27.2 s) | tied (5.10 vs 5.31) |
+///
+/// GLM is the model that decides this and it points both ways, so a flat default is wrong
+/// whichever way it is set: shipping grouped costs 28% of its prefill, flipping to
+/// per-expert costs 19% of its decode. The mechanism is legible — grouping trades a
+/// per-expert H2D/D2H round-trip for staging every routed expert through a pinned buffer
+/// (148.6 GB on one m3 prefill, pack 4.80 s + H2D 2.77 s). At one row per expert the
+/// round-trip dominates and grouping wins; at tens of rows the kernel work amortises the
+/// round-trip anyway and only the staging is left.
+///
+/// **Rows-per-expert, not a phase flag**, deliberately: this repo has shipped three expert
+/// path defaults chosen on prefill and silently wrong in decode, and the fix each time was
+/// to gate on the quantity at the decision point. Rows also carries the model (top_k /
+/// n_experts), the batch, and the cluster shape — under expert parallelism a node owns
+/// fewer experts so each sees proportionally more rows, and slides toward per-expert on its
+/// own. Same axis `nvfp4_wsmm_launch` uses when it declines above 32.
+///
+/// **8 is bounded, not derived.** The two regimes' actual means, from a threshold sweep on
+/// GLM (the flip lands between 16 and 32): **decode = 1** row/expert, **512-token prefill =
+/// 25.6** (512 tokens × top_k 8 / ~160 routed experts). 8 sits between them with room on
+/// both sides and keeps small batched decode grouped. The crossover *within* (1, 25.6) is
+/// **not** measured — re-measure before trusting it for a batch size or a model that lands
+/// in there.
+///
+/// **The decode half of this was nearly gated on a measurement artifact.** A 24-token bench
+/// showed grouped "winning" GLM decode 1.05 vs 0.88 tok/s, which looked like a reason not to
+/// touch the default. It was not decode at all: GLM's decode mean is 1, so decode takes the
+/// grouped path either way — the knob was changing *prefill*, and the grouped prefill's extra
+/// ~19 s simply gave the background prefetcher longer to warm the cache before decode began.
+/// Run out to 100 tokens the arms converge (last-half median 1.33/1.23 vs 1.23/1.23). One
+/// knob, two effects: the ablation was not isolating what it appeared to.
+///
+/// Corollary worth knowing: **GLM steady-state decode is ~1.23–1.33 tok/s**, not the ~1.0 a
+/// 24-token run reports. At ~1 tok/s that window is nearly all warm-up.
+fn nvfp4_group_rows_max() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("COLI_NVFP4_GROUP_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    })
+}
+
 
 pub fn dsv4_moe<P: ExpertProvider>(
     cfg: &Config,
@@ -3465,10 +3685,12 @@ pub fn dsv4_moe<P: ExpertProvider>(
     let (uniq, w_mat) = union_and_weights(&idxs, &ws, s_len, k, e_n);
     let uniq_u32: Vec<u32> = uniq.iter().map(|&e| e as u32).collect();
 
-    let partial = compute_experts_partial(provider, layer, &uniq_u32, &w_mat, x, s_len, d)?;
-    for (o, p) in out.iter_mut().zip(partial.iter()) {
-        *o += *p;
-    }
+    // Straight into the layer's own buffer, which was zeroed just above. The routed path
+    // only ever accumulates (`out[t*d+dd] += w * y[..]` on both the grouped and per-expert
+    // arms), so this is the same arithmetic as allocating a `partial` and adding it back —
+    // minus an ~8 MB/layer allocation (a fresh `mmap` under this binary's mallopt, faulted
+    // in during the scatter) and minus a full add pass over `s_len * d`.
+    compute_experts_partial_into(provider, layer, &uniq_u32, &w_mat, x, s_len, d, out)?;
 
     // Shared expert (weight 1.0, every position), same SwiGLU triple as the routed ones.
     //
@@ -3496,10 +3718,21 @@ pub fn dsv4_moe<P: ExpertProvider>(
     // expert to the CPU.
     if cfg.n_shared > 0 {
         let _st = std::time::Instant::now();
-        let mut sh = vec![0f32; s_len * d];
-        ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, &mut sh);
-        for (o, &v) in out.iter_mut().zip(sh.iter()) {
-            *o += v;
+        // Pooled, same as the two latent paths above. #98 established that a fresh
+        // multi-MB `vec![0f32; …]` per layer costs a page fault under memory pressure and
+        // hoisted this exact buffer — but only in `nemotron_moe`/`kimi_moe`, leaving the
+        // three SwiGLU paths (M3 / M2.7 / GLM / V4) on the raw allocation. Measured here:
+        // `shared` 656 ms on the pre-mallopt baseline vs 1088-1234 ms today.
+        let mut add_shared = |sh: &mut [f32]| {
+            ffn(&l.sh_gate, &l.sh_up, &l.sh_down, x, s_len, sh);
+            for (o, &v) in out.iter_mut().zip(sh.iter()) {
+                *o += v;
+            }
+        };
+        if shared_scratch_reuse() {
+            SHARED_SH.with(|c| add_shared(fit_scratch(&mut c.borrow_mut(), s_len * d)));
+        } else {
+            add_shared(&mut vec![0f32; s_len * d]);
         }
         if crate::forward::profile_on() {
             crate::forward::SHARED_US

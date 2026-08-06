@@ -148,6 +148,274 @@ I/O-oriented work (prefetch-ahead, eviction policy, autopin, RAM sweeps) was dev
 this model, and **those conclusions are regime-specific — re-measure before assuming they hold
 for a model whose experts fit in RAM.**
 
+## Full four-model re-measurement, and a prefill REGRESSION on the grouped path (2026-08-06)
+
+The README headline table was re-taken end to end because its figures had drifted from the
+build. Twelve suites, all exit 0, all token-identity gated PASS. Prompt 512 tokens (every
+prefill figure divides out to exactly 512, so the basis is unchanged from 2026-07-26).
+Command per cell: `BENCH_REPS=3 scripts/bench.sh <m> prefill`, `BENCH_REPS=8 … decode`
+(4 for glm), `scripts/bench.sh <m> serve`.
+
+| model | prefill 07-26 → 08-06 | decode 07-26 → 08-06 | serve 07-26 → 08-06 |
+|---|---|---|---|
+| nemotron-3-super | 16.5 → **40.3** (2.44×) | 8.3 → **12.8** (1.54×) | 5.5 → **10.0** (1.81×) |
+| minimax-m2.7 | 18.8 → **18.5** (flat) | 4.0 → **5.1** (1.28×) | 4.4 → **5.9** (1.33×) |
+| minimax-m3 | 16.8 → **13.2** (**0.79×**) | 1.9 → **2.5** (1.32×) | 1.8 → **2.6** (1.42×) |
+| glm-5.2 | 7.4 → **5.6** (**0.76×**) | 0.6 → **1.0** (1.63×) | 0.6 → **0.8** (1.38×) |
+
+### The regression (open — bisect not yet run)
+
+**`minimax-m3` −21% and `glm-5.2` −24% on prefill**, on a build where their decode went *up*.
+
+```
+m3:  38794.0 / 39162.8 / 37984.9 ms → MEDIAN 38794.0 = 13.2 tok/s   gate PASS [67732]
+     attn 5139 | moe 33528 (expert-load 12411) | proj 2387
+glm: 90240.8 / 91568.6 / 92239.2 ms → MEDIAN 91568.6 =  5.6 tok/s   gate PASS [374]
+     attn 16983 | moe 74014 (expert-load 9562) | proj 2682
+```
+
+Why this is not noise and not a stale baseline: reps span 3.1% (m3) and 2.2% (glm);
+expert-load is a small and roughly unchanged share of both, so the growth is in MoE **compute**;
+and decode rose on the same build. Prefill is large-S, decode is S==1 ⇒ implicates the
+**large-S grouped-expert path** specifically.
+
+**~~Why m2.7 looks flat — it is masked, not unaffected~~ — RETRACTED, see the A/B below.**
+The first reading here was that the loss scaled with each model's MoE-compute share of prefill
+(m2.7 ~48%, m3 ~54%, glm ~70%), so m2.7 was carrying the same per-unit regression diluted by
+I/O. **The A/B refutes it**: on the per-expert arm — the same structural path July used —
+m2.7 measures 26.61 s against July's 27.16 s, i.e. slightly *faster*. m2.7 is genuinely
+unaffected and IS a usable control. A companion claim, "expert-load is unchanged", is also
+withdrawn: no July expert-load figure was ever in hand to support it.
+
+What the two affected models share is not a compute share but a **memory regime** — m3 (229 GB)
+and glm (403 GB) are the two that are ≫ RAM; m2.7 (122 GB) is near-fit and clean; nemotron
+(69 GB) fits outright. That correlation, not the compute share, is where to look next.
+
+**RULED OUT — `gpu-ffn = 0ms` is a bench REPORTING gap, not a dispatch failure.**
+`scripts/bench.sh:50` prints only the `gpu-ffn(+sync)` field of the nine-field breakdown at
+`forward.rs:1796` (`router | select | fc1+fc2 | group | gather | gpu-ffn | scatter | shared |
+other`). `GPUFFN_US` times the *per-expert* path; the grouped kernel records into `group` /
+`fc1+fc2`. So every grouped-path model reads `gpu-ffn=0` and always has. This matters beyond
+this bug: it disables the "phase total ≫ sum of GPU sub-timers" tell for exactly the models
+that need it. **Side fix worth doing: widen the bench prefill summary to print `group` and
+`fc1+fc2`.**
+
+### CLEARED: the NVFP4 SwiGLU grouped path is a ~1.04× WIN, not the regression
+
+The strongest-looking suspect, tested and eliminated. `try_expert_group_nvfp4` (moe.rs) became
+default-on for M2.7/M3/GLM in 750fd10 (#49, 2026-08-03) — *after* the old snapshot — and
+everything about it read like a defect waiting to be found. Its own commit body says the
+scaffolding was "DELIBERATELY NOT WIRED, because the repo has already measured this lever twice
+and it does not win"; that it was then flipped on with all measurements taken on **M2.7 at a
+128-token prefill**; that doing so "removes the A/B control along with the gate"; and that
+staging runs at **0.74 GB/s against a ~51 GB/s zero-copy ceiling**. The MXFP4 twin of the same
+idea is opt-in *because* it measured negative. None of that survived contact with a measurement.
+
+`COLI_NVFP4_GROUP` was added to restore the control the commit removed (default 1 = shipped;
+0 = the per-expert arm). ABBA ×4, one binary, warmup discarded, tokens identical throughout:
+
+| model | arm=1 grouped (ms) | arm=0 per-expert (ms) | result |
+|---|---|---|---|
+| minimax-m3 | 38782.9 / 38148.5 | 39950.0 / 40327.8 | grouped **1.043×** faster |
+| minimax-m2.7 | 25639.7 / 25476.1 | 26436.8 / 26775.3 | grouped **1.041×** faster |
+
+The arms provably switched, which is what makes the null trustworthy: `group` went 17833 → 2 ms
+and `gpu-ffn` 0 → 12241 ms. **Keep the knob** — it converts a default that could not be
+questioned into one that has been measured.
+
+### BISECTED: first bad commit is 750fd10 "Kimi k3 kv accounting (#49)"
+
+Direct binary A/B against the July baseline **9b49fdd** (the commit that introduced the perf
+table), then an automated `git bisect` over the 34 commits to `a82ecdf`. Harness held constant
+(today's `scripts/`, today's container — M3 weights are byte-identical since 2026-07-22, only
+`.coli_usage` is newer); only the binary changes. Predicate: prefill ms, threshold 34000, which
+sits in a ~10 s gap against ~1.5 s of run-to-run spread.
+
+| | prefill | expert-load | coverage | token |
+|---|---|---|---|---|
+| JUL27 `9b49fdd` | 28057.5 / 29566.3 ms | 12607 / 13634 | 46% | `[67732]` |
+| TODAY `a82ecdf` | 38231.1 / 39998.3 ms | 12441 / 13166 | 37% | `[67732]` |
+
+**1.358× slower** (28812 → 39115 ms mean), tokens identical in all four runs. Bisect path, one
+M3 prefill per step:
+
+```
+ea269a6  README for #46/#47                   28504.3 ms  GOOD   <- 750fd10's parent
+750fd10  Kimi k3 kv accounting (#49)          38793.8 ms  BAD    <- first bad commit
+831b09a  Gqa decode and k3 preflight (#51)    38350.1 ms  BAD
+c1e559d  Deepseek v4 flash (#53)              38332.8 ms  BAD
+cd03e65  docker: run-dgx.sh reads registry    40522.4 ms  BAD
+```
+
+Good and bad are **adjacent** (`750fd10^ == ea269a6`), so the whole regression is inside that
+one squashed PR.
+
+### It is COMPUTE, not memory — expert-load is flat
+
+Full profiles, same prompt, both binaries:
+
+| | JUL27 | TODAY | Δ |
+|---|---|---|---|
+| **moe compute** (moe − expert-load) | **11448 ms** | **19745 ms** | **+8297 (1.72×)** |
+| attn | 4653 | 5486 | +833 |
+| expert-load | 13538 | 12559 | −979 |
+| logits | 171 | 303 | +132 |
+
+MoE compute is +8.3 s of a ~10 s regression. Expert-load *improved*. Note the July binary
+predates the 9-field breakdown, so compare subtotals, not field names: July reports
+`gpu-ffn 9694` (per-expert path), today reports `group 17732` — those are not like-for-like,
+because `group` is timed as one block that also swallows gather/scatter/staging.
+
+### It is CPU-side MoE overhead — the GPU kernel is innocent
+
+The knob matrix over the levers 750fd10 flipped (all default-on), m3 prefill, tokens identical:
+
+| arm | prefill | gpu-ffn | group |
+|---|---|---|---|
+| baseline | 38376.8 / 39251.4 | 0 | 18321 |
+| `COLI_NVFP4_U4=0` | 38779.4 | 0 | 18555 |
+| `COLI_FFN_DEVCOPY=0` | 38985.4 | 0 | 18361 |
+| `GROUP=0 DEVCOPY=0` | 37907.1 | **9519** | 2 |
+| `GROUP=0 U4=0` | 40927.6 | 12350 | 2 |
+
+**No knob recovers the time.** But `GROUP=0 DEVCOPY=0` puts `gpu-ffn` at 9519 ms — essentially
+July's 9694 — while total prefill stays ~9.4 s slow. So the earlier "per-expert gpu-ffn
+9694 → 12241, 1.26×" reading was a **red herring**: that delta is entirely `COLI_FFN_DEVCOPY`
+and costs no wall time.
+
+Full breakdown of that arm (same path and same kernel speed as July) against July:
+
+| sub-timer | JULY | TODAY | Δ |
+|---|---|---|---|
+| router | 163 | 162 | 0 |
+| **gather** | 143 | **1030** | **+887 (7.2×)** |
+| gpu-ffn | 9694 | 10452 | +758 |
+| **scatter** | 174 | **2262** | **+2088 (13×)** |
+| shared | 713 | 945 | +232 |
+| **other** (unattributed) | 561 | **6743** | **+6182 (12×)** |
+| *moe compute* | *11448* | *21595* | *+10147* |
+
+`gather` + `scatter` + `other` account for ~9.2 s of the 10.1 s. The GPU kernel contributes
++758 ms. **The regression is CPU-side work inside `moe()`, present in both the grouped and
+per-expert arms.**
+
+`other` is the residual — MoE time no timer claims — at 6.7 s, 20% of the phase. The comment
+above that line (forward.rs) records that it exists because "a 26% residual sat here unnoticed".
+It is unnoticed again.
+
+**NEXT: instrument the untimed region of `moe()` before theorising.** Five hypotheses about this
+regression (grouped path, pointer-keyed cache, WSMM, residency, and the two knobs above) were all
+formed from code reading and all five were wrong. The timers and the bisect have been right every
+time. Add sub-timers to what `other` covers, re-run the same A/B, and let it name itself.
+
+### ~~Where the regression actually is: a MEMORY REGIME~~ — REFUTED by the same run
+
+The A/B's real yield. Today's **per-expert arm** is the same structural path July ran, so it is
+the apples-to-apples comparison:
+
+| model | July 2026-07-26 | today, per-expert arm | |
+|---|---|---|---|
+| minimax-m3 | 30.40 s | **40.14 s** | **1.32× slower** |
+| minimax-m2.7 | 27.16 s | **26.61 s** | 1.02× *faster* |
+
+m3 is slower on **both** arms ⇒ the cause is shared by both, and is not the grouped path.
+m2.7 is clean on both ⇒ it is a control, not a masked casualty. Both of those still hold.
+
+The **memory** reading did not. The theory was that m3 (229 GB) and glm (403 GB), being the two
+≫-RAM models, had lost expert residency — m3 carries a 12 GiB device duplicate and glm 17 GiB,
+and `lib.rs:1427` decides `Upload` vs `ZeroCopy` by asking only whether the duplicate *fits*,
+never whether it is worth more than the experts it displaces. Coverage **did** fall 46% → 37%
+exactly as that predicted. **But expert-load did not move** (13538 → 12559 ms, marginally
+*better*), so the lost coverage costs nothing measurable here and cannot be the mechanism.
+
+Kept because the observation is still true and still worth acting on independently: that
+`Upload`/`ZeroCopy` test is the one residency decision on this box that is **not** coverage-aware,
+unlike O_DIRECT, mmap and reader threads. Freeing 12–17 GiB for experts on the ≫-RAM models may
+well be a win. It is simply not this bug.
+
+**Method note, worth more than the hypothesis:** four separate stories about this regression were
+built from code reading and commit archaeology — the grouped path, the pointer-keyed cache, WSMM,
+and residency — and all four died on measurement. The bisect took about an hour of an idle box
+and answered it outright. When a signal is this wide (10 s against 1.5 s of spread), bisect first
+and theorise afterwards.
+
+### FIXED (2026-08-06): root cause was mallopt's page faults, not any expert kernel
+
+`750fd10` introduced `mallopt(M_MMAP_THRESHOLD, 2 MiB)`. That is deliberate and load-bearing —
+it is what makes eviction actually return memory, and removing it costs nemotron serve 2.4×.
+Its price is that expert-sized allocations go to `mmap` and each fresh mapping faults on **first
+touch**. The MoE per-expert loop allocated `xg`/`hh` per expert per layer (~7680 per M3 prefill)
+and was never routed through any pool, so the faults were billed to whoever wrote first —
+`gather` (143 → 1131 ms) and `scatter` (174 → 2267 ms) on byte-identical code.
+
+Three changes, in the order they were measured:
+
+| commit | change | effect |
+|---|---|---|
+| `5f5e007` | free evicted experts off the cache lock | **neutral on speed** — contention real, not on the critical path. Kept for serve hygiene |
+| `0fefba9` | pool the per-expert `xg`/`hh` scratch | per-expert prefill **1.10×**, `gather` **7.7×** (146 vs July's 140 — fully recovered) |
+| `abb3d64` | gate grouped path on mean rows/expert (=8) | prefill glm **1.28×**, m3 **1.12×**, m2.7 **1.04×** |
+
+| model | prefill before | after | July |
+|---|---|---|---|
+| glm-5.2 | 5.6 tok/s | **7.2** | 7.4 |
+| minimax-m3 | 13.2 | **15.0** | 16.8 |
+| minimax-m2.7 | 18.5 | **18.9** | 18.8 |
+
+**Serve is neutral and memory is safe** (m2.7 5.86→5.89, m3 2.55→2.51, glm 0.83→0.87, all
+within noise; swap 0, avail 9–12 GB, no OOM). Expected: `bench_serve.py` uses short prompts, so
+prefill is a small share of it. **The scope of this work is long-prompt prefill.** GLM was the
+specific memory worry — the grouped path carried the ledger charging that once stopped it being
+OOM-killed — and per-expert allocates strictly less, which the run confirms.
+
+**Still open:** m3 keeps ~5.5 s over July. `scatter` is still 2160 ms vs 173 because it writes
+into `out`, which is `vec![0f32; n_tokens*d]` per layer and faulted during the scatter. Fixing
+it needs a caller-provided buffer — `out` is the return value, so a thread-local will not do.
+
+### Eight hypotheses died. The bisect and the timers were right every time.
+
+Kept as a list because the failure mode was identical each time — a mechanism argued from code
+reading or from an ablation that moved two things at once:
+
+1. **Grouped path** — measured a 1.04× *win* at the time (before pooling changed the balance).
+2. **Residency/coverage** — coverage fell 46%→37% exactly as predicted; `expert-load` did not move.
+3. **Pointer-keyed device cache** (`1928094`) — fmt 0/1 only; shipped containers are 5/6.
+4. **WSMM** — `backend_cuda.cu:2897` records it measured *on M2.7* as a 1.16× win.
+5. **`COLI_NVFP4_U4`** — no effect.
+6. **`COLI_FFN_DEVCOPY`** — explains the `gpu-ffn` timer delta entirely, costs no wall time.
+7. **Eviction volume** — July evicted *more* (5013 vs 3600) and paid ~nothing.
+8. **"The gate breaks glm decode"** — a 24-token bench said 1.05→0.88. Decode was grouped in
+   *both* arms; the knob moved **prefill**, whose extra ~19 s warmed the cache before decode
+   began. At 100 tokens they converge (last-half 1.33/1.23 vs 1.23/1.23).
+
+(8) also retracts the fleet A/B's "grouped wins glm decode 1.19×". **Corollary: glm
+steady-state decode is ~1.23–1.33 tok/s, not the ~1.0 a 24-token window reports.**
+
+### Two things the re-measurement retired
+
+- **Decode bimodality did not appear.** The old "~25% of decode runs land well below the mode"
+  claim justified 8 reps. All 28 reps here sat within 1.3% / 2.8% / 4.4% / 1.0% of their
+  model's median (nemotron / m2.7 / m3 / glm). Unobserved on this build — not proven gone.
+- **Best-token vs median is now model-dependent.** m3 and glm still spike (best ≈ 1.4–1.8×
+  median), but **nemotron's best ≈ its median** (13.00 vs 12.8): it no longer misses the
+  expert cache often enough to show a spread.
+
+### Serve warm-up is a real confound in the serve column
+
+The 12-request median contains each model's ramp, and the ramp size depends on whether the
+model converges on a resident working set: m2.7 goes 2.02 → ~7.4 by request 6 (stdev 2.17, so
+its 5.86 median materially understates warm), m3 ramps mildly (1.88 → ~2.7, stdev 0.37, at
+229 GB it never converges), nemotron barely ramps (9.18 → ~10.0, stdev 0.32, 69 GB fits).
+Cross-model comparison of serve medians is therefore not apples-to-apples.
+
+### kimi-k3 serving: not measurable on one box
+
+`coli serve` ran 22 minutes without binding its port, reading steadily at 4.5 GiB/s — ~5.7 TB,
+four times the container — with RSS flat at 108.4 GB. Verified progressing (not hung) via
+`/sys/block/nvme0n1/stat` and `/proc/<pid>/io`. A 1.4 TB model against 121 GB RAM streams and
+evicts rather than converging. Hardware limit, consistent with the ~12-box residency estimate.
+**Do not re-attempt single-box K3 serve without a residency change.**
+
 ## DeepSeek-V4-Flash: first sound measurements (2026-08-04)
 
 Deliberately NOT a column in the Coverage grid above — most levers are untested on V4, and
