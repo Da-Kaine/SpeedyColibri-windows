@@ -57,6 +57,45 @@ resource the previous one used. That reframes the remaining work:
 
 Per-module port status and the milestone order live in **[PORTING.md](PORTING.md)**.
 
+## Reading the phase timers: what they can and cannot tell you — 2026-08-07
+
+**Phase timers here measure wall time around a phase, and a phase that ends at a CUDA sync
+absorbs whatever the previous phase left in flight.** That is not a bug in the code being
+profiled; it is what the numbers mean. It has produced three wrong conclusions in this
+project and is worth internalising before reading any breakdown below.
+
+n=10 on MiniMax-M3, one binary, identical configuration. Variance **by timer, same runs**:
+
+| timer | range (ms) | spread |
+|---|---|---|
+| `expert-load` | 12546–12918 | 3% |
+| **`prefill` (wall)** | 30378–31528 | **4%** |
+| `moe` | 22320–23869 | 7% |
+| `proj` | 3573–3868 | 8% |
+| `attn` | 6977–7865 | 12% |
+| **`core`** | **908–1840** | **75%** |
+
+A 932 ms swing in `core` against a 4% wall is not work being done. The mechanism shows up as
+an **anticorrelation between `attn` and `moe`** — run 7 `attn` 7865 / `moe` 22320, run 4
+`attn` 7096 / `moe` 22799 — where the *sum* (3.8%) is far tighter than either part. Work
+sloshes across the phase boundary run to run. MiniMax-M2.7 shows the same shape (`core` 38%
+while its `attn` holds 4%), so this is a property of the instrument, not of one model.
+
+Practical rules:
+
+- **Quote wall time, or `attn`+`moe` combined.** Never headline `core`, and never use it as a
+  bisect predicate — a 75% spread will converge on wherever the threshold was drawn.
+- **Never compare `attn` across arms with different expert dispatch.** Switching only
+  `COLI_NVFP4_GROUP_ROWS` on one binary moves `attn` 6896 → 5756 with no code change.
+- **A kernel-only measurement can invert a decision.** CUDA events show expert-weight staging
+  costs 2.06 s and makes the kernel *slower*, so a compute-only benchmark says "always
+  disable" — and that regresses GLM by 11.5%, because staging's value is I/O decoupling that
+  no compute timer can see. See [the staging gate](#prefill-the-mallopt-regression-and-its-fix--2026-08-06).
+
+Three conclusions in this repo were corrected by these rules rather than by new code: a
+"branch-introduced attention regression" that was a dispatch difference, a "1.09× V4 speedup"
+that was cross-day drift, and a "3.3× attention-core regression" that was phase attribution.
+
 ## Prefill: the `mallopt` regression and its fix — 2026-08-06
 
 A re-measurement found MiniMax-M3 prefill at **1.358×** its July figure. Eight mechanisms
