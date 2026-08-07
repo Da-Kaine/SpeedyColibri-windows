@@ -2209,6 +2209,80 @@ fn cmd_iobench(args: &[String]) -> ExitCode {
         }
         Err(e) => println!("  (C) O_DIRECT open failed ({e}) — skipping ceiling"),
     }
+
+    // ---- WARM arms: the steady-state decode regime -------------------------------
+    // A/B/C above drop the page cache first, so they measure the COLD (prefill /
+    // model-load) bound. Warm decode is a different regime and needs different arms:
+    // measured on M2.7, the drive sits at ~1% util for 15+ s while decode still takes
+    // 379 ms/token, because 66% of expert draws miss the managed cache and `pread`
+    // bytes that are ALREADY page-cache resident into a fresh heap buffer.
+    //
+    // (D) is what we do today on that path. (E) is the same bytes reached in place
+    // through a mapping — no syscall, no copy. The gap between them is the whole
+    // prize for warm decode, and it is why `pread`-over-mmap deserves a re-measure:
+    // the reader chose pread to keep RSS down, but a heap copy is ANONYMOUS and
+    // unevictable while a mapped file page is clean and reclaimable.
+    println!("  --- warm arms (page cache primed; the steady-state decode regime) ---");
+    let warm = |label: &str, f: &dyn Fn() -> u64| {
+        let _ = f(); // prime
+        let t = std::time::Instant::now();
+        let touched = f();
+        let s = t.elapsed().as_secs_f64();
+        println!("  {label}: {:.2} GB/s  ({s:.2}s)", touched as f64 / s / 1e9);
+    };
+    warm("(D) warm pread + copy  ", &|| {
+        let mut buf = vec![0u8; bs];
+        let mut n = 0u64;
+        for &off in &offsets {
+            if unsafe { libc::pread(fd, buf.as_mut_ptr().cast(), bs, off as libc::off_t) } > 0 {
+                n += bs as u64;
+            }
+        }
+        n
+    });
+    let map = unsafe {
+        libc::mmap(std::ptr::null_mut(), flen as usize, libc::PROT_READ, libc::MAP_SHARED, fd, 0)
+    };
+    if map == libc::MAP_FAILED {
+        println!("  (E) mmap failed — skipping");
+    } else {
+        // Every 64 B cache line, so this is a like-for-like READ of the same bytes (D)
+        // copies — not a page-touch. A 4 KiB stride moves 1/4096 of the data and reports
+        // a meaningless ~600 GB/s.
+        warm("(E) mmap, read in place", &|| {
+            let mut acc = 0u64;
+            let mut n = 0u64;
+            for &off in &offsets {
+                let base = (map as usize + off as usize) as *const u8;
+                let mut p = 0usize;
+                while p < bs {
+                    acc = acc.wrapping_add(unsafe { *base.add(p) } as u64);
+                    p += 64;
+                }
+                n += bs as u64;
+            }
+            std::hint::black_box(acc);
+            n
+        });
+        // (F) the honest upper bound for our actual consumer: the GPU reads mapped pages
+        // itself, so the CPU pays only for *reaching* them. One byte per 4 KiB page.
+        warm("(F) mmap, page-reach only", &|| {
+            let mut acc = 0u64;
+            let mut n = 0u64;
+            for &off in &offsets {
+                let base = (map as usize + off as usize) as *const u8;
+                let mut p = 0usize;
+                while p < bs {
+                    acc = acc.wrapping_add(unsafe { *base.add(p) } as u64);
+                    p += 4096;
+                }
+                n += bs as u64;
+            }
+            std::hint::black_box(acc);
+            n
+        });
+        unsafe { libc::munmap(map, flen as usize) };
+    }
     ExitCode::SUCCESS
 }
 
