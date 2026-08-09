@@ -252,6 +252,7 @@ pub fn attention_gqa(
     pos_base: usize,
     out: &mut [f32],
 ) {
+    let _tb = std::time::Instant::now();
     let h = cfg.n_heads as usize;
     let kvh = cfg.n_kv_heads as usize;
     let hd = cfg.qk_head as usize; // head_dim
@@ -267,6 +268,8 @@ pub fn attention_gqa(
     // separate synchronized GPU dispatch (~25% of decode across q/k/v/o × 60 layers). The
     // separate-proj path is the fallback for unit tests that build q/k/v_proj directly.
     let _tp = std::time::Instant::now();
+    // Pooled — see `AttnScratch`. The bindings stay owned `Vec<f32>`, so every use site
+    // below is unchanged; only where they come from and where they go changes.
     let mut q = vec![0f32; s_len * h * hd];
     let mut k = vec![0f32; s_len * kv_dim];
     let mut v = vec![0f32; s_len * kv_dim];
@@ -363,6 +366,66 @@ pub fn attention_gqa(
     // double-counts — which it did on first writing, inflating `core` by the alloc and
     // making the sub-timer sum look closer to `attn` than it is. The twin in
     // `attention_with_heads` allocates before its core timer, so only this path was wrong.
+    //
+    // ---- ~700 ms of `ATTN_US` IS STILL UNBRACKETED ON M3, AND HERE IS WHAT IT IS NOT ----
+    //
+    // `timed(&ATTN_US, ..)` wraps this function and nothing else, yet exceeds the sum of the
+    // sub-timers by 568-810 ms across eight runs (mean ~700) while the July binary leaves
+    // 3 ms, twice. It is the steadiest signal in this phase: `core` swings 868-1413 and
+    // `proj` spans 2266-3371 on July alone, so neither can be used to chase it.
+    //
+    // Eliminated, each by measurement rather than by reading:
+    //   1. the `ctx` allocation — 16.8 MB/call, 1.01 GB over 60 layers, and `mallopt` mmaps
+    //      anything past 2 MB. Predicted ~700 ms from that; it measures 118-209. Real cost,
+    //      ~20% of the hole, now its own `ctx-alloc` sub-timer.
+    //   2. `dsa-indexer` — genuinely 0 ms on m3, closing an assumption previously made from
+    //      code reading alone.
+    //   3. THE EXPERT PATH'S ASYNC TAIL. This file warns never to compare `attn` across arms
+    //      with different expert dispatch, so that warning was used as the test: switching
+    //      per-expert -> grouped zero-copy moved `attn` ~790 ms, and ALL of it landed in the
+    //      SUB-TIMERS (6667 -> 5960). The unaccounted remainder held at 778 vs 698, arms
+    //      overlapping. The tail is real and lands in `proj`/`core`; it is not this.
+    //   4. `m3_block_select` above — the one function call in an untimed gap, and it returns
+    //      immediately unless COLI_M3_SPARSE=1, which is off by default.
+    //   5. a timer-mechanism asymmetry — `timed` and `atime` are identical (both gate on
+    //      `profile_on()`, both `Instant` + `as_micros()`), and truncation across ~300 calls
+    //      per prefill is under a millisecond.
+    //
+    // ANSWERED, and then the answer turned out not to be the regression. Bracketing the
+    // whole body settled where: `body` matches the sub-timer sum EXACTLY (6246 vs 6246),
+    // so `attn - body` = 786/714 ms is OUTSIDE the body, where the only thing that happens
+    // is the locals being dropped. Moving `drop(ctx)` inside cut it to 339/349, confirming
+    // the frees. Per layer call that is ~55 MB (q 16.8, qkv_out ~18.9, ctx 16.8, k/v ~1.05
+    // each) and ~3.3 GB over 60 layers, each past `mallopt`'s 2 MB mmap threshold.
+    //
+    // **BUT REMOVING THEM BUYS NOTHING.** Pooling all five buffers in a thread-local — token
+    // gates identical on m3, m2.7, maple and nemotron — measured NEUTRAL on m3 prefill:
+    // 30206.6/30803.7 unpooled vs 30167.8/30942.6 pooled, alternating, medians of 3. That
+    // is 0.16% the wrong way, inside each arm's ~700 ms spread. So the pooling was NOT
+    // shipped.
+    //
+    // The frees are real CPU time and OFF THE CRITICAL PATH: expert-load is 12.5-16 s of a
+    // 30 s prefill, so the CPU has slack and freeing memory overlaps async GPU work. A
+    // phase timer measures CPU wall, which is why it saw them at all.
+    //
+    // So the ~700 ms hole is explained. AND THE WALL GAP IT WAS BEING CHASED FOR DOES NOT
+    // EXIST. Three measurements of m3 prefill against the July binary, same alternating
+    // design, increasing power:
+    //
+    //   medians-of-3, n=2      +884 ms  (+2.9%)
+    //   medians-of-3, n=2      +106 ms  (+0.35%)   <- repeat of the identical design
+    //   medians-of-8, n=2       -85 ms  (main FASTER)
+    //
+    // The sign flips. At 16 reps per arm JULY is 30868 and MAIN 30783, arms interleaving.
+    // The 6.6% this started from was cross-session; the 2.9% that replaced it was n=2
+    // medians-of-3 whose arms happened to land 0.13% apart, which read as confidence and
+    // was luck. `median()` in scripts/lib.sh is not a power guarantee.
+    //
+    // Every phase agrees: at medians the `attn` phase on main is if anything FASTER than
+    // July's (4017 vs 4465), which is the opposite of the premise the whole search rested
+    // on. Seven eliminations found nothing in the attention phase because there was nothing
+    // to find. They are kept above because they are true and cheap to re-read — not because
+    // they narrowed anything.
     let st0 = kv.kv_start[layer];
     let _tx = std::time::Instant::now();
     let mut ctx = vec![0f32; s_len * h * hd];
@@ -468,6 +531,10 @@ pub fn attention_gqa(
     let _to = std::time::Instant::now();
     matmul_qt(out, &ctx, &l.o, s_len);
     atime(&crate::forward::ATTN_OPROJ_US, _to);
+    // `drop(ctx)` inside the bracket, so `body` accounts for the largest free rather than
+    // leaving it outside every timer. It costs nothing — see the retraction above.
+    drop(ctx);
+    atime(&crate::forward::ATTN_BODY_US, _tb);
 }
 
 /// As [`attention`], but selecting the core explicitly and optionally restricting each
