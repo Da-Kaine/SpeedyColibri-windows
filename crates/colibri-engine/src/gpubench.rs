@@ -55,6 +55,20 @@ fn int8_tensor(o: usize, i: usize) -> QTensor {
     t
 }
 
+/// int2 (`fmt 3`): 4 values/byte, `value = field - 2`, one f32 scale per row.
+///
+/// **This format had no row in either table until Maple shipped on it** — the same
+/// closed-set gap that once left MXFP4, the format two models depend on, impossible to
+/// microbenchmark. `qtensor_from_f32` at `bits = 2` routes to `pack_int2`, which is the
+/// encoder the ternary converter uses, so the benchmark cannot encode in a way the kernels
+/// do not decode.
+fn int2_tensor(o: usize, i: usize) -> QTensor {
+    let w: Vec<f32> = (0..o * i).map(|k| ((k as f32) * 0.017).sin()).collect();
+    let mut t = crate::quantize::qtensor_from_f32(&w, o, i, 2);
+    t.gpu_eligible = true;
+    t
+}
+
 /// Quantize `w` [o, i] to MXFP4 (fmt 6): E2M1 nibbles, two per byte with the EVEN column
 /// in the low nibble, plus one E8M0 (bare power-of-two) scale per **32** inputs.
 ///
@@ -158,6 +172,12 @@ pub fn sweep(s: usize, reps: usize) -> Vec<Row> {
         ("br-O8192", 8192, 1024),
         ("br-I512", 4096, 512),
         ("br-I2048", 4096, 2048),
+        // Maple's decode-path resident shapes (ternary/int2). `lm_head` is deliberately
+        // absent: at [151936, 2048] building it in three formats needs several GB of
+        // scratch, and it is fmt 0 (f32) in the container anyway — no int2/nvfp4 arm to
+        // compare it against.
+        ("maple-qkv", 3072, 2048),
+        ("maple-o", 2048, 2048),
     ];
     sweep_shapes(SHAPES, s, reps)
 }
@@ -176,7 +196,11 @@ pub fn sweep_shapes(shapes: &[(&'static str, usize, usize)], s: usize, reps: usi
     let built: Vec<(&'static str, usize, usize, &'static str, QTensor)> = shapes
         .iter()
         .flat_map(|&(name, o, i)| {
-            [(name, o, i, "nvfp4", nvfp4_tensor(o, i)), (name, o, i, "int8", int8_tensor(o, i))]
+            [
+                (name, o, i, "nvfp4", nvfp4_tensor(o, i)),
+                (name, o, i, "int8", int8_tensor(o, i)),
+                (name, o, i, "int2", int2_tensor(o, i)),
+            ]
         })
         .collect();
     built
@@ -186,6 +210,181 @@ pub fn sweep_shapes(shapes: &[(&'static str, usize, usize)], s: usize, reps: usi
             Row { name, o: *o, i: *i, fmt, us_per_call, bytes: t.bytes(), gpu_frac }
         })
         .collect()
+}
+
+/// bf16 (`fmt 2`): raw 2-byte values in `q4`, no per-row scale — the IO tier.
+fn bf16_tensor(o: usize, i: usize) -> QTensor {
+    let mut bytes = Vec::with_capacity(o * i * 2);
+    for k in 0..o * i {
+        let v = ((k as f32) * 0.017).sin();
+        bytes.extend_from_slice(&colibri_core::f32_to_bf16(v).to_le_bytes());
+    }
+    QTensor {
+        fmt_code: 2,
+        o: o as i32,
+        i: i as i32,
+        q4: bytes.into(),
+        gpu_eligible: true,
+        ..Default::default()
+    }
+}
+
+/// f32 (`fmt 0`): the IO tier bf16 replaced. Here so the two can be compared directly.
+fn f32_tensor(o: usize, i: usize) -> QTensor {
+    QTensor {
+        fmt_code: 0,
+        o: o as i32,
+        i: i as i32,
+        qf: (0..o * i).map(|k| ((k as f32) * 0.017).sin()).collect(),
+        gpu_eligible: true,
+        ..Default::default()
+    }
+}
+
+/// The `lm_head` shape, in the three tiers it can ship in, measured in ISOLATION.
+///
+/// This exists because the phase timer could not settle the question. `lm_head` is the
+/// largest single per-token read in any fits-RAM model here, and `logits_us` put it at
+/// ~145 GB/s against a measured 257 GB/s streaming ceiling — but four different kernel
+/// shapes (block reduction, warp-per-row narrow, warp-per-row wide, and a rows-per-block
+/// sweep) all came back within noise of each other, which is what you see either when the
+/// kernel is already at a hardware limit or when the number is not really the kernel's.
+/// A phase timer cannot tell those apart; a direct per-call measurement can.
+///
+/// `s = 1` on purpose: this is the decode regime, where the row count is what selects the
+/// GEMV in the first place.
+pub fn io_report(reps: usize) {
+    let (o, i) = (151936usize, 2048usize);
+    println!();
+    println!("lm_head [{o}, {i}] per-call cost   S=1  reps={reps}");
+    match ceiling_gbs() {
+        Some(c) => println!("  streaming-read ceiling = {c:.0} GB/s"),
+        None => println!("  streaming-read ceiling = unavailable (no CUDA)"),
+    }
+    println!(
+        "  {:<7} {:>10} {:>9} {:>9} {:>10}  {}",
+        "tier", "us/call", "MB", "GB/s", "% ceiling", "on-gpu"
+    );
+    let ceil = ceiling_gbs().unwrap_or(f64::NAN);
+    // Built one at a time and dropped: three tiers of a 311M-parameter weight is ~2 GB of
+    // host memory held at once otherwise. `time_one` warms each before timing, so the
+    // device registration is not folded in.
+    for tier in ["bf16", "int8", "f32"] {
+        let t = match tier {
+            "bf16" => bf16_tensor(o, i),
+            "int8" => int8_tensor(o, i),
+            _ => f32_tensor(o, i),
+        };
+        let (us, frac) = time_one(&t, 1, reps);
+        let mb = t.bytes() as f64 / 1e6;
+        let gbs = mb / us * 1e3;
+        println!(
+            "  {:<7} {:>10.1} {:>9.1} {:>9.0} {:>9.0}%  {}",
+            tier,
+            us,
+            mb,
+            gbs,
+            100.0 * gbs / ceil,
+            if frac > 0.99 { "yes".to_string() } else { format!("NO ({:.0}%)", frac * 100.0) }
+        );
+    }
+}
+
+/// The GROUPED int2 expert path — the one Maple's decode actually runs.
+///
+/// `expert_sweep` below measures `try_expert_ffn`, the PER-EXPERT entry point, which decode
+/// does not use for int2: `moe.rs` routes to `try_expert_group_int2_decode`, one launch
+/// triple for all K experts of a layer. Benchmarking the path the model does not take is how
+/// a kernel ends up "measured" and still unexplained, so this times the real one.
+///
+/// It reports the GPU call and the Rust wrapper SEPARATELY. The wrapper adds a per-call
+/// `vec![0f32; K*D]` and then a scalar CPU scatter of `K*D` multiply-adds — 16K per layer,
+/// ~393K per token at Maple's shape, single-threaded — and none of that is visible to a
+/// kernel timer. Splitting them says which half to work on instead of guessing.
+#[cfg(feature = "cuda")]
+pub fn expert_group_report(reps: usize) {
+    use std::sync::Arc;
+    let (d, inter, k) = (2048usize, 512usize, 8usize);
+    let experts: Vec<Arc<crate::moe::Expert>> = (0..k)
+        .map(|_| {
+            Arc::new(crate::moe::Expert {
+                gate: int2_tensor(inter, d),
+                up: int2_tensor(inter, d),
+                down: int2_tensor(d, inter),
+            })
+        })
+        .collect();
+    let bytes: i64 = experts
+        .iter()
+        .map(|e| e.gate.bytes() + e.up.bytes() + e.down.bytes())
+        .sum();
+    let x: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.011).cos()).collect();
+    let active: Vec<(Arc<crate::moe::Expert>, Vec<usize>, Vec<f32>)> = experts
+        .iter()
+        .map(|e| (e.clone(), vec![0usize], vec![1.0f32]))
+        .collect();
+
+    // Raw GPU call: the three kernels plus the two copies and the stream sync, no wrapper.
+    let (gw, uw, dw): (Vec<_>, Vec<_>, Vec<_>) = (
+        experts.iter().map(|e| e.gate.q4.as_ptr() as *const std::ffi::c_void).collect(),
+        experts.iter().map(|e| e.up.q4.as_ptr() as *const std::ffi::c_void).collect(),
+        experts.iter().map(|e| e.down.q4.as_ptr() as *const std::ffi::c_void).collect(),
+    );
+    let (gs, us, ds): (Vec<_>, Vec<_>, Vec<_>) = (
+        experts.iter().map(|e| e.gate.s.as_ptr()).collect(),
+        experts.iter().map(|e| e.up.s.as_ptr()).collect(),
+        experts.iter().map(|e| e.down.s.as_ptr()).collect(),
+    );
+    let mut y = vec![0f32; k * d];
+    let raw = |y: &mut Vec<f32>| unsafe {
+        colibri_backend::cuda::expert_group_int2_raw(
+            y.as_mut_ptr(), x.as_ptr(), &gw, &uw, &dw, &gs, &us, &ds,
+            k as i32, d as i32, inter as i32,
+        )
+    };
+    raw(&mut y); // warm
+    let t0 = std::time::Instant::now();
+    for _ in 0..reps {
+        raw(&mut y);
+    }
+    let gpu_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    std::hint::black_box(&y);
+
+    // Full wrapper: adds the allocation, the pointer gather, and the CPU scatter.
+    let mut out = vec![0f32; d];
+    crate::gpu::try_expert_group_int2_decode(&active, &x, d, &mut out); // warm
+    let t1 = std::time::Instant::now();
+    for _ in 0..reps {
+        crate::gpu::try_expert_group_int2_decode(&active, &x, d, &mut out);
+    }
+    let all_us = t1.elapsed().as_secs_f64() * 1e6 / reps as f64;
+    std::hint::black_box(&out);
+
+    let mb = bytes as f64 / 1e6;
+    let ceil = ceiling_gbs().unwrap_or(f64::NAN);
+    println!();
+    println!("grouped int2 experts (K={k}, D={d}, I={inter}) — the path Maple decode runs");
+    println!("  reps={reps}   weight bytes/call = {mb:.2} MB   ceiling = {ceil:.0} GB/s");
+    println!(
+        "  {:<22} {:>10} {:>9} {:>10}",
+        "stage", "us/call", "GB/s", "% ceiling"
+    );
+    for (name, us) in [("GPU call only", gpu_us), ("+ Rust wrapper", all_us)] {
+        let gbs = mb / us * 1e3;
+        println!(
+            "  {:<22} {:>10.1} {:>9.0} {:>9.0}%",
+            name, us, gbs, 100.0 * gbs / ceil
+        );
+    }
+    println!(
+        "  wrapper overhead: {:.1} us/call ({:.0}% of the call) — alloc + CPU scatter of K*D",
+        all_us - gpu_us,
+        100.0 * (all_us - gpu_us) / all_us.max(1e-9)
+    );
+}
+#[cfg(not(feature = "cuda"))]
+pub fn expert_group_report(_reps: usize) {
+    println!("grouped int2 experts: unavailable (no CUDA)");
 }
 
 /// One measured expert FFN — the fused gate+up+down triple, not a single matmul.
@@ -255,6 +454,7 @@ pub fn expert_sweep(s: usize, reps: usize) -> Vec<ExpertRow> {
         ("floor", 128, 64),
         ("v4-expert", 4096, 2048),  // DeepSeek-V4: hidden 4096, moe_intermediate 2048
         ("k3-expert", 3584, 3072),  // Kimi-K3: routed_expert_hidden 3584, moe_inter 3072
+        ("maple-expert", 2048, 512), // Maple: hidden 2048, moe_intermediate 512
     ];
     // The fused kernels apply whatever `gpu::set_activation` last set. Pin it so a run is
     // reproducible and both formats do the same arithmetic; plain SiLU, no clamp.
@@ -265,6 +465,7 @@ pub fn expert_sweep(s: usize, reps: usize) -> Vec<ExpertRow> {
             [
                 (name, d, i, "nvfp4", [nvfp4_tensor(i, d), nvfp4_tensor(i, d), nvfp4_tensor(d, i)]),
                 (name, d, i, "mxfp4", [mxfp4_tensor(i, d), mxfp4_tensor(i, d), mxfp4_tensor(d, i)]),
+                (name, d, i, "int2", [int2_tensor(i, d), int2_tensor(i, d), int2_tensor(d, i)]),
             ]
         })
         .collect();
@@ -405,11 +606,55 @@ mod tests {
 
 /// Print a sweep with the floor called out explicitly. The interesting column is
 /// `over-floor`: time that is not the fixed round trip.
+/// Measured streaming-read ceiling of device memory, GB/s.
+///
+/// 1 GiB, which is far past any cache on this part, so it is DRAM and not L2. Reported
+/// beside every achieved GB/s because "we get 141 GB/s" means nothing on its own: against
+/// the 273 GB/s on the spec sheet it reads as half-wasted, and against what a do-nothing
+/// read kernel actually reaches it may be essentially done.
+#[cfg(feature = "cuda")]
+pub fn ceiling_gbs() -> Option<f64> {
+    colibri_backend::cuda::bandwidth_gbs(1 << 30, 5)
+}
+#[cfg(not(feature = "cuda"))]
+pub fn ceiling_gbs() -> Option<f64> {
+    None
+}
+
+/// Pageable host→device copy bandwidth at the size the attention KV upload actually moves
+/// (~1 MiB per projection per layer at a 512-token context).
+#[cfg(feature = "cuda")]
+pub fn h2d_gbs_1mib() -> Option<f64> {
+    colibri_backend::cuda::h2d_gbs(1 << 20, 20)
+}
+#[cfg(not(feature = "cuda"))]
+pub fn h2d_gbs_1mib() -> Option<f64> {
+    None
+}
+
 pub fn report(s: usize, reps: usize) {
     let rows = sweep(s, reps);
     let floor = rows.iter().filter(|r| r.name == "floor").map(|r| r.us_per_call).fold(f64::INFINITY, f64::min);
     println!("gpu matmul per-call cost   S={s}  reps={reps}");
     println!("  floor (64x128, negligible arithmetic) = {floor:.1} us/call");
+    match ceiling_gbs() {
+        Some(c) => println!(
+            "  streaming-read ceiling (1 GiB, no arithmetic)  = {c:.0} GB/s  \
+             <- compare the GB/s column to THIS, not to the spec sheet"
+        ),
+        None => println!("  streaming-read ceiling = unavailable (no CUDA)"),
+    }
+    // Pageable H2D is a DIFFERENT and much slower tier, and the attention path lives on it:
+    // `coli_cuda_gqa_attn` re-uploads the whole K and V history on every call, so the cost
+    // of this number is paid ~2x per layer per decoded token.
+    if let Some(h) = h2d_gbs_1mib() {
+        println!("  pageable host->device copy (1 MiB)             = {h:.0} GB/s");
+    }
+    // The tier decode attention reads on since the KV cache went zero-copy.
+    #[cfg(feature = "cuda")]
+    if let Some(z) = colibri_backend::cuda::zc_gbs(1 << 28, 5) {
+        println!("  kernel read of HOST memory, in place (256 MiB) = {z:.0} GB/s");
+    }
     println!();
     println!("  {:<10} {:>6} {:>6} {:>7} {:>10} {:>11} {:>9} {:>8}  {}", "shape", "O", "I", "fmt", "us/call", "over-floor", "MB", "GB/s", "on-gpu");
     for r in &rows {

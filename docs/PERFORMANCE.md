@@ -41,6 +41,15 @@ resource the previous one used. That reframes the remaining work:
   running the shared expert during the routed experts' disk wait — hides 100% of its cost
   and is still a **15× loss**, because concurrent GPU work from a second thread takes an
   illegal memory access and a sticky CUDA error drops every expert to the CPU.
+- **There are THREE memory tiers, and mixing them misreads everything.** `coli gpubench`
+  measures all three with the same do-nothing read kernel: a **device** read is **256 GB/s**
+  (94% of the GB10's 273 GB/s paper figure), a kernel reading **host memory in place** is
+  **161 GB/s**, and a **pageable H2D copy** is **44 GB/s**. That ordering is why zero-copy
+  KV won: it replaced (copy at 44 + device read) with a single host read at 161. Quote an
+  achieved GB/s against the tier the code actually uses. Compare every achieved GB/s to that, not to the spec sheet. It also times
+  `lm_head` [151936, 2048] in isolation: **bf16 250 GB/s (98% of ceiling)**, f32 262, int8
+  199. The output projection has no kernel headroom left; see
+  [the BF16 IO tier](#the-bf16-io-tier).
 - **4-bit experts are dequant-bound, not bandwidth-bound.** `coli gpubench` puts 4-bit at
   ~190 GB/s against int8's 400–580 on the same shapes — slower in absolute time while
   reading half the bytes. The wins came instead from read width and cheaper dequant.
@@ -95,6 +104,33 @@ Practical rules:
 Three conclusions in this repo were corrected by these rules rather than by new code: a
 "branch-introduced attention regression" that was a dispatch difference, a "1.09× V4 speedup"
 that was cross-day drift, and a "3.3× attention-core regression" that was phase attribution.
+
+### A fourth: a fixed cost hiding inside a rate — 2026-08-08
+
+Add one more rule, because it cost four A/Bs. **A per-unit figure must not be a running total
+divided by a step count when the total contains a one-time term.**
+
+Maple's `lm_head` read 4.4 ms/token while `gpubench` timed the identical matmul at 2.5 ms.
+The 1.9 ms gap was chased through a warp-per-row GEMV, `uint4` vectorised reads, a
+rows-per-block sweep, and the removal of a 608 KB per-token allocation — **all four measured
+neutral**, because none of them touched anything that was slow. Two arithmetic faults:
+
+1. The running total included the **prefill** logits call, which is the first touch of
+   `lm_head` and therefore pays a one-time **~38 ms device upload** of the whole 622 MB
+   weight. Spread over 24 steps that is +1.6 ms/token of fiction.
+2. It was then averaged over **every** decode step while the `mean` it was added to used only
+   the **warm half** — a cold number added to a warm one.
+
+**The tell was visible from the start and is worth memorising: the figure went UP when the
+run got SHORTER** — 6.3 ms over 11 steps against 4.4 over 24. No genuine per-token cost can
+do that. Two runs at different N also solve for both terms directly (`c + F/N`), which gave
+F = 38.6 ms and c = 2.79 ms — and c matched the isolated kernel, confirming the diagnosis
+before a line was changed. `head_ms` is now the warm-window mean of per-step samples and
+holds at 2.5 ms across NGEN 11/24/48.
+
+So: **vary the denominator and check the rate holds still**, and confirm any phase timer
+against an isolated measurement before optimising what it points at. `coli gpubench` now
+prints a measured bandwidth ceiling and an isolated `lm_head` table for exactly this.
 
 ## Prefill: the `mallopt` regression and its fix — 2026-08-06
 
@@ -287,6 +323,154 @@ ceiling is set by disk bandwidth: even at saturation the union (~all 256 experts
 fits the cache, so every step still streams ~the whole expert set. The real lever is
 **RAM-resident experts across a cluster**, which lifts the whole curve; a continuous-batching
 scheduler pairs with that, not with a single node.
+
+### Split-K decode attention — 2026-08-08
+
+**Measured decode-only** (phase counters differenced from end-of-prefill; the cumulative
+totals are ~96% prefill at a 512-token prompt and cannot answer this), Maple:
+
+| phase | ms/token | share |
+|---|---|---|
+| **attn** | **10.33** | **66%** |
+| moe | 2.68 | 17% |
+| logits | 2.62 | 17% |
+
+Attention, not the expert path — which measures 42–49% of the memory ceiling and ~1.44
+ms/token. The whole prior effort had been aimed at experts on the strength of a
+short-context profile.
+
+Cause: at `S == 1` both GQA kernels launch `grid = (H, S)` = **16 blocks for a layer**, and
+`tc_gqa_attn` fills a `GQA_QT=16`-row query tile with one real row. Prefill-shaped kernels in
+the decode regime — the same error as the block-per-row expert kernels, one level up. Inside
+`gqa_attn_kernel` the V accumulation strides `d < D`, so at D=128 against 1024 threads only
+128 threads are live and each walks all `nt` keys.
+
+Split-K partitions keys across `nsplit` blocks per head, each with a local softmax, combined
+against a global max (`acc * exp(m_split − M)`). ABBA, one knob, tokens identical:
+
+| | prefill-shaped | split-K |
+|---|---|---|
+| decode (forward-only) | 75.59 / 76.44 | **130.35 / 132.40 tok/s** (1.73×) |
+| decode (end-to-end) | 63.58 / 64.18 | **98.31 / 99.47 tok/s** (1.55×) |
+
+**It scales with context and is neutral without it.** `serving` moved 69.1 → 69.8 because
+that suite uses short prompts: few keys, `nsplit` → 1, kernel degenerates to the old shape.
+Prefill untouched (S>1 never takes this path). Nemotron 12.54 vs 12.68, tokens identical —
+neutral, as expected when decode is expert-streaming with 8 GQA layers.
+
+### Zero-copy KV, not a device KV cache — 2026-08-08
+
+`coli_cuda_gqa_attn` re-uploaded the ENTIRE K and V history every call: ~52.7 MB per decoded
+token at a 512-token context, against a measured **43 GB/s** pageable H2D (vs 256 GB/s for a
+device read) — ~1.23 ms/token, a quarter of attention after split-K, when exactly one row had
+changed.
+
+**The device-resident KV that everyone reaches for first was rejected on correctness, not
+performance.** It has to be invalidated whenever the host rows change, and they do: a
+rejected MTP draft rewrites positions, and `serve` reuses a cache across requests. A stale
+device KV is wrong output, not slow output — and this repo has already shipped a
+pointer-keyed device cache that served the wrong bytes (see the expert-weight incident).
+
+Zero-copy has no such failure mode: there is no second copy to go stale, so the kernel reads
+whatever the host last wrote. Needs `cudaDevAttrPageableMemoryAccess`, true on GB10, and it
+is the same mechanism the expert weights already use.
+
+Measured, n=5 per arm: **forward-only 129.9 → 158.1 tok/s (1.22×)**, end-to-end ~99.6 →
+~112.8. Tokens identical, bit-exact by construction.
+
+**NEGATIVE, tried and reverted: sharing the KV read across a GQA group.** `kvh = h/(H/Hkv)`
+means four query-head blocks each read the same K/V rows, so decode attention issues ~203.6
+MB of reads where the cache holds 50.9 — a 4× amplification, and against the 161 GB/s
+host-read tier that put it at ~29% of ceiling. A variant giving one block per KV head, each
+lane loading an element once and doing `g` MACs with it (with `nsplit` multiplied by `g` so
+the block count did not collapse — the trap that cost the int2 wide read 38%), measured
+**NEUTRAL**: share 154.2/157.8 against per-head 161.4/140.7, ranges overlapping, tokens
+identical. Reverted.
+
+The lesson is about the metric, not the kernel: **an achieved-GB/s figure counts bytes
+*requested*, not bytes fetched from DRAM.** Those four blocks were already hitting cache, so
+the amplification existed in instruction count and not in traffic, and removing it bought
+nothing. A read-amplification argument needs a cache-miss measurement behind it, not an
+arithmetic one.
+
+**Honest caveat: it is less consistent than the upload.** Zero-copy spans 140–161 tok/s
+across runs against the upload's 129.6–132.9, and the first run after a build read 111.85
+before settling. Faster in six runs of seven. `COLI_GQA_ZEROCOPY=0` restores the uploads.
+Prefill still uploads — it indexes k/v by absolute position across all S queries and cannot
+use the decode window.
+
+### Short rows starve block-per-row kernels — 2026-08-08
+
+**Check `row_bytes / blockDim` before concluding a GEMV is ALU-bound.** The grouped int2
+expert kernels gave one 256-thread block to each output row, and `int2_partial` strides
+`for (b = tid; b < nb; b += nthreads)`. On Maple's expert shapes that starves: the down
+projection's row is `ceil(512/4)` = **128 bytes against 256 threads**, so half the block did
+nothing and the rest decoded one byte each — followed by an 8-round shared tree reduction
+with a barrier per level.
+
+A token routes top-8 over 24 layers = 192 experts × 786 KB = **151 MB of expert weight**,
+which at the measured 257 GB/s ceiling is **0.59 ms**. The path was spending ~10.7 ms, about
+**5% of the roof** — the signature of a kernel-shape bug, not a bandwidth story.
+
+One warp per row: every lane busy, five `__shfl_down_sync`, no shared memory, no block
+barrier, 8 rows per block. ABBA, one knob (`COLI_INT2_WARP`), `lm_head` flat at 2.5 ms as the
+control, tokens identical in all four runs:
+
+| | block-per-row | warp-per-row |
+|---|---|---|
+| decode (forward-only) | 63.95 | **76.91 tok/s** (1.20×) |
+| decode (end-to-end) | 55.14 | **64.51 tok/s** (1.17×) |
+| serving | 60.2 | **69.1 tok/s** |
+
+This **retires the earlier "int2 is ALU-bound" conclusion**. It was occupancy, and the lever
+was the thread→row mapping — which is also why the earlier 16-weights-per-thread read
+measured 38% worse: it kept block-per-row and widened the read, emptying the block further.
+Read granularity (one byte, 4 ternary weights) was already right.
+
+The dense int2 attention projections have the same shape, and there the win is real but
+small: isolated, `maple-qkv` [3072,2048] goes **34.8 → 21.0 µs (1.66×, 59 → 125 GB/s)** and
+`maple-o` is unchanged. qkv is 24 calls of a 15.6 ms token — ~2%, below what the decode
+harness resolves, and the end-to-end A/B came back neutral. Kept on the isolated result, not
+claimed as a headline.
+
+### The BF16 IO tier
+
+**`fmt 2`, shipped 2026-08-08.** The embeddings and `lm_head` are the "IO tier" — genuinely
+dense weights with no structure to exploit — so a model that wants exactness ships them
+unquantized. On Maple that is worth 31/32 teacher-forced top-1 against the reference instead
+of 29/32.
+
+Exact used to mean F32, and for a BF16 checkpoint that is **2× the bytes for zero extra
+information**: every stored f32 carried 16 zero mantissa bits. `lm_head` alone is 311M
+parameters read once per generated token — the largest single per-token read in any
+fits-RAM model here. Storing bf16 and widening in-kernel is the *same arithmetic* (f32
+accumulation either way), so logits are bit-identical; the token gate confirms it end to end
+rather than the claim resting on unit tests.
+
+| | `lm_head`/token | e2e decode | serving | container |
+|---|---|---|---|---|
+| F32 IO tier | 5.1 ms | 48.59 / 48.49 tok/s | 52.4 tok/s | 7.1 GB |
+| **BF16 IO tier** | **2.5 ms** | **55.48 / 55.57 tok/s** | **60.2 tok/s** | **5.9 GB** |
+
+ABBA, one binary, non-overlapping arms. `lm_head` **2.04×** against a byte ratio of exactly
+2.00 — the kernel was already at the memory ceiling in both tiers, so halving the bytes
+halved the time and nothing else changed.
+
+Forward-only decode is unchanged across the two, which is the control: the effect is confined
+to the phase that reads the weight. Two design notes worth carrying:
+
+- **The safetensors dtype is the format tag.** No `.qs` sidecar and no byte-length inference
+  (the int8-vs-int2 branch has to guess from a length; BF16 and F32 are self-describing).
+  Gated on `bits >= 16`, so loading a raw HF checkpoint at 8 bits still runtime-quantizes.
+- **The converter verifies the round trip per tensor** and falls back to F32 rather than
+  round a genuinely-f32 source. Exactness is checked, not assumed.
+
+It also flushed out a latent crash. `coli_cuda_tensor_upload`/`_update` decided whether to
+`cudaMemcpy` a per-row scale array with `if (fmt)` — "everything except f32 is scaled". bf16
+has no scale vector, and an **empty Rust `Vec` yields a dangling non-null pointer**, so that
+test would have sailed past its own null check and copied `O*4` bytes of garbage. Replaced
+with an explicit `has_row_scale(fmt)` at ~15 sites; any `fmt != 0` / `fmt > 4` test is a
+closed set with a dangerous default.
 
 ### Expert quantization: NVFP4 (default), e4m3 opt-out, MXFP4 passthrough
 
