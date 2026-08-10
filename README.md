@@ -91,19 +91,31 @@ the ~100 ms is a constant, so it is 24% of Maple's request and 0.3% of GLM's. Ev
 was flat to within its own noise — GLM's 12 prompts spread 0.73-1.24 tok/s *inside a single
 run*, so nothing at GLM's scale can be read off one serve median.
 
-**GLM's old prefill figure of 6.9 tok/s (74.6 s) does not reproduce, and the cause is the
-box, not the code.** Re-measured 2026-08-09 it reads 7.7 (66.9 s), and the tempting conclusion
-— that something got 11% faster — is wrong. Built `bc8d164`, the last commit before that
-work, and ran both binaries alternating in one session, 4 reps per block, 2 blocks per arm:
+**GLM's prefill has no stable absolute value on this box, and the 7.7 tok/s above is one
+draw from a range.** The same binary and the same prompt read **62.0, 65.1, 66.9, 72.4 and
+80.1 s** across 2026-08-09/10 — **8.3 down to 6.4 tok/s**, with no code change anywhere. GLM
+moves 403 GB through 121 GB of RAM, so page-cache and fragmentation state dominates; a reboot
+resets it to the fast end and it degrades within ~20 minutes of repeated streaming. Not
+thermal (GPU 60 °C, throttle reasons `0x0`), not another tenant, not compilation.
+
+That is why the older 6.9 tok/s (74.6 s) figure is gone rather than corrected: it was never
+wrong, it was a draw taken further along the same curve. **Treat ±15% as the honest width and
+never compare a GLM prefill number against one from a different session.** The card says so
+too.
+
+Against that backdrop, one comparison does survive, because both arms were sampled inside a
+single quiet session — `bc8d164` vs `main`, alternating, 4 reps per block, 2 blocks per arm:
 
     OLD bc8d164   65146 / 65084 ms      NEW main   67002 / 66611 ms
 
-Neither arm comes near 74.6 s. **The published figure was a worse-conditions baseline**, the
-same trap that once turned a 4% serve delta into a reported 20% here — GLM prefill runs at
-~82% of the drive's ceiling, so it reads whatever the box's I/O state allows that day. The
-A/B also found the opposite of a win: `main` is **2.6% slower** than `bc8d164` on this
-prefill, cleanly outside the per-rep spread and with each arm repeating within 0.6%. It is
-unattributed and not the attention timers (`atime` accumulates only under `COLI_PROFILE`).
+`main` is **2.6% slower** than `bc8d164` here — each arm repeating within 0.6%, cleanly
+outside the per-rep spread. It is a real regression and it is **unattributed**. Three attempts
+to localise it failed: a per-commit sweep drifted so badly that two docs-only commits read
+2-3 s slow, and two counterbalanced A/Bs against `5f4159f` (#63, the largest candidate) gave
+block deltas that flipped sign, then a control that moved **+29% between its own two blocks**
+— eleven times the effect. So #63 is neither implicated nor exonerated, and this metric on
+this machine cannot decide it. It is not the attention timers (`atime` accumulates only under
+`COLI_PROFILE`).
 
 **The biggest single win came from the phase nobody was looking at.** Everything above about
 Maple concerns the expert path, because that is where a short-context profile said the time
