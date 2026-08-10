@@ -41,12 +41,20 @@ data says why — the spread is a property of the model, not of the measurement:
 | | per-rep decode spread, one session, 8 reps |
 |---|---|
 | `nemotron-3-super` | **0.7%** (13.23-13.32) |
-| `deepseek-v4-flash` | 5.5% |
-| `minimax-m3` | 10% |
+| `deepseek-v4-flash` | 5.5% (4.53-4.78) |
+| `kimi-k3` | 8% (0.38-0.41) |
+| `glm-5.2` | 9% (0.98-1.07) |
+| `minimax-m3` | 10% (2.52-2.78) |
 | `minimax-m2.7` | **18%** (5.01-5.92) |
 
 m2.7's published 5.1 sits inside tonight's own low tail. A median-of-8 is the better estimate,
 which is why it is here — but the difference from a median-of-3 is not evidence of anything.
+
+**Each model card carries its own figure from this table**, because the spread varies 26×
+across the fleet and a shared "this is noisy" caveat would understate m2.7 while misleading
+on nemotron — whose card says the opposite, that its decode can be taken at face value.
+Maple has no such note: its warm suites agree within ~2%, and its decode already carries the
+correction described above.
 
 **The decode figure is a median of 8, not 3, and that correction is mine.** It read 116.3
 here until four suites at `BENCH_REPS=8` put it at 112.1: three warm suites agreed at 112.80,
