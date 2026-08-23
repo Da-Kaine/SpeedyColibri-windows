@@ -39,7 +39,7 @@ impl JsonObj {
         Self::default()
     }
 
-    fn push(&mut self, key: String, val: Json) {
+    pub fn push(&mut self, key: String, val: Json) {
         // Last write wins, matching `hm_put`/`json_get`'s first-hit-after-overwrite.
         if let Some(&i) = self.index.get(&key) {
             self.vals[i] = val;
