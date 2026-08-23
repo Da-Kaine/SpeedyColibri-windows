@@ -6,18 +6,20 @@ A fast Rust Mixture-of-Experts (MoE) inference engine designed to stream large A
 
 ---
 
-## 🚀 Quick Start on Windows
+## 🚀 Quick Start
 
-### 1. Installation
+### 1. Download & Install Engine
 
-#### Option A: Pre-compiled Binary
+#### Windows
+
+##### Option A: Pre-compiled Binary
 Download the latest `coli.exe` binary directly from the [GitHub Releases](https://github.com/GriffinPilz/SpeedyColibri/releases) page, or run the installer script in PowerShell:
 
 ```powershell
 .\scripts\install.ps1
 ```
 
-#### Option B: Build from Source
+##### Option B: Build from Source
 If you have [Rust](https://rustup.rs) installed:
 
 ```powershell
@@ -29,6 +31,41 @@ $env:COLI_CUDA=1
 .\scripts\build.ps1
 ```
 The compiled binary will be located at `.\target\release\coli.exe`.
+
+#### Linux / macOS
+
+##### Option A: Installer Script
+Run the installation script in terminal:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/GriffinPilz/SpeedyColibri/main/scripts/install.sh | bash
+```
+
+##### Option B: Build from Source
+```bash
+# Build standard release
+cargo build --release
+
+# (Optional) Build with CUDA GPU support
+cargo build --release --features cuda
+```
+The compiled binary will be located at `./target/release/coli`.
+
+---
+
+### 2. Download Model Container
+
+Download ready-to-run model containers directly using `scripts/fetch.sh`:
+
+```bash
+# Download a specific model container (e.g. maple-preview)
+./scripts/fetch.sh maple-preview
+
+# List available models in the registry
+python3 scripts/model.py list
+```
+
+Available models include `maple-preview`, `nemotron-3-super`, `minimax-m2.7`, `deepseek-v4-flash`, `minimax-m3`, `glm-5.2`, and `kimi-k3`.
 
 ---
 
