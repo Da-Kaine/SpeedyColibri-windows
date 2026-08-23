@@ -46,6 +46,9 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 # Always confirm: `coli backend` must print `backend: cuda (Cuda(0))`, not `cpu`.
 
+# On Windows (PowerShell):
+.\scripts\build.ps1
+
 # Which models are registered (scripts/models.toml) — serve any of them by name:
 scripts/model.py list                     # name + arch notes (abbreviated here)
 #   deepseek-v4-flash 43 layers all-MoE, 256 exp top-6 + 1 shared, MXFP4 routed;

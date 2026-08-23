@@ -454,7 +454,7 @@ fn open_direct(_path: &Path) -> Option<File> {
 /// Mapping the whole file costs only address space — 1.4 TB of it is free on 64-bit,
 /// and physical pages materialise only when touched.
 struct Mapping {
-    ptr: *mut libc::c_void,
+    ptr: *mut std::ffi::c_void,
     len: usize,
 }
 
@@ -490,7 +490,7 @@ impl Mapping {
         // reached because `mincore` said it was already resident.
         // SAFETY: `ptr`/`len` name the mapping just created.
         unsafe { libc::madvise(ptr, len as usize, libc::MADV_RANDOM) };
-        Some(Mapping { ptr, len: len as usize })
+        Some(Mapping { ptr: ptr.cast(), len: len as usize })
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -623,8 +623,11 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
-        // SAFETY: unmapping exactly what `open` mapped.
-        unsafe { libc::munmap(self.ptr, self.len) };
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: unmapping exactly what `open` mapped.
+            unsafe { libc::munmap(self.ptr.cast(), self.len) };
+        }
     }
 }
 
