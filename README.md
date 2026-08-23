@@ -497,6 +497,16 @@ scripts/model.py list                     # what's registered
 
 Pre-compiled Windows binaries (`coli.exe`) are built automatically for each release and available on the [GitHub Releases page](https://github.com/GriffinPilz/SpeedyColibri/releases).
 
+**Single-Click / One-Line Install:**
+- **Windows (Single Click):** Double-click `install.bat` in the repository root or run in PowerShell:
+  ```powershell
+  iwr -useb https://raw.githubusercontent.com/GriffinPilz/SpeedyColibri/main/scripts/install.ps1 | iex
+  ```
+- **Linux / macOS:**
+  ```bash
+  curl -sSL https://raw.githubusercontent.com/GriffinPilz/SpeedyColibri/main/scripts/install.sh | bash
+  ```
+
 To build natively from source on Windows:
 
 ```powershell

@@ -46,7 +46,13 @@ NVCC=/usr/local/cuda/bin/nvcc CUDA_HOME=/usr/local/cuda CUDA_ARCH=sm_121 \
   cargo build --release -p coli --features cuda
 # Always confirm: `coli backend` must print `backend: cuda (Cuda(0))`, not `cpu`.
 
-# On Windows (PowerShell):
+# One-line binary installer:
+# Windows (PowerShell):
+iwr -useb https://raw.githubusercontent.com/GriffinPilz/SpeedyColibri/main/scripts/install.ps1 | iex
+# Linux / macOS:
+curl -sSL https://raw.githubusercontent.com/GriffinPilz/SpeedyColibri/main/scripts/install.sh | bash
+
+# Build from source on Windows (PowerShell):
 .\scripts\build.ps1
 
 # Which models are registered (scripts/models.toml) — serve any of them by name:

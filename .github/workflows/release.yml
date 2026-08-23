@@ -69,6 +69,10 @@ jobs:
       - name: Upload binaries to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset_name }}
+          files: |
+            ${{ matrix.asset_name }}
+            install.bat
+            scripts/install.ps1
+            scripts/install.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
