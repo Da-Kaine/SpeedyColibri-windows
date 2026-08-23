@@ -8,6 +8,7 @@
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod chat;
 mod serve;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -93,6 +94,7 @@ USAGE:
   coli <command> [args]
 
 COMMANDS:
+  chat <snap> [system_prompt...]  interactive terminal chat      [working]
   cluster [seconds]        scan the ConnectX/RoCE fabric for other Sparks  [working]
   serve <snap> [port] [warm-up prompt...]  OpenAI-compatible HTTP server  [working]
   worker <snap> [port]     expert-shard server for a peer node (multi-node)  [working]
@@ -233,6 +235,7 @@ fn main() -> ExitCode {
         "shard-serve" => cmd_shard_serve(&args),
         "shard-pull" => cmd_shard_pull(&args),
         "backend" => cmd_backend(),
+        "chat" => chat::cmd_chat(&args),
         "cluster" => cmd_cluster(&args),
         "worker" => cmd_worker(&args),
         "serve" => serve::cmd_serve(&args),

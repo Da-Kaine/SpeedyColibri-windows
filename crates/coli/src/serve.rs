@@ -988,7 +988,11 @@ fn complete(
 /// block disables reasoning so the model answers directly. The control tokens
 /// (`<|user|>`, `<|assistant|>`, …) are added-vocab entries, so encoding the
 /// assembled string resolves them to their ids exactly as the C engine does.
-fn build_chat_prompt(tok: &Tokenizer, messages: &[Json], arch: colibri_core::Arch) -> Vec<i32> {
+pub(crate) fn build_chat_prompt(
+    tok: &Tokenizer,
+    messages: &[Json],
+    arch: colibri_core::Arch,
+) -> Vec<i32> {
     match arch {
         colibri_core::Arch::MinimaxM2 => build_chat_prompt_minimax(tok, messages),
         colibri_core::Arch::NemotronH => build_chat_prompt_nemotron(tok, messages),
