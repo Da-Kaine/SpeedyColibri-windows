@@ -493,6 +493,19 @@ scripts/serve.sh maple-preview 8080       # …or just this: serve fetches what'
 scripts/model.py list                     # what's registered
 ```
 
+### Running Natively on Windows
+
+Pre-compiled Windows binaries (`coli.exe`) are built automatically for each release and available on the [GitHub Releases page](https://github.com/GriffinPilz/SpeedyColibri/releases).
+
+To build natively from source on Windows:
+
+```powershell
+# Prerequisites: Install Rust (https://rustup.rs)
+.\scripts\build.ps1
+# Run the binary:
+.\target\release\coli.exe serve maple-preview 8080
+```
+
 `serve.sh` downloads a container that isn't on the host; `fetch.sh` is the same download on
 its own, for when you want it to happen at a time you chose. Both are idempotent — over a
 complete directory they verify it, over an interrupted one they finish it. `SERVE_NO_FETCH=1`
